@@ -1,0 +1,170 @@
+use core::fmt;
+use std::fmt::Display;
+
+use chrono::{DateTime, Utc};
+use near_min_api::{
+    types::{AccountId, Action, Balance, CryptoHash},
+    utils::dec_format,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum Amount {
+    AmountIn(#[serde(with = "dec_format")] Balance),
+    AmountOut(#[serde(with = "dec_format")] Balance),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TokenId {
+    Near,
+    Nep141(AccountId),
+}
+
+impl Serialize for TokenId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_string().as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s == "near" {
+            Ok(TokenId::Near)
+        } else {
+            Ok(TokenId::Nep141(
+                s.parse().map_err(serde::de::Error::custom)?,
+            ))
+        }
+    }
+}
+
+impl Display for TokenId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenId::Near => write!(f, "near"),
+            TokenId::Nep141(account_id) => write!(f, "{account_id}"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SwapRequest {
+    /// The token to swap from. This and token_out must be different.
+    pub token_in: TokenId,
+    /// The token to swap to. This and token_in must be different.
+    pub token_out: TokenId,
+    /// The amount to swap. If it's AmountOut, some dexes might not support this.
+    #[serde(flatten)]
+    pub amount: Amount,
+    /// The maximum amount of time to wait for the route to be found. Some dexes
+    /// like near intents might show a better quote if you wait a bit longer.
+    /// Usually, 2-3 seconds is enough. Maximum is 60 seconds.
+    pub max_wait_ms: u64,
+    /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%. Must be
+    /// between 0.00 and 1.00.
+    pub slippage: f64,
+    /// The dexes to use. You might want to remove Near Intents if you don't want
+    /// to implement its own swap logic, which relies on signing and sending messages
+    /// to a centralized RPC rather than just sending a transaction. If not provided,
+    /// all dexes will be used. Must not be an empty array.
+    pub dexes: Option<Vec<DexId>>,
+    /// The account ID of the trader. If provided, the route will include storage
+    /// deposit actions.
+    pub trader_account_id: Option<AccountId>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Route {
+    /// The deadline for the route. If provided, you should refresh the route by
+    /// calling the /route endpoint again 2-3 seconds before the deadline to account
+    /// for network and block production latency.
+    pub deadline: Option<DateTime<Utc>>,
+    /// Whether the route has slippage. Usually it's true for AMM models like Rhea
+    /// and false for OTC / guaranteed-quote models like Near Intents.
+    pub has_slippage: bool,
+    /// The amount of tokens this route will swap. If you provided `Amount::AmountOut`,
+    /// this amount will be `Amount::AmountIn` and vice versa.
+    pub estimated_amount: Amount,
+    /// The amount of tokens this route will swap in the worst case scenario (with
+    /// slippage). If you provided `Amount::AmountOut`, this amount will be
+    /// `Amount::AmountIn` and vice versa. If you set slippage to `0.01`, this will be
+    /// 1% more / less than `estimated_amount`. If it's a dex like Near Intents,
+    /// this will be the same as `estimated_amount`.
+    pub worst_case_amount: Amount,
+    /// The id of the dex that provided this route.
+    pub dex_id: DexId,
+    /// How to execute the swap. Need to be executed sequentially.
+    pub execution_instructions: Vec<ExecutionInstruction>,
+    /// Whether the route needs to unwrap the tokens after completing the swap. Only
+    /// true for dexes that don't auto-unwrap tokens, and when token_out is NEAR.
+    /// A transaction is not included in `execution_instructions` because the unwrapping
+    /// can't be done deterministically due to slippage. The recommended behavior is
+    /// to remember the current wrap.near balance and compare it to the balance after the
+    /// swap, and unwrap the difference. When choosing amount_out, it can also happen
+    /// when we wrap too much NEAR into wNEAR (because we're accounting for slippage)
+    /// but the resulting wNEAR amount spent is less than what we wrapped.
+    pub needs_unwrap: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum ExecutionInstruction {
+    /// Sign a transaction with the given actions and send it to the RPC.
+    NearTransaction {
+        receiver_id: AccountId,
+        actions: Vec<Action>,
+        /// Some .omft.near tokens don't implement `storage_deposit` method and
+        /// fail
+        continue_if_failed: bool,
+    },
+    /// A quote from Near Intents. You should sign the message and send it to
+    /// POST https://solver-relay-v2.chaindefuser.com/rpc with method
+    /// `publish_intent`. More details on how to publish a signed intent:
+    /// https://docs.near-intents.org/near-intents/market-makers/bus/solver-relay
+    IntentsQuote {
+        message_to_sign: String,
+        quote_hash: CryptoHash,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DexId {
+    /// https://dex.rhea.finance/
+    /// AMM DEX
+    ///
+    /// Supports AmountIn, doesn't support AmountOut
+    Rhea,
+    /// https://app.near-intents.org/
+    /// guaranteed-quote DEX & Bridge
+    ///
+    /// Supports both AmountIn and AmountOut
+    NearIntents,
+    /// https://app.veax.com/
+    /// AMM DEX
+    ///
+    /// Not implemented yet
+    Veax,
+    /// https://aidols.bot/
+    /// bonding-curve launchpad
+    ///
+    /// Supports both AmountIn and AmountOut, only *.aidols.near tokens
+    Aidols,
+    /// https://gra.fun/
+    /// bonding-curve launchpad
+    ///
+    /// Supports AmountIn, doesn't support AmountOut, only *.gra-fun.near tokens
+    GraFun,
+    /// https://app.jumpdefi.xyz/swap
+    /// AMM DEX
+    ///
+    /// Not implemented yet
+    Jumpdefi,
+}
