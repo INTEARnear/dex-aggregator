@@ -51,6 +51,7 @@ impl Provider for NearIntentsProvider {
                         },
                         amount: request.amount.into(),
                         min_deadline_ms: Duration::from_secs(15).as_millis() as u64,
+                        wait_ms: (request.max_wait_ms - 500).min(5000), // account for latency
                     }],
                 })
                 .send()
@@ -203,6 +204,7 @@ struct NearIntentsQuoteParams {
     #[serde(flatten)]
     amount: ExactAmount,
     min_deadline_ms: u64,
+    wait_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
