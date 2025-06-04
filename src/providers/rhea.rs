@@ -100,7 +100,7 @@ impl Provider for RheaProvider {
                 if request.token_in == TokenId::Near {
                     actions.insert(
                         0,
-                        create_wrap_action(NearToken::from_yoctonear(route.min_amount_out)),
+                        create_wrap_action(NearToken::from_yoctonear(exact_amount_in)),
                     );
                     if let Some(trader_account_id) = request.trader_account_id.as_ref() {
                         if needs_storage_deposit(trader_account_id, &request.token_in).await {

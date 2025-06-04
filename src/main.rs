@@ -5,6 +5,7 @@ use axum::{
     Router,
 };
 use std::{env, future::Future, pin::Pin, time::Duration};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -116,7 +117,14 @@ async fn main() {
 
     info!("Starting swap-router HTTP server...");
 
-    let app = Router::new().route("/route", get(route_handler));
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/route", get(route_handler))
+        .layer(cors);
 
     let bind_address = env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
