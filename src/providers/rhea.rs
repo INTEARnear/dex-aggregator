@@ -35,17 +35,20 @@ impl Provider for RheaProvider {
             let slippage =
                 get_slippage_f64(request.slippage, &request.token_in, &request.token_out).await;
 
-            let url = format!(
-                "https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}",
-                token_in = match request.token_in {
-                    TokenId::Near => WRAP_NEAR.to_string(),
-                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                },
-                token_out = match request.token_out {
-                    TokenId::Near => WRAP_NEAR.to_string(),
-                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                },
-            );
+            let token_in = match request.token_in {
+                TokenId::Near => WRAP_NEAR.to_string(),
+                TokenId::Nep141(ref account_id) => account_id.to_string(),
+            };
+            let token_out = match request.token_out {
+                TokenId::Near => WRAP_NEAR.to_string(),
+                TokenId::Nep141(ref account_id) => account_id.to_string(),
+            };
+
+            if token_in == token_out {
+                return None;
+            }
+
+            let url = format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}");
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
                 return None;
