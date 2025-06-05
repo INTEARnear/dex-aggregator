@@ -1,5 +1,5 @@
 use core::fmt;
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
@@ -37,13 +37,7 @@ impl<'de> Deserialize<'de> for TokenId {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        if s == "near" {
-            Ok(TokenId::Near)
-        } else {
-            Ok(TokenId::Nep141(
-                s.parse().map_err(serde::de::Error::custom)?,
-            ))
-        }
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -52,6 +46,18 @@ impl Display for TokenId {
         match self {
             TokenId::Near => write!(f, "near"),
             TokenId::Nep141(account_id) => write!(f, "{account_id}"),
+        }
+    }
+}
+
+impl FromStr for TokenId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "near" {
+            Ok(TokenId::Near)
+        } else {
+            Ok(TokenId::Nep141(s.parse().map_err(|_| "Invalid token ID")?))
         }
     }
 }
@@ -195,4 +201,8 @@ pub enum DexId {
     ///
     /// Not implemented yet
     Jumpdefi,
+    /// Directly wrap NEAR to wNEAR, or unwrap wNEAR to NEAR
+    ///
+    /// Supports both AmountIn and AmountOut
+    Wrap,
 }

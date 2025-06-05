@@ -86,6 +86,7 @@ async fn route_handler(
         &providers::aidols::AidolsProvider,
         &providers::grafun::GraFunProvider,
         &providers::near_intents::NearIntentsProvider,
+        &providers::wrap::WrapProvider,
     ];
 
     let mut routes = Vec::new();
