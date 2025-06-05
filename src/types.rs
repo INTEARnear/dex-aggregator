@@ -6,6 +6,7 @@ use near_min_api::{
     types::{AccountId, Action, Balance, CryptoHash},
     utils::dec_format,
 };
+use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -69,6 +70,7 @@ pub struct SwapRequest {
     /// Usually, 2-3 seconds is enough. Maximum is 60 seconds.
     pub max_wait_ms: u64,
     /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%.
+    #[serde(flatten)]
     pub slippage: Slippage,
     /// The dexes to use. You might want to remove Near Intents if you don't want
     /// to implement its own swap logic, which relies on signing and sending messages
@@ -80,17 +82,31 @@ pub struct SwapRequest {
     pub trader_account_id: Option<AccountId>,
 }
 
+fn from_str<'de, D, S>(deserializer: D) -> Result<S, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    S: std::str::FromStr,
+{
+    let s = <&str as serde::Deserialize>::deserialize(deserializer)?;
+    S::from_str(s).map_err(|_| D::Error::custom("could not parse string"))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-#[serde(untagged)]
+#[serde(tag = "slippage_type")]
 pub enum Slippage {
     /// Automatically determine the optimal slippage based on the current market
     /// conditions (liquidity, 24h volume, etc).
     Auto {
+        #[serde(deserialize_with = "from_str")]
         max_slippage: f64,
+        #[serde(deserialize_with = "from_str")]
         min_slippage: f64,
     },
     /// Fixed slippage percentage. Must be between 0.00 and 1.00.
-    Fixed(f64),
+    Fixed {
+        #[serde(deserialize_with = "from_str")]
+        slippage: f64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

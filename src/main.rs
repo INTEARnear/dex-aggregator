@@ -50,7 +50,7 @@ async fn route_handler(
                 ));
             }
         }
-        Slippage::Fixed(slippage) => {
+        Slippage::Fixed { slippage } => {
             if !(0.00..=1.0).contains(&slippage) {
                 return Err((
                     StatusCode::BAD_REQUEST,

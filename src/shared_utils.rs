@@ -190,7 +190,7 @@ pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out:
 
             optimal_slippage.clamp(0.0001, 0.9999)
         }
-        Slippage::Fixed(slippage) => slippage.clamp(0.0001, 0.9999),
+        Slippage::Fixed { slippage } => slippage.clamp(0.0001, 0.9999),
     }
 }
 
