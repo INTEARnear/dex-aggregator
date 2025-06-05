@@ -82,10 +82,53 @@ pub struct SwapRequest {
     /// to implement its own swap logic, which relies on signing and sending messages
     /// to a centralized RPC rather than just sending a transaction. If not provided,
     /// all dexes will be used. Must not be an empty array.
+    #[serde(with = "comma_separated", default)]
     pub dexes: Option<Vec<DexId>>,
     /// The account ID of the trader. If provided, the route will include storage
     /// deposit actions.
     pub trader_account_id: Option<AccountId>,
+}
+
+mod comma_separated {
+    use std::{fmt::Display, str::FromStr};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T>(value: &Option<Vec<T>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Display,
+    {
+        if let Some(value) = value {
+            let s = value
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(s).serialize(serializer)
+        } else {
+            None::<String>.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromStr,
+        T::Err: Display,
+    {
+        let s = Option::<String>::deserialize(deserializer)?;
+        if let Some(s) = s {
+            let values = s
+                .split(',')
+                .map(|v| v.parse::<T>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(serde::de::Error::custom)?;
+            Ok(Some(values))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn from_str<'de, D, S>(deserializer: D) -> Result<S, D::Error>
@@ -205,4 +248,43 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     Wrap,
+}
+
+const RHEA_STR: &str = "Rhea";
+const NEAR_INTENTS_STR: &str = "NearIntents";
+const VEAX_STR: &str = "Veax";
+const AIDOLS_STR: &str = "Aidols";
+const GRA_FUN_STR: &str = "GraFun";
+const JUMPDEFI_STR: &str = "Jumpdefi";
+const WRAP_STR: &str = "Wrap";
+
+impl Display for DexId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DexId::Rhea => f.write_str(RHEA_STR),
+            DexId::NearIntents => f.write_str(NEAR_INTENTS_STR),
+            DexId::Veax => f.write_str(VEAX_STR),
+            DexId::Aidols => f.write_str(AIDOLS_STR),
+            DexId::GraFun => f.write_str(GRA_FUN_STR),
+            DexId::Jumpdefi => f.write_str(JUMPDEFI_STR),
+            DexId::Wrap => f.write_str(WRAP_STR),
+        }
+    }
+}
+
+impl FromStr for DexId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            RHEA_STR => DexId::Rhea,
+            NEAR_INTENTS_STR => DexId::NearIntents,
+            VEAX_STR => DexId::Veax,
+            AIDOLS_STR => DexId::Aidols,
+            GRA_FUN_STR => DexId::GraFun,
+            JUMPDEFI_STR => DexId::Jumpdefi,
+            WRAP_STR => DexId::Wrap,
+            _ => return Err(format!("Invalid dex id: {}", s)),
+        })
+    }
 }
