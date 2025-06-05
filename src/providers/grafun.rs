@@ -8,8 +8,8 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_wrap_action, needs_storage_deposit, RPC_CLIENT,
-        WRAP_NEAR,
+        create_storage_deposit_action, create_wrap_action, get_slippage_f64, needs_storage_deposit,
+        RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -88,7 +88,10 @@ impl Provider for GraFunProvider {
 
                     info!("Estimated amount out: {}", estimated_amount_out);
 
-                    let min_amount_out = estimated_amount_out as f64 * (1.0 - request.slippage);
+                    let slippage =
+                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
+                            .await;
+                    let min_amount_out = estimated_amount_out as f64 * (1.0 - slippage);
                     let min_amount_out = min_amount_out as u128;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {

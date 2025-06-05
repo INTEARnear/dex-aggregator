@@ -9,7 +9,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::types::{Amount, DexId, Route, SwapRequest};
+use crate::types::{Amount, DexId, Route, Slippage, SwapRequest};
 
 mod providers;
 mod shared_utils;
@@ -24,23 +24,40 @@ pub trait Provider: Sync {
 async fn route_handler(
     Query(request): Query<SwapRequest>,
 ) -> Result<Json<Vec<Route>>, (StatusCode, String)> {
-    info!(
-        token_in = %request.token_in,
-        token_out = %request.token_out,
-        amount = %match &request.amount {
-            Amount::AmountIn(amount) => format!("AmountIn: {}", amount),
-            Amount::AmountOut(amount) => format!("AmountOut: {}", amount),
-        },
-        max_wait_ms = request.max_wait_ms,
-        slippage = request.slippage,
-        "Received route request"
-    );
+    info!("Received route request: {:?}", request);
 
-    if request.slippage < 0.00 || request.slippage > 1.0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Slippage must be between 0.00 and 1.00".to_string(),
-        ));
+    match request.slippage {
+        Slippage::Auto {
+            max_slippage,
+            min_slippage,
+        } => {
+            if !(0.00..=1.0).contains(&max_slippage) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Max slippage must be between 0.00 and 1.00".to_string(),
+                ));
+            }
+            if !(0.00..=1.0).contains(&min_slippage) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Min slippage must be between 0.00 and 1.00".to_string(),
+                ));
+            }
+            if max_slippage < min_slippage {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Max slippage must be greater than min slippage".to_string(),
+                ));
+            }
+        }
+        Slippage::Fixed(slippage) => {
+            if !(0.00..=1.0).contains(&slippage) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Slippage must be between 0.00 and 1.00".to_string(),
+                ));
+            }
+        }
     }
 
     if request.token_in == request.token_out {

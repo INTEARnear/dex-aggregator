@@ -9,8 +9,8 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_wrap_action, needs_storage_deposit, REQWEST_CLIENT,
-        WRAP_NEAR,
+        create_storage_deposit_action, create_wrap_action, get_slippage_f64, needs_storage_deposit,
+        REQWEST_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -32,6 +32,9 @@ impl Provider for RheaProvider {
                 return None;
             };
 
+            let slippage =
+                get_slippage_f64(request.slippage, &request.token_in, &request.token_out).await;
+
             let url = format!(
                 "https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}",
                 token_in = match request.token_in {
@@ -42,7 +45,6 @@ impl Provider for RheaProvider {
                     TokenId::Near => WRAP_NEAR.to_string(),
                     TokenId::Nep141(ref account_id) => account_id.to_string(),
                 },
-                slippage = request.slippage.clamp(0.0001, 0.9999),
             );
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {

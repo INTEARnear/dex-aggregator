@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_unwrap_action, create_wrap_action,
+        create_storage_deposit_action, create_unwrap_action, create_wrap_action, get_slippage_f64,
         needs_storage_deposit, RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
@@ -88,7 +88,10 @@ impl Provider for AidolsProvider {
 
                     info!("Estimated amount out: {}", estimated_amount_out);
 
-                    let min_amount_out = estimated_amount_out as f64 * (1.0 - request.slippage);
+                    let slippage =
+                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
+                            .await;
+                    let min_amount_out = estimated_amount_out as f64 * (1.0 - slippage);
                     let min_amount_out = min_amount_out as u128;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
@@ -207,7 +210,10 @@ impl Provider for AidolsProvider {
 
                     info!("Required amount in: {}", required_amount_in);
 
-                    let max_amount_in = required_amount_in as f64 * (1.0 + request.slippage);
+                    let slippage =
+                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
+                            .await;
+                    let max_amount_in = required_amount_in as f64 * (1.0 + slippage);
                     let max_amount_in = max_amount_in as u128;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
@@ -292,7 +298,7 @@ impl Provider for AidolsProvider {
                         dex_id: DexId::Aidols,
                         deadline: None,
                         has_slippage: true,
-                        estimated_amount: Amount::AmountOut(required_amount_in),
+                        estimated_amount: Amount::AmountIn(required_amount_in),
                         worst_case_amount: Amount::AmountIn(max_amount_in),
                         execution_instructions: transactions,
                         needs_unwrap: needs_to_wrap && is_buy,

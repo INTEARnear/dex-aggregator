@@ -68,9 +68,8 @@ pub struct SwapRequest {
     /// like near intents might show a better quote if you wait a bit longer.
     /// Usually, 2-3 seconds is enough. Maximum is 60 seconds.
     pub max_wait_ms: u64,
-    /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%. Must be
-    /// between 0.00 and 1.00.
-    pub slippage: f64,
+    /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%.
+    pub slippage: Slippage,
     /// The dexes to use. You might want to remove Near Intents if you don't want
     /// to implement its own swap logic, which relies on signing and sending messages
     /// to a centralized RPC rather than just sending a transaction. If not provided,
@@ -79,6 +78,19 @@ pub struct SwapRequest {
     /// The account ID of the trader. If provided, the route will include storage
     /// deposit actions.
     pub trader_account_id: Option<AccountId>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(untagged)]
+pub enum Slippage {
+    /// Automatically determine the optimal slippage based on the current market
+    /// conditions (liquidity, 24h volume, etc).
+    Auto {
+        max_slippage: f64,
+        min_slippage: f64,
+    },
+    /// Fixed slippage percentage. Must be between 0.00 and 1.00.
+    Fixed(f64),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
