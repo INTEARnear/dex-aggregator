@@ -228,6 +228,7 @@ impl Provider for AidolsProvider {
                                     None
                                 },
                                 "amount_out": exact_amount_out.to_string(),
+                                "min_swap_amount": u128::MAX.to_string(), // not used but required
                             })).unwrap(),
                         }))
                         .unwrap()
@@ -238,33 +239,25 @@ impl Provider for AidolsProvider {
                     }));
 
                     let mut actions = vec![swap_action];
-                    if needs_to_wrap {
-                        if is_buy {
-                            // Wrap NEAR -> wNEAR before buying a token
-                            actions
-                                .push(create_wrap_action(NearToken::from_yoctonear(max_amount_in)));
+                    if needs_to_wrap && is_buy {
+                        // Wrap NEAR -> wNEAR before buying a token
+                        actions.push(create_wrap_action(NearToken::from_yoctonear(max_amount_in)));
 
-                            if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                                if needs_storage_deposit(
-                                    trader_account_id,
-                                    &TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
-                                )
-                                .await
-                                {
-                                    actions.insert(
-                                        0,
-                                        create_storage_deposit_action(TokenId::Nep141(
-                                            WRAP_NEAR.parse::<AccountId>().unwrap(),
-                                        ))
-                                        .await,
-                                    );
-                                }
+                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
+                            if needs_storage_deposit(
+                                trader_account_id,
+                                &TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
+                            )
+                            .await
+                            {
+                                actions.insert(
+                                    0,
+                                    create_storage_deposit_action(TokenId::Nep141(
+                                        WRAP_NEAR.parse::<AccountId>().unwrap(),
+                                    ))
+                                    .await,
+                                );
                             }
-                        } else {
-                            // Unwrap wNEAR -> NEAR after selling a token
-                            actions.push(create_unwrap_action(NearToken::from_yoctonear(
-                                exact_amount_out,
-                            )));
                         }
                     }
 
@@ -277,6 +270,16 @@ impl Provider for AidolsProvider {
                         actions,
                         continue_if_failed: false,
                     }];
+                    if needs_to_wrap && !is_buy {
+                        // Unwrap wNEAR -> NEAR after selling a token
+                        transactions.push(ExecutionInstruction::NearTransaction {
+                            receiver_id: WRAP_NEAR.parse().unwrap(),
+                            actions: vec![create_unwrap_action(NearToken::from_yoctonear(
+                                exact_amount_out,
+                            ))],
+                            continue_if_failed: false,
+                        });
+                    }
                     if let Some(trader_account_id) = request.trader_account_id.as_ref() {
                         if needs_storage_deposit(trader_account_id, &request.token_out).await {
                             transactions.insert(
