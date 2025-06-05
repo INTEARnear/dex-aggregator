@@ -108,10 +108,18 @@ impl Provider for RheaProvider {
                         create_wrap_action(NearToken::from_yoctonear(exact_amount_in)),
                     );
                     if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                        if needs_storage_deposit(trader_account_id, &request.token_in).await {
+                        if needs_storage_deposit(
+                            trader_account_id,
+                            &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
+                        )
+                        .await
+                        {
                             actions.insert(
                                 0,
-                                create_storage_deposit_action(request.token_in.clone()).await,
+                                create_storage_deposit_action(TokenId::Nep141(
+                                    WRAP_NEAR.parse().unwrap(),
+                                ))
+                                .await,
                             );
                         }
                     }
