@@ -3,7 +3,7 @@ use std::{fmt::Display, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{AccountId, Action, Balance, CryptoHash},
+    types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash},
     utils::dec_format,
 };
 use serde::de::Error;
@@ -87,6 +87,9 @@ pub struct SwapRequest {
     /// The account ID of the trader. If provided, the route will include storage
     /// deposit actions.
     pub trader_account_id: Option<AccountId>,
+    /// The public key to use for signing. Can be used for `add_public_key` method in
+    /// NEAR Intents.
+    pub signing_public_key: Option<PublicKey>,
 }
 
 mod comma_separated {

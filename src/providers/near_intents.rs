@@ -2,8 +2,11 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{AccountId, Action, Balance, CryptoHash, FunctionCallAction, NearGas, NearToken},
+    types::{
+        AccountId, Action, Balance, CryptoHash, Finality, FunctionCallAction, NearGas, NearToken,
+    },
     utils::dec_format,
+    QueryFinality,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -14,7 +17,7 @@ const INTENTS_CONTRACT_ID: &str = "intents.near";
 use crate::{
     shared_utils::{
         create_storage_deposit_action, create_wrap_action, needs_storage_deposit, REQWEST_CLIENT,
-        WRAP_NEAR,
+        RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -175,6 +178,55 @@ impl Provider for NearIntentsProvider {
                         continue_if_failed: true,
                     },
                 );
+            }
+            if let (Some(trader_account_id), Some(signing_public_key)) =
+                (request.trader_account_id, request.signing_public_key)
+            {
+                let is_near_implicit = trader_account_id.as_str().len() == 64
+                    && trader_account_id
+                        .as_str()
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit());
+                let is_evm_implicit = trader_account_id.as_str().len() == 42
+                    && trader_account_id.as_str().starts_with("0x")
+                    && trader_account_id
+                        .as_str()
+                        .chars()
+                        .skip(2)
+                        .all(|c| c.is_ascii_hexdigit());
+                if !is_near_implicit && !is_evm_implicit {
+                    if let Ok(false) = RPC_CLIENT
+                        .call::<bool>(
+                            INTENTS_CONTRACT_ID.parse().unwrap(),
+                            "has_public_key",
+                            serde_json::json!({
+                                "account_id": trader_account_id,
+                                "public_key": signing_public_key,
+                            }),
+                            QueryFinality::Finality(Finality::DoomSlug),
+                        )
+                        .await
+                    {
+                        instructions.insert(
+                            0,
+                            ExecutionInstruction::NearTransaction {
+                                receiver_id: INTENTS_CONTRACT_ID.parse().unwrap(),
+                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                                    method_name: "add_public_key".to_string(),
+                                    args: serde_json::to_string(&serde_json::json!({
+                                        "public_key": signing_public_key,
+                                    }))
+                                    .unwrap()
+                                    .as_bytes()
+                                    .to_vec(),
+                                    gas: NearGas::from_tgas(5).as_gas(),
+                                    deposit: NearToken::from_yoctonear(1),
+                                }))],
+                                continue_if_failed: false,
+                            },
+                        );
+                    }
+                }
             }
             let route = Route {
                 dex_id: DexId::NearIntents,
