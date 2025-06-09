@@ -213,7 +213,7 @@ impl Provider for AidolsProvider {
                     let slippage =
                         get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
                             .await;
-                    let max_amount_in = required_amount_in as f64 * (1.0 + slippage);
+                    let max_amount_in = required_amount_in as f64 / (1.0 - slippage);
                     let max_amount_in = max_amount_in as u128;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {

@@ -215,7 +215,6 @@ pub enum ExecutionInstruction {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum DexId {
     /// https://dex.rhea.finance/
     /// AMM DEX
@@ -251,6 +250,11 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     Wrap,
+    /// https://dex.rhea.finance/
+    /// AMM DEX
+    ///
+    /// Supports AmountIn, doesn't support AmountOut
+    RheaDcl,
 }
 
 const RHEA_STR: &str = "Rhea";
@@ -260,6 +264,7 @@ const AIDOLS_STR: &str = "Aidols";
 const GRA_FUN_STR: &str = "GraFun";
 const JUMPDEFI_STR: &str = "Jumpdefi";
 const WRAP_STR: &str = "Wrap";
+const RHEA_DCL_STR: &str = "RheaDcl";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -271,6 +276,7 @@ impl Display for DexId {
             DexId::GraFun => f.write_str(GRA_FUN_STR),
             DexId::Jumpdefi => f.write_str(JUMPDEFI_STR),
             DexId::Wrap => f.write_str(WRAP_STR),
+            DexId::RheaDcl => f.write_str(RHEA_DCL_STR),
         }
     }
 }
@@ -287,6 +293,7 @@ impl FromStr for DexId {
             GRA_FUN_STR => DexId::GraFun,
             JUMPDEFI_STR => DexId::Jumpdefi,
             WRAP_STR => DexId::Wrap,
+            RHEA_DCL_STR => DexId::RheaDcl,
             _ => return Err(format!("Invalid dex id: {}", s)),
         })
     }
