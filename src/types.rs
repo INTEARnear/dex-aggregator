@@ -253,7 +253,7 @@ pub enum DexId {
     /// https://dex.rhea.finance/
     /// AMM DEX
     ///
-    /// Supports AmountIn, doesn't support AmountOut
+    /// Supports both AmountIn and AmountOut
     RheaDcl,
 }
 
