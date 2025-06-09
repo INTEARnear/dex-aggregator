@@ -123,7 +123,7 @@ impl Provider for RheaDclProvider {
                                 }
                             }
                         }
-                        let transactions = vec![ExecutionInstruction::NearTransaction {
+                        let mut transactions = vec![ExecutionInstruction::NearTransaction {
                             receiver_id: match &request.token_in {
                                 TokenId::Near => WRAP_NEAR.parse().unwrap(),
                                 TokenId::Nep141(account_id) => account_id.clone(),
@@ -131,6 +131,23 @@ impl Provider for RheaDclProvider {
                             actions,
                             continue_if_failed: false,
                         }];
+                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
+                            if needs_storage_deposit(trader_account_id, &request.token_out).await {
+                                transactions.insert(
+                                    0,
+                                    ExecutionInstruction::NearTransaction {
+                                        receiver_id: match request.token_out {
+                                            TokenId::Near => unreachable!(),
+                                            TokenId::Nep141(ref account_id) => account_id.clone(),
+                                        },
+                                        actions: vec![
+                                            create_storage_deposit_action(&request.token_out).await,
+                                        ],
+                                        continue_if_failed: false,
+                                    },
+                                );
+                            }
+                        }
                         Some(Route {
                             dex_id: DexId::RheaDcl,
                             estimated_amount: Amount::AmountOut(quote.amount),
