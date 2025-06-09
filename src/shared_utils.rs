@@ -4,8 +4,8 @@ use cached::proc_macro::cached;
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
-        AccountId, Action, Balance, BlockHeight, BlockReference, Finality, FunctionCallAction,
-        NearGas, NearToken,
+        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, Finality,
+        FunctionCallAction, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -20,10 +20,7 @@ pub const WRAP_NEAR: &str = "wrap.near";
 pub fn create_wrap_action(amount: NearToken) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "near_deposit".to_string(),
-        args: serde_json::to_string(&serde_json::json!({}))
-            .unwrap()
-            .as_bytes()
-            .to_vec(),
+        args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
         gas: NearGas::from_tgas(2).as_gas(),
         deposit: amount,
     }))
@@ -46,23 +43,28 @@ pub fn create_unwrap_action(amount: NearToken) -> Action {
 pub async fn needs_storage_deposit(account_id: &AccountId, token_id: &TokenId) -> bool {
     match token_id {
         TokenId::Near => false,
-        TokenId::Nep141(token_id) => {
-            let Ok(storage_deposit) = RPC_CLIENT
-                .call::<StorageDeposit>(
-                    token_id.clone(),
-                    "storage_balance_of",
-                    serde_json::json!({
-                        "account_id": account_id,
-                    }),
-                    QueryFinality::Finality(Finality::DoomSlug),
-                )
-                .await
-            else {
-                return true;
-            };
-            storage_deposit.total == 0
-        }
+        TokenId::Nep141(token_id) => needs_storage_deposit_for_contract(account_id, token_id).await,
     }
+}
+
+pub async fn needs_storage_deposit_for_contract(
+    account_id: &AccountId,
+    contract_id: &AccountIdRef,
+) -> bool {
+    let Ok(storage_deposit) = RPC_CLIENT
+        .call::<StorageDeposit>(
+            contract_id.to_owned(),
+            "storage_balance_of",
+            serde_json::json!({
+                "account_id": account_id,
+            }),
+            QueryFinality::Finality(Finality::DoomSlug),
+        )
+        .await
+    else {
+        return true;
+    };
+    storage_deposit.total == 0
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,21 +76,25 @@ struct StorageDeposit {
     total: Balance,
 }
 
-pub async fn create_storage_deposit_action(token_id: TokenId) -> Action {
+pub async fn create_storage_deposit_action(token_id: &TokenId) -> Action {
     match token_id {
-        TokenId::Nep141(_token_id) => Action::FunctionCall(Box::new(FunctionCallAction {
-            method_name: "storage_deposit".to_string(),
-            args: serde_json::to_string(&serde_json::json!({
-                "registration_only": true,
-            }))
-            .unwrap()
-            .as_bytes()
-            .to_vec(),
-            gas: NearGas::from_tgas(10).as_gas(),
-            deposit: "0.00125 NEAR".parse().unwrap(),
-        })),
+        TokenId::Nep141(_token_id) => {
+            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap())
+        }
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
     }
+}
+
+pub fn create_storage_deposit_action_for_contract(amount: NearToken) -> Action {
+    Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "storage_deposit".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({
+            "registration_only": true,
+        }))
+        .unwrap(),
+        gas: NearGas::from_tgas(10).as_gas(),
+        deposit: amount,
+    }))
 }
 
 lazy_static! {

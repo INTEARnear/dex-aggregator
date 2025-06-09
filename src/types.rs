@@ -229,7 +229,7 @@ pub enum DexId {
     /// https://app.veax.com/
     /// AMM DEX
     ///
-    /// Not implemented yet
+    /// Supports both AmountIn and AmountOut
     Veax,
     /// https://aidols.bot/
     /// bonding-curve launchpad

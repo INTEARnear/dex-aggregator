@@ -96,7 +96,7 @@ impl Provider for GraFunProvider {
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "ft_transfer_call".to_string(),
-                        args: serde_json::to_string(&serde_json::json!({
+                        args: serde_json::to_vec(&serde_json::json!({
                             "receiver_id": GRAFUN_CONTRACT_ID,
                             "amount": exact_amount_in.to_string(),
                             "msg": serde_json::to_string(&serde_json::json!({
@@ -108,9 +108,7 @@ impl Provider for GraFunProvider {
                                 "min_swap_amount": min_amount_out.to_string(),
                             })).unwrap(),
                         }))
-                        .unwrap()
-                        .as_bytes()
-                        .to_vec(),
+                        .unwrap(),
                         gas: NearGas::from_tgas(50).as_gas(),
                         deposit: NearToken::from_yoctonear(1),
                     }));
@@ -131,7 +129,7 @@ impl Provider for GraFunProvider {
                             {
                                 actions.insert(
                                     0,
-                                    create_storage_deposit_action(TokenId::Nep141(
+                                    create_storage_deposit_action(&TokenId::Nep141(
                                         WRAP_NEAR.parse::<AccountId>().unwrap(),
                                     ))
                                     .await,
@@ -158,7 +156,7 @@ impl Provider for GraFunProvider {
                                         TokenId::Nep141(ref account_id) => account_id.clone(),
                                     },
                                     actions: vec![
-                                        create_storage_deposit_action(request.token_out).await,
+                                        create_storage_deposit_action(&request.token_out).await,
                                     ],
                                     continue_if_failed: false,
                                 },
@@ -172,7 +170,7 @@ impl Provider for GraFunProvider {
                         estimated_amount: Amount::AmountOut(estimated_amount_out),
                         worst_case_amount: Amount::AmountOut(min_amount_out),
                         execution_instructions: transactions,
-                        needs_unwrap: needs_to_wrap && !is_buy,
+                        needs_unwrap: needs_to_wrap,
                     };
 
                     Some(route)

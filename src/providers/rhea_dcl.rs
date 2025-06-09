@@ -23,7 +23,7 @@ const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 
 impl Provider for RheaDclProvider {
     fn dex_id(&self) -> DexId {
-        DexId::Rhea
+        DexId::RheaDcl
     }
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
@@ -43,11 +43,11 @@ impl Provider for RheaDclProvider {
                 (token_out.clone(), token_in.clone())
             };
 
-            let fee_options = [100u64, 400, 2000, 10000]; // 0.01%, 0.04%, 0.2%, 1%
+            const FEE_TIERS: [u64; 4] = [100, 400, 2000, 10000]; // 0.01%, 0.04%, 0.2%, 1%
 
             match request.amount {
                 Amount::AmountIn(exact_amount_in) => {
-                    let futures = fee_options.into_iter().map(|fee| {
+                    let futures = FEE_TIERS.into_iter().map(|fee| {
                         let pool_id = format!("{token_x}|{token_y}|{fee}");
                         RPC_CLIENT
                             .call::<RheaDclQuoteResponse>(
@@ -83,7 +83,7 @@ impl Provider for RheaDclProvider {
 
                         let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                             method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_string(&serde_json::json!({
+                            args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
                                 "amount": exact_amount_in.to_string(),
                                 "msg": serde_json::to_string(&serde_json::json!({
@@ -95,9 +95,7 @@ impl Provider for RheaDclProvider {
                                     }
                                 })).unwrap(),
                             }))
-                            .unwrap()
-                            .as_bytes()
-                            .to_vec(),
+                            .unwrap(),
                             gas: NearGas::from_tgas(70).as_gas(),
                             deposit: NearToken::from_yoctonear(1),
                         }));
@@ -117,7 +115,7 @@ impl Provider for RheaDclProvider {
                                 {
                                     actions.insert(
                                         0,
-                                        create_storage_deposit_action(TokenId::Nep141(
+                                        create_storage_deposit_action(&TokenId::Nep141(
                                             WRAP_NEAR.parse().unwrap(),
                                         ))
                                         .await,
@@ -126,9 +124,9 @@ impl Provider for RheaDclProvider {
                             }
                         }
                         let transactions = vec![ExecutionInstruction::NearTransaction {
-                            receiver_id: match request.token_in {
+                            receiver_id: match &request.token_in {
                                 TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                                TokenId::Nep141(account_id) => account_id,
+                                TokenId::Nep141(account_id) => account_id.clone(),
                             },
                             actions,
                             continue_if_failed: false,

@@ -88,6 +88,7 @@ async fn route_handler(
         &providers::near_intents::NearIntentsProvider,
         &providers::wrap::WrapProvider,
         &providers::rhea_dcl::RheaDclProvider,
+        &providers::veax::VeaxProvider,
     ];
 
     let mut routes = Vec::new();

@@ -146,7 +146,7 @@ impl Provider for NearIntentsProvider {
                 {
                     deposit_actions.insert(
                         0,
-                        create_storage_deposit_action(TokenId::Nep141(
+                        create_storage_deposit_action(&TokenId::Nep141(
                             WRAP_NEAR.parse::<AccountId>().unwrap(),
                         ))
                         .await,
@@ -172,9 +172,7 @@ impl Provider for NearIntentsProvider {
                             TokenId::Near => unreachable!(),
                             TokenId::Nep141(ref account_id) => account_id.clone(),
                         },
-                        actions: vec![
-                            create_storage_deposit_action(request.token_out.clone()).await,
-                        ],
+                        actions: vec![create_storage_deposit_action(&request.token_out).await],
                         continue_if_failed: true,
                     },
                 );
