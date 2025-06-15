@@ -1,4 +1,3 @@
-use core::fmt;
 use std::{fmt::Display, str::FromStr};
 
 use chrono::{DateTime, Utc};
@@ -20,6 +19,8 @@ pub enum Amount {
 pub enum TokenId {
     Near,
     Nep141(AccountId),
+    // Nep141OnRhea(AccountId),
+    // Nep141OnIntents(AccountId),
 }
 
 impl Serialize for TokenId {
@@ -27,7 +28,13 @@ impl Serialize for TokenId {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.to_string().as_str())
+        match self {
+            TokenId::Near => "near".to_string(),
+            TokenId::Nep141(account_id) => format!("nep141:{account_id}"),
+            // TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
+            // TokenId::Nep141OnIntents(account_id) => format!("intents-nep141:{account_id}"),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -41,21 +48,24 @@ impl<'de> Deserialize<'de> for TokenId {
     }
 }
 
-impl Display for TokenId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TokenId::Near => write!(f, "near"),
-            TokenId::Nep141(account_id) => write!(f, "{account_id}"),
-        }
-    }
-}
-
 impl FromStr for TokenId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "near" {
             Ok(TokenId::Near)
+        // } else if let Some(account_id) = s.strip_prefix("rhea-nep141:") {
+        //     Ok(TokenId::Nep141OnRhea(
+        //         account_id.parse().map_err(|_| "Invalid token ID")?,
+        //     ))
+        // } else if let Some(account_id) = s.strip_prefix("intents-nep141:") {
+        //     Ok(TokenId::Nep141OnIntents(
+        //         account_id.parse().map_err(|_| "Invalid token ID")?,
+        //     ))
+        } else if let Some(account_id) = s.strip_prefix("nep141:") {
+            Ok(TokenId::Nep141(
+                account_id.parse().map_err(|_| "Invalid token ID")?,
+            ))
         } else {
             Ok(TokenId::Nep141(s.parse().map_err(|_| "Invalid token ID")?))
         }
@@ -200,9 +210,6 @@ pub enum ExecutionInstruction {
     NearTransaction {
         receiver_id: AccountId,
         actions: Vec<Action>,
-        /// Some .omft.near tokens don't implement `storage_deposit` method and
-        /// fail
-        continue_if_failed: bool,
     },
     /// A quote from Near Intents. You should sign the message and send it to
     /// POST https://solver-relay-v2.chaindefuser.com/rpc with method

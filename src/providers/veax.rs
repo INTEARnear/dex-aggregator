@@ -9,9 +9,8 @@ use serde::Deserialize;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_storage_deposit_action_for_contract,
-        create_wrap_action, get_slippage_f64, needs_storage_deposit,
-        needs_storage_deposit_for_contract, RPC_CLIENT, WRAP_NEAR,
+        convert_to_nep141, create_storage_deposit_action_for_contract, deposit_storage_if_needed,
+        get_slippage_f64, needs_storage_deposit_for_contract, RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -26,16 +25,17 @@ impl Provider for VeaxProvider {
         DexId::Veax
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
         Box::pin(async move {
-            let token_in = match request.token_in {
-                TokenId::Near => WRAP_NEAR.parse::<AccountId>().unwrap(),
-                TokenId::Nep141(ref token_id) => token_id.clone(),
-            };
-            let token_out = match request.token_out {
-                TokenId::Near => WRAP_NEAR.parse::<AccountId>().unwrap(),
-                TokenId::Nep141(ref token_id) => token_id.clone(),
-            };
+            let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
+            let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
+
+            if token_in == token_out {
+                return None;
+            }
 
             let Ok(estimate) = RPC_CLIENT
                 .call::<VeaxEstimateResponse>(
@@ -60,7 +60,9 @@ impl Provider for VeaxProvider {
             else {
                 return None;
             };
-            let (swap_action, estimated_amount, worst_case_amount) = match request.amount {
+            let (ft_transfer_call_swap_action, estimated_amount, worst_case_amount) = match request
+                .amount
+            {
                 Amount::AmountIn(exact_amount_in) => {
                     let estimated_amount_out = estimate.result;
                     let slippage =
@@ -143,63 +145,25 @@ impl Provider for VeaxProvider {
                     )
                 }
             };
-
-            let mut actions = vec![swap_action];
-            if request.token_in == TokenId::Near {
-                if let (Amount::AmountIn(near_deposit_amount), _)
-                | (_, Amount::AmountIn(near_deposit_amount)) =
-                    (request.amount, worst_case_amount)
-                {
-                    actions.insert(
-                        0,
-                        create_wrap_action(NearToken::from_yoctonear(near_deposit_amount)),
-                    );
-                    if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                        if needs_storage_deposit(
-                            trader_account_id,
-                            &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
-                        )
-                        .await
-                        {
-                            actions.insert(
-                                0,
-                                create_storage_deposit_action(&TokenId::Nep141(
-                                    WRAP_NEAR.parse().unwrap(),
-                                ))
-                                .await,
-                            );
-                        }
-                    }
-                }
-            }
-
-            let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                receiver_id: match &request.token_in {
-                    TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                    TokenId::Nep141(account_id) => account_id.clone(),
-                },
-                actions,
-                continue_if_failed: false,
+            let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                receiver_id: token_in.clone(),
+                actions: vec![ft_transfer_call_swap_action],
             }];
+
+            let mut veax_storage_deposit_transactions = vec![];
             if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                let mut veax_transaction = None;
                 if needs_storage_deposit_for_contract(
                     trader_account_id,
                     &VEAX_CONTRACT_ID.parse::<AccountId>().unwrap(),
                 )
                 .await
                 {
-                    transactions.insert(
-                        0,
-                        ExecutionInstruction::NearTransaction {
-                            receiver_id: VEAX_CONTRACT_ID.parse().unwrap(),
-                            actions: vec![create_storage_deposit_action_for_contract(
-                                "0.00366 NEAR".parse().unwrap(),
-                            )],
-                            continue_if_failed: false,
-                        },
-                    );
-                    veax_transaction = Some(transactions.get_mut(0).unwrap());
+                    veax_storage_deposit_transactions.push(ExecutionInstruction::NearTransaction {
+                        receiver_id: VEAX_CONTRACT_ID.parse().unwrap(),
+                        actions: vec![create_storage_deposit_action_for_contract(
+                            "0.00366 NEAR".parse().unwrap(),
+                        )],
+                    });
                 }
                 if let Ok(user_tokens) = RPC_CLIENT
                     .call::<Vec<AccountId>>(
@@ -212,27 +176,15 @@ impl Provider for VeaxProvider {
                     )
                     .await
                 {
-                    let tokens_that_need_deposit = [token_in, token_out]
+                    let tokens_that_need_deposit = [token_in.clone(), token_out.clone()]
                         .into_iter()
                         .filter(|token| !user_tokens.contains(token))
                         .collect::<Vec<_>>();
                     if !tokens_that_need_deposit.is_empty() {
-                        let veax_transaction = if let Some(veax_transaction) = veax_transaction {
-                            veax_transaction
-                        } else {
-                            transactions.insert(
-                                0,
-                                ExecutionInstruction::NearTransaction {
-                                    receiver_id: VEAX_CONTRACT_ID.parse().unwrap(),
-                                    actions: vec![],
-                                    continue_if_failed: false,
-                                },
-                            );
-                            transactions.get_mut(0).unwrap()
-                        };
-                        match veax_transaction {
-                            ExecutionInstruction::NearTransaction { actions, .. } => {
-                                actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+                        veax_storage_deposit_transactions.push(
+                            ExecutionInstruction::NearTransaction {
+                                receiver_id: VEAX_CONTRACT_ID.parse().unwrap(),
+                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                                     method_name: "storage_deposit".to_string(),
                                     args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                     gas: NearGas::from_tgas(10).as_gas(),
@@ -241,8 +193,13 @@ impl Provider for VeaxProvider {
                                         .unwrap()
                                         .checked_mul(tokens_that_need_deposit.len() as u128)
                                         .unwrap(),
-                                })));
-                                actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+                                }))],
+                            },
+                        );
+                        veax_storage_deposit_transactions.push(
+                            ExecutionInstruction::NearTransaction {
+                                receiver_id: VEAX_CONTRACT_ID.parse().unwrap(),
+                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                                     method_name: "register_tokens".to_string(),
                                     args: serde_json::to_vec(&serde_json::json!({
                                         "token_ids": tokens_that_need_deposit,
@@ -250,38 +207,47 @@ impl Provider for VeaxProvider {
                                     .unwrap(),
                                     gas: NearGas::from_tgas(10).as_gas(),
                                     deposit: NearToken::from_yoctonear(1),
-                                })));
-                            }
-                            _ => unreachable!(),
-                        }
+                                }))],
+                            },
+                        );
                     }
                 }
             }
-            if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                    transactions.insert(
-                        0,
-                        ExecutionInstruction::NearTransaction {
-                            receiver_id: match request.token_out {
-                                TokenId::Near => unreachable!(),
-                                TokenId::Nep141(ref account_id) => account_id.clone(),
-                            },
-                            actions: vec![create_storage_deposit_action(&request.token_out).await],
-                            continue_if_failed: false,
-                        },
-                    );
-                }
-            }
-            Some(Route {
-                dex_id: DexId::Veax,
-                estimated_amount,
-                deadline: None,
-                has_slippage: true,
-                worst_case_amount,
-                execution_instructions: transactions,
-                needs_unwrap: request.token_out == TokenId::Near
-                    || request.token_in == TokenId::Near,
-            })
+            let transactions = [
+                veax_storage_deposit_transactions,
+                deposit_storage_if_needed(&request.token_out, request.trader_account_id.clone())
+                    .await,
+                deposit_storage_if_needed(&request.token_in, request.trader_account_id.clone())
+                    .await,
+                convert_to_nep141(
+                    &request.token_in,
+                    request.trader_account_id.clone(),
+                    match (request.amount, worst_case_amount) {
+                        (Amount::AmountIn(amount), Amount::AmountOut(_)) => amount,
+                        (Amount::AmountOut(_), Amount::AmountIn(amount)) => amount,
+                        _ => unreachable!(),
+                    },
+                )
+                .await?
+                .0,
+                swap_transactions,
+            ]
+            .concat();
+            Some((
+                Route {
+                    dex_id: DexId::Veax,
+                    estimated_amount,
+                    deadline: None,
+                    has_slippage: true,
+                    worst_case_amount,
+                    execution_instructions: transactions,
+                    needs_unwrap: (request.token_out == TokenId::Near
+                        && matches!(request.amount, Amount::AmountIn(_)))
+                        || (request.token_in == TokenId::Near
+                            && matches!(request.amount, Amount::AmountOut(_))),
+                },
+                TokenId::Nep141(token_out),
+            ))
         })
     }
 }

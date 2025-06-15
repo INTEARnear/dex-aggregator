@@ -9,8 +9,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_wrap_action, get_slippage_f64, needs_storage_deposit,
-        REQWEST_CLIENT, WRAP_NEAR,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -25,7 +24,10 @@ impl Provider for RheaProvider {
         DexId::Rhea
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
         Box::pin(async move {
             let Amount::AmountIn(exact_amount_in) = request.amount else {
                 // smartrouter.ref.finance/findPath doesn't support AmountOut
@@ -35,14 +37,8 @@ impl Provider for RheaProvider {
             let slippage =
                 get_slippage_f64(request.slippage, &request.token_in, &request.token_out).await;
 
-            let token_in = match request.token_in {
-                TokenId::Near => WRAP_NEAR.to_string(),
-                TokenId::Nep141(ref account_id) => account_id.to_string(),
-            };
-            let token_out = match request.token_out {
-                TokenId::Near => WRAP_NEAR.to_string(),
-                TokenId::Nep141(ref account_id) => account_id.to_string(),
-            };
+            let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
+            let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
 
             if token_in == token_out {
                 return None;
@@ -60,108 +56,86 @@ impl Provider for RheaProvider {
 
             info!("Found Rhea route: {:?}", response.result_data);
 
-            let route = if !response.result_data.routes.is_empty() {
-                let route = response.result_data.routes.remove(0);
+            if response.result_data.routes.is_empty() {
+                return None;
+            }
 
-                let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "ft_transfer_call".to_string(),
-                    args: serde_json::to_vec(&serde_json::json!({
-                        "receiver_id": RHEA_CONTRACT_ID,
-                        "amount": exact_amount_in.to_string(),
-                        "msg": serde_json::to_string(&serde_json::json!({
-                            "force": 0,
-                            "actions": route
-                                .pools
-                                .iter()
-                                .map(|step| {
-                                    let mut new_step = step.clone();
-                                    if let Some(pool) = step.get("pool_id") {
-                                        if let Some(pool_str) = pool.as_str() {
-                                            if let Ok(pool_u64) = pool_str.parse::<u64>() {
-                                                new_step["pool_id"] = serde_json::Value::from(pool_u64);
-                                            }
+            let route = response.result_data.routes.remove(0);
+
+            let unwrapping_near = request.token_out == TokenId::Near;
+            let ft_transfer_call_swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: "ft_transfer_call".to_string(),
+                args: serde_json::to_vec(&serde_json::json!({
+                    "receiver_id": RHEA_CONTRACT_ID,
+                    "amount": exact_amount_in.to_string(),
+                    "msg": serde_json::to_string(&serde_json::json!({
+                        "force": 0,
+                        "actions": route
+                            .pools
+                            .iter()
+                            .map(|step| {
+                                let mut new_step = step.clone();
+                                if let Some(pool) = step.get("pool_id") {
+                                    if let Some(pool_str) = pool.as_str() {
+                                        if let Ok(pool_u64) = pool_str.parse::<u64>() {
+                                            new_step["pool_id"] = serde_json::Value::from(pool_u64);
                                         }
                                     }
-                                    if let Some(amount_in) = step.get("amount_in") {
-                                        if amount_in == "0" {
-                                            new_step.as_object_mut().unwrap().remove("amount_in");
-                                        }
+                                }
+                                if let Some(amount_in) = step.get("amount_in") {
+                                    if amount_in == "0" {
+                                        new_step.as_object_mut().unwrap().remove("amount_in");
                                     }
-                                    new_step
-                                })
-                                .collect::<Vec<_>>(),
-                            "skip_degen_price_sync": true,
-                            "skip_unwrap_near": request.token_out != TokenId::Near,
-                        })).unwrap(),
-                    }))
-                    .unwrap(),
-                    gas: NearGas::from_tgas(90).as_gas(),
-                    deposit: NearToken::from_yoctonear(1),
-                }));
+                                }
+                                new_step
+                            })
+                            .collect::<Vec<_>>(),
+                        "skip_degen_price_sync": true,
+                        "skip_unwrap_near": !unwrapping_near,
+                    })).unwrap(),
+                }))
+                .unwrap(),
+                gas: NearGas::from_tgas(100).as_gas(),
+                deposit: NearToken::from_yoctonear(1),
+            }));
+            let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                receiver_id: token_in,
+                actions: vec![ft_transfer_call_swap_action],
+            }];
 
-                let mut actions = vec![swap_action];
-                if request.token_in == TokenId::Near {
-                    actions.insert(
-                        0,
-                        create_wrap_action(NearToken::from_yoctonear(exact_amount_in)),
-                    );
-                    if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                        if needs_storage_deposit(
-                            trader_account_id,
-                            &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
-                        )
-                        .await
-                        {
-                            actions.insert(
-                                0,
-                                create_storage_deposit_action(&TokenId::Nep141(
-                                    WRAP_NEAR.parse().unwrap(),
-                                ))
-                                .await,
-                            );
-                        }
-                    }
-                }
-                let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                    receiver_id: match request.token_in {
-                        TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                        TokenId::Nep141(account_id) => account_id,
-                    },
-                    actions,
-                    continue_if_failed: false,
-                }];
-                if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                    if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                        transactions.insert(
-                            0,
-                            ExecutionInstruction::NearTransaction {
-                                receiver_id: match request.token_out {
-                                    TokenId::Near => unreachable!(),
-                                    TokenId::Nep141(ref account_id) => account_id.clone(),
-                                },
-                                actions: vec![
-                                    create_storage_deposit_action(&request.token_out).await,
-                                ],
-                                continue_if_failed: false,
-                            },
-                        );
-                    }
-                }
-                let route = Route {
-                    dex_id: DexId::Rhea,
-                    deadline: None,
-                    has_slippage: true,
-                    estimated_amount: Amount::AmountOut(response.result_data.amount_out),
-                    worst_case_amount: Amount::AmountOut(route.min_amount_out),
-                    execution_instructions: transactions,
-                    needs_unwrap: false,
-                };
-                Some(route)
-            } else {
-                None
+            let transactions = [
+                deposit_storage_if_needed(&request.token_out, request.trader_account_id.clone())
+                    .await,
+                deposit_storage_if_needed(&request.token_in, request.trader_account_id.clone())
+                    .await,
+                convert_to_nep141(
+                    &request.token_in,
+                    request.trader_account_id.clone(),
+                    exact_amount_in,
+                )
+                .await?
+                .0,
+                swap_transactions,
+            ]
+            .concat();
+
+            let route = Route {
+                dex_id: DexId::Rhea,
+                deadline: None,
+                has_slippage: true,
+                estimated_amount: Amount::AmountOut(response.result_data.amount_out),
+                worst_case_amount: Amount::AmountOut(route.min_amount_out),
+                execution_instructions: transactions,
+                needs_unwrap: false,
             };
-
-            route
+            Some((
+                route,
+                if unwrapping_near {
+                    TokenId::Near
+                } else {
+                    TokenId::Nep141(token_out)
+                },
+            ))
         })
     }
 }

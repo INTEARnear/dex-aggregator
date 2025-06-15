@@ -2,9 +2,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{
-        AccountId, Action, Balance, CryptoHash, Finality, FunctionCallAction, NearGas, NearToken,
-    },
+    types::{Action, Balance, CryptoHash, Finality, FunctionCallAction, NearGas, NearToken},
     utils::dec_format,
     QueryFinality,
 };
@@ -16,8 +14,7 @@ const INTENTS_CONTRACT_ID: &str = "intents.near";
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_wrap_action, needs_storage_deposit, REQWEST_CLIENT,
-        RPC_CLIENT, WRAP_NEAR,
+        convert_to_nep141, deposit_storage_if_needed, REQWEST_CLIENT, RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -30,7 +27,10 @@ impl Provider for NearIntentsProvider {
         DexId::NearIntents
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
         Box::pin(async move {
             let Some(account_id) = request.trader_account_id.as_ref() else {
                 // Need to have trader's account ID for intents
@@ -89,6 +89,12 @@ impl Provider for NearIntentsProvider {
                     Amount::AmountIn(_) => -(quote.amount_out.try_into().unwrap_or(i128::MAX)),
                     Amount::AmountOut(_) => quote.amount_in.try_into().unwrap_or(i128::MAX),
                 })?;
+            let (input_to_nep141, input_nep141_id) = convert_to_nep141(
+                &request.token_in,
+                Some(account_id.clone()),
+                best_quote.amount_in,
+            )
+            .await?;
 
             let token_diff_intent = serde_json::json!({
                 "intent": "token_diff",
@@ -97,135 +103,93 @@ impl Provider for NearIntentsProvider {
                     best_quote.defuse_asset_identifier_out.clone(): best_quote.amount_out.to_string(),
                 }
             });
-            let withdraw_intent = serde_json::json!({
-                "intent": match request.token_out {
-                    TokenId::Near => "native_withdraw",
-                    TokenId::Nep141(_) => "ft_withdraw",
+            let (withdraw_intent, withdraw_token) = (
+                serde_json::json!({
+                    "intent": match request.token_out {
+                        TokenId::Near => "native_withdraw",
+                        TokenId::Nep141(_) => "ft_withdraw",
+                    },
+                    "token": match request.token_out {
+                        TokenId::Near => None,
+                        TokenId::Nep141(ref token_id) => Some(token_id.clone()),
+                    },
+                    "receiver_id": account_id,
+                    "amount": best_quote.amount_out.to_string(),
+                }),
+                match request.token_out {
+                    TokenId::Near => TokenId::Near,
+                    TokenId::Nep141(ref account_id) => TokenId::Nep141(account_id.clone()),
                 },
-                "token": match request.token_out {
-                    TokenId::Near => None,
-                    TokenId::Nep141(ref token_id) => Some(token_id.clone()),
-                },
-                "receiver_id": account_id,
-                "amount": best_quote.amount_out.to_string(),
-            });
+            );
             let message = serde_json::json!({
                 "deadline": best_quote.expiration_time,
                 "intents": vec![token_diff_intent, withdraw_intent],
                 "signer_id": account_id,
             });
 
-            let mut instructions = vec![ExecutionInstruction::IntentsQuote {
+            let intents = vec![ExecutionInstruction::IntentsQuote {
                 message_to_sign: serde_json::to_string(&message).unwrap(),
                 quote_hash: best_quote.quote_hash,
             }];
-            let mut deposit_actions = vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                method_name: "ft_transfer_call".to_string(),
-                args: serde_json::to_string(&serde_json::json!({
-                    "receiver_id": INTENTS_CONTRACT_ID,
-                    "amount": best_quote.amount_in.to_string(),
-                    "msg": "",
-                }))
-                .unwrap()
-                .as_bytes()
-                .to_vec(),
-                gas: NearGas::from_tgas(40).as_gas(),
-                deposit: NearToken::from_yoctonear(1),
-            }))];
-            if request.token_in == TokenId::Near {
-                // Wrap NEAR -> wNEAR
-                deposit_actions.insert(
-                    0,
-                    create_wrap_action(NearToken::from_yoctonear(best_quote.amount_in)),
-                );
-                if needs_storage_deposit(
-                    account_id,
-                    &TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
-                )
-                .await
-                {
-                    deposit_actions.insert(
-                        0,
-                        create_storage_deposit_action(&TokenId::Nep141(
-                            WRAP_NEAR.parse::<AccountId>().unwrap(),
-                        ))
-                        .await,
-                    );
-                }
-            }
-            instructions.insert(
-                0,
-                ExecutionInstruction::NearTransaction {
-                    receiver_id: match request.token_in {
-                        TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                        TokenId::Nep141(ref account_id) => account_id.clone(),
-                    },
-                    actions: deposit_actions,
-                    continue_if_failed: false,
-                },
-            );
-            if needs_storage_deposit(account_id, &request.token_out).await {
-                instructions.insert(
-                    0,
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: match request.token_out {
-                            TokenId::Near => unreachable!(),
-                            TokenId::Nep141(ref account_id) => account_id.clone(),
-                        },
-                        actions: vec![create_storage_deposit_action(&request.token_out).await],
-                        continue_if_failed: true,
-                    },
-                );
-            }
-            if let (Some(trader_account_id), Some(signing_public_key)) =
-                (request.trader_account_id, request.signing_public_key)
-            {
-                let is_near_implicit = trader_account_id.as_str().len() == 64
-                    && trader_account_id
-                        .as_str()
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit());
-                let is_evm_implicit = trader_account_id.as_str().len() == 42
-                    && trader_account_id.as_str().starts_with("0x")
-                    && trader_account_id
-                        .as_str()
-                        .chars()
-                        .skip(2)
-                        .all(|c| c.is_ascii_hexdigit());
-                if !is_near_implicit && !is_evm_implicit {
+            let deposit_instructions = vec![ExecutionInstruction::NearTransaction {
+                receiver_id: input_nep141_id,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "ft_transfer_call".to_string(),
+                    args: serde_json::to_string(&serde_json::json!({
+                        "receiver_id": INTENTS_CONTRACT_ID,
+                        "amount": best_quote.amount_in.to_string(),
+                        "msg": "",
+                    }))
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+                    gas: NearGas::from_tgas(40).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }))],
+            }];
+            let add_public_key_instructions =
+                if let Some(signing_public_key) = request.signing_public_key {
                     if let Ok(false) = RPC_CLIENT
                         .call::<bool>(
                             INTENTS_CONTRACT_ID.parse().unwrap(),
                             "has_public_key",
                             serde_json::json!({
-                                "account_id": trader_account_id,
+                                "account_id": account_id,
                                 "public_key": signing_public_key,
                             }),
                             QueryFinality::Finality(Finality::DoomSlug),
                         )
                         .await
                     {
-                        instructions.insert(
-                            0,
-                            ExecutionInstruction::NearTransaction {
-                                receiver_id: INTENTS_CONTRACT_ID.parse().unwrap(),
-                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                                    method_name: "add_public_key".to_string(),
-                                    args: serde_json::to_string(&serde_json::json!({
-                                        "public_key": signing_public_key,
-                                    }))
-                                    .unwrap()
-                                    .as_bytes()
-                                    .to_vec(),
-                                    gas: NearGas::from_tgas(5).as_gas(),
-                                    deposit: NearToken::from_yoctonear(1),
-                                }))],
-                                continue_if_failed: false,
-                            },
-                        );
+                        vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: INTENTS_CONTRACT_ID.parse().unwrap(),
+                            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                                method_name: "add_public_key".to_string(),
+                                args: serde_json::to_string(&serde_json::json!({
+                                    "public_key": signing_public_key,
+                                }))
+                                .unwrap()
+                                .as_bytes()
+                                .to_vec(),
+                                gas: NearGas::from_tgas(5).as_gas(),
+                                deposit: NearToken::from_yoctonear(1),
+                            }))],
+                        }]
+                    } else {
+                        vec![]
                     }
-                }
-            }
+                } else {
+                    vec![]
+                };
+            let instructions = [
+                add_public_key_instructions,
+                deposit_storage_if_needed(&request.token_out, account_id.clone()).await,
+                deposit_storage_if_needed(&request.token_in, account_id.clone()).await,
+                input_to_nep141,
+                deposit_instructions,
+                intents,
+            ]
+            .concat();
             let route = Route {
                 dex_id: DexId::NearIntents,
                 estimated_amount: match request.amount {
@@ -242,7 +206,8 @@ impl Provider for NearIntentsProvider {
                 needs_unwrap: false,
             };
 
-            Some(route)
+            // TODO only outputs NEP-141 or NEAR
+            Some((route, withdraw_token))
         })
     }
 }

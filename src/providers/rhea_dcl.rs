@@ -9,10 +9,7 @@ use near_min_api::{
 use serde::Deserialize;
 
 use crate::{
-    shared_utils::{
-        create_storage_deposit_action, create_wrap_action, get_slippage_f64, needs_storage_deposit,
-        RPC_CLIENT, WRAP_NEAR,
-    },
+    shared_utils::{convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, RPC_CLIENT},
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
@@ -26,16 +23,17 @@ impl Provider for RheaDclProvider {
         DexId::RheaDcl
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
         Box::pin(async move {
-            let token_in = match request.token_in {
-                TokenId::Near => WRAP_NEAR.to_string(),
-                TokenId::Nep141(ref token_id) => token_id.to_string(),
-            };
-            let token_out = match request.token_out {
-                TokenId::Near => WRAP_NEAR.to_string(),
-                TokenId::Nep141(ref token_id) => token_id.to_string(),
-            };
+            let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
+            let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
+
+            if token_in == token_out {
+                return None;
+            }
 
             let (token_x, token_y) = if token_in < token_out {
                 (token_in.clone(), token_out.clone())
@@ -81,82 +79,68 @@ impl Provider for RheaDclProvider {
                                 .await))
                             .floor() as Balance;
 
-                        let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": exact_amount_in.to_string(),
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec![pool_id],
-                                        "output_token": token_out,
-                                        "min_output_amount": min_amount_out.to_string(),
-                                        "skip_unwrap_near": request.token_out != TokenId::Near,
-                                    }
-                                })).unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: NearGas::from_tgas(70).as_gas(),
-                            deposit: NearToken::from_yoctonear(1),
-                        }));
+                        let unwrapping_near = request.token_out == TokenId::Near;
+                        let ft_transfer_call_swap_action =
+                            Action::FunctionCall(Box::new(FunctionCallAction {
+                                method_name: "ft_transfer_call".to_string(),
+                                args: serde_json::to_vec(&serde_json::json!({
+                                    "receiver_id": RHEA_DCL_CONTRACT_ID,
+                                    "amount": exact_amount_in.to_string(),
+                                    "msg": serde_json::to_string(&serde_json::json!({
+                                        "Swap": {
+                                            "pool_ids": vec![pool_id],
+                                            "output_token": token_out,
+                                            "min_output_amount": min_amount_out.to_string(),
+                                            "skip_unwrap_near": !unwrapping_near,
+                                        }
+                                    })).unwrap(),
+                                }))
+                                .unwrap(),
+                                gas: NearGas::from_tgas(70).as_gas(),
+                                deposit: NearToken::from_yoctonear(1),
+                            }));
 
-                        let mut actions = vec![swap_action];
-                        if request.token_in == TokenId::Near {
-                            actions.insert(
-                                0,
-                                create_wrap_action(NearToken::from_yoctonear(exact_amount_in)),
-                            );
-                            if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                                if needs_storage_deposit(
-                                    trader_account_id,
-                                    &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
-                                )
-                                .await
-                                {
-                                    actions.insert(
-                                        0,
-                                        create_storage_deposit_action(&TokenId::Nep141(
-                                            WRAP_NEAR.parse().unwrap(),
-                                        ))
-                                        .await,
-                                    );
-                                }
-                            }
-                        }
-                        let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                            receiver_id: match &request.token_in {
-                                TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                                TokenId::Nep141(account_id) => account_id.clone(),
-                            },
-                            actions,
-                            continue_if_failed: false,
+                        let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: token_in,
+                            actions: vec![ft_transfer_call_swap_action],
                         }];
-                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                            if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                                transactions.insert(
-                                    0,
-                                    ExecutionInstruction::NearTransaction {
-                                        receiver_id: match request.token_out {
-                                            TokenId::Near => unreachable!(),
-                                            TokenId::Nep141(ref account_id) => account_id.clone(),
-                                        },
-                                        actions: vec![
-                                            create_storage_deposit_action(&request.token_out).await,
-                                        ],
-                                        continue_if_failed: false,
-                                    },
-                                );
-                            }
-                        }
-                        Some(Route {
-                            dex_id: DexId::RheaDcl,
-                            estimated_amount: Amount::AmountOut(quote.amount),
-                            deadline: None,
-                            has_slippage: true,
-                            worst_case_amount: Amount::AmountOut(min_amount_out),
-                            execution_instructions: transactions,
-                            needs_unwrap: false,
-                        })
+                        let transactions = [
+                            deposit_storage_if_needed(
+                                &request.token_out,
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            deposit_storage_if_needed(
+                                &request.token_in,
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            convert_to_nep141(
+                                &request.token_in,
+                                request.trader_account_id.clone(),
+                                exact_amount_in,
+                            )
+                            .await?
+                            .0,
+                            swap_transactions,
+                        ]
+                        .concat();
+                        Some((
+                            Route {
+                                dex_id: DexId::RheaDcl,
+                                estimated_amount: Amount::AmountOut(quote.amount),
+                                deadline: None,
+                                has_slippage: true,
+                                worst_case_amount: Amount::AmountOut(min_amount_out),
+                                execution_instructions: transactions,
+                                needs_unwrap: false,
+                            },
+                            if unwrapping_near {
+                                TokenId::Near
+                            } else {
+                                TokenId::Nep141(token_out)
+                            },
+                        ))
                     } else {
                         None
                     }
@@ -196,6 +180,7 @@ impl Provider for RheaDclProvider {
                                 .await))
                             .floor() as Balance;
 
+                        let unwrapping_near = request.token_out == TokenId::Near;
                         let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
@@ -206,7 +191,7 @@ impl Provider for RheaDclProvider {
                                         "pool_ids": vec![pool_id],
                                         "output_token": token_out,
                                         "output_amount": exact_amount_out.to_string(),
-                                        "skip_unwrap_near": request.token_out != TokenId::Near,
+                                        "skip_unwrap_near": !unwrapping_near,
                                     }
                                 })).unwrap(),
                             }))
@@ -215,63 +200,47 @@ impl Provider for RheaDclProvider {
                             deposit: NearToken::from_yoctonear(1),
                         }));
 
-                        let mut actions = vec![swap_action];
-                        if request.token_in == TokenId::Near {
-                            actions.insert(
-                                0,
-                                create_wrap_action(NearToken::from_yoctonear(max_amount_in)),
-                            );
-                            if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                                if needs_storage_deposit(
-                                    trader_account_id,
-                                    &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
-                                )
-                                .await
-                                {
-                                    actions.insert(
-                                        0,
-                                        create_storage_deposit_action(&TokenId::Nep141(
-                                            WRAP_NEAR.parse().unwrap(),
-                                        ))
-                                        .await,
-                                    );
-                                }
-                            }
-                        }
-                        let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                            receiver_id: match &request.token_in {
-                                TokenId::Near => WRAP_NEAR.parse().unwrap(),
-                                TokenId::Nep141(account_id) => account_id.clone(),
-                            },
-                            actions,
-                            continue_if_failed: false,
+                        let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: token_in,
+                            actions: vec![swap_action],
                         }];
-                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                            if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                                transactions.insert(
-                                    0,
-                                    ExecutionInstruction::NearTransaction {
-                                        receiver_id: match request.token_out {
-                                            TokenId::Near => unreachable!(),
-                                            TokenId::Nep141(ref account_id) => account_id.clone(),
-                                        },
-                                        actions: vec![
-                                            create_storage_deposit_action(&request.token_out).await,
-                                        ],
-                                        continue_if_failed: false,
-                                    },
-                                );
-                            }
-                        }
-                        Some(Route {
-                            dex_id: DexId::RheaDcl,
-                            estimated_amount: Amount::AmountIn(quote.amount),
-                            deadline: None,
-                            has_slippage: true,
-                            worst_case_amount: Amount::AmountIn(max_amount_in),
-                            execution_instructions: transactions,
-                            needs_unwrap: false,
-                        })
+                        let transactions = [
+                            deposit_storage_if_needed(
+                                &request.token_out,
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            deposit_storage_if_needed(
+                                &request.token_in,
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            convert_to_nep141(
+                                &request.token_in,
+                                request.trader_account_id.clone(),
+                                max_amount_in,
+                            )
+                            .await?
+                            .0,
+                            swap_transactions,
+                        ]
+                        .concat();
+                        Some((
+                            Route {
+                                dex_id: DexId::RheaDcl,
+                                estimated_amount: Amount::AmountIn(quote.amount),
+                                deadline: None,
+                                has_slippage: true,
+                                worst_case_amount: Amount::AmountIn(max_amount_in),
+                                execution_instructions: transactions,
+                                needs_unwrap: false,
+                            },
+                            if unwrapping_near {
+                                TokenId::Near
+                            } else {
+                                TokenId::Nep141(token_out)
+                            },
+                        ))
                     } else {
                         None
                     }

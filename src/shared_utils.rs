@@ -13,7 +13,7 @@ use near_min_api::{
 use reqwest::{Client, ClientBuilder};
 use serde::Deserialize;
 
-use crate::types::{Slippage, TokenId};
+use crate::types::{ExecutionInstruction, Slippage, TokenId};
 
 pub const WRAP_NEAR: &str = "wrap.near";
 
@@ -239,4 +239,148 @@ pub async fn get_current_block_height() -> Result<u64, String> {
         return Err("Failed to get current block".to_string());
     };
     Ok(response.header.height)
+}
+
+/// Merge all neighboring NearTransactions with the same receiver_id
+pub fn optimize_execution_instructions(
+    execution_instructions: Vec<ExecutionInstruction>,
+) -> Vec<ExecutionInstruction> {
+    let mut optimized_execution_instructions = vec![];
+    for next_instruction in execution_instructions {
+        match &next_instruction {
+            ExecutionInstruction::NearTransaction {
+                receiver_id,
+                actions,
+            } => {
+                if actions.is_empty() {
+                    continue;
+                }
+                if let Some(ExecutionInstruction::NearTransaction {
+                    receiver_id: prev_receiver_id,
+                    actions: prev_actions,
+                }) = optimized_execution_instructions.last_mut()
+                {
+                    if prev_receiver_id == receiver_id {
+                        prev_actions.extend(actions.iter().cloned());
+                    } else {
+                        optimized_execution_instructions.push(next_instruction);
+                    }
+                } else {
+                    optimized_execution_instructions.push(next_instruction);
+                }
+            }
+            _ => optimized_execution_instructions.push(next_instruction),
+        }
+    }
+    optimized_execution_instructions
+}
+
+pub async fn convert_to_nep141(
+    token_id: &TokenId,
+    _trader_account_id: Option<AccountId>,
+    amount: Balance,
+) -> Option<(Vec<ExecutionInstruction>, AccountId)> {
+    match token_id {
+        TokenId::Near => {
+            let mut transactions = vec![];
+            if amount > 0 {
+                transactions.push(ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
+                    actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+                });
+            }
+            Some((transactions, WRAP_NEAR.parse::<AccountId>().unwrap()))
+        }
+        TokenId::Nep141(account_id) => Some((vec![], account_id.clone())),
+    }
+}
+
+// pub async fn convert_to_native(
+//     token_id: &TokenId,
+//     _trader_account_id: Option<AccountId>,
+//     amount: Balance,
+// ) -> Option<Vec<ExecutionInstruction>> {
+//     match token_id {
+//         TokenId::Near => Some(vec![]),
+//         TokenId::Nep141(account_id) if account_id == WRAP_NEAR => {
+//             let mut transactions = vec![];
+//             if amount > 0 {
+//                 transactions.push(ExecutionInstruction::NearTransaction {
+//                     receiver_id: account_id.clone(),
+//                     actions: vec![create_unwrap_action(NearToken::from_yoctonear(amount))],
+//                 });
+//             }
+//             Some(transactions)
+//         }
+//         TokenId::Nep141(_) => None,
+//     }
+// }
+
+pub async fn deposit_storage_if_needed(
+    token_id: &TokenId,
+    trader_account_id: impl Into<Option<AccountId>>,
+) -> Vec<ExecutionInstruction> {
+    match token_id {
+        TokenId::Nep141(token_account_id) => {
+            let mut transactions = vec![];
+            if let Some(trader_account_id) = trader_account_id.into() {
+                if needs_storage_deposit(&trader_account_id, token_id).await {
+                    transactions.push(ExecutionInstruction::NearTransaction {
+                        receiver_id: token_account_id.clone(),
+                        actions: vec![create_storage_deposit_action(token_id).await],
+                    });
+                }
+            }
+            transactions
+        }
+        TokenId::Near => vec![],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenLocation {
+    Native,
+    Nep141,
+}
+
+impl From<&TokenId> for TokenLocation {
+    fn from(token_id: &TokenId) -> Self {
+        match token_id {
+            TokenId::Near => TokenLocation::Native,
+            TokenId::Nep141(_) => TokenLocation::Nep141,
+        }
+    }
+}
+
+pub async fn convert_to(
+    from: &TokenId,
+    to: TokenLocation,
+    amount: Balance,
+    _trader_account_id: Option<AccountId>,
+) -> Vec<ExecutionInstruction> {
+    match (from, to) {
+        (TokenId::Near, TokenLocation::Native) => vec![],
+        (TokenId::Near, TokenLocation::Nep141) => {
+            if amount > 0 {
+                vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
+                    actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+                }]
+            } else {
+                vec![]
+            }
+        }
+        (TokenId::Nep141(token_id), TokenLocation::Native) if token_id == WRAP_NEAR => {
+            if amount > 0 {
+                vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
+                    actions: vec![create_unwrap_action(NearToken::from_yoctonear(amount))],
+                }]
+            } else {
+                vec![]
+            }
+        }
+        (TokenId::Nep141(_), TokenLocation::Native) => vec![],
+        (TokenId::Nep141(_), TokenLocation::Nep141) => vec![],
+    }
 }

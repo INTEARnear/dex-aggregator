@@ -9,14 +9,29 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::types::{Amount, DexId, Route, Slippage, SwapRequest};
+use crate::{
+    shared_utils::{convert_to, optimize_execution_instructions},
+    types::{Amount, DexId, Route, Slippage, SwapRequest, TokenId},
+};
 
 mod providers;
 mod shared_utils;
 mod types;
 
+/// Route and resulting token ID. If wrapping / unwrapping of the result is not
+/// immediate (creates a new receipt), it's recommended to not wrap / unwrap the
+/// token, and instead, return the token ID of the direct result, so that we can
+/// do the wrapping / unwrapping / other conversions here, since sometimes the
+/// user might want to leave the token in an internal balance of a DEX, or
+/// convert it to internal balance of a different DEX, which is not realistic to
+/// implement in each DEX provider individually.
+type RouteResult = (Route, TokenId);
+
 pub trait Provider: Sync {
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>>;
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<RouteResult>> + Send>>;
 
     fn dex_id(&self) -> DexId;
 }
@@ -111,7 +126,7 @@ async fn route_handler(
     let routes = futures_util::future::join_all(routes).await;
     let mut routes = routes.into_iter().flatten().flatten().collect::<Vec<_>>();
 
-    routes.sort_by_key(|route| {
+    routes.sort_by_key(|(route, _)| {
         match route.estimated_amount {
             // If 2 or more dexes return amount more than i128::MAX, don't care about these
             // stupidly large token amounts, usually normal tokens don't go so close to
@@ -121,9 +136,44 @@ async fn route_handler(
         }
     });
 
+    for (route, out_token) in routes.iter_mut() {
+        if !route.needs_unwrap {
+            let amount_out = match (
+                request.amount,
+                route.estimated_amount,
+                route.worst_case_amount,
+            ) {
+                (Amount::AmountIn(_), Amount::AmountOut(amount), Amount::AmountOut(amount2)) => {
+                    if amount == amount2 {
+                        Some(amount)
+                    } else {
+                        None
+                    }
+                }
+                (Amount::AmountOut(amount), Amount::AmountIn(_), Amount::AmountIn(_)) => {
+                    Some(amount)
+                }
+                _ => unreachable!(),
+            };
+            if let Some(amount_out) = amount_out {
+                route.execution_instructions.extend(
+                    convert_to(
+                        out_token,
+                        (&request.token_out).into(),
+                        amount_out,
+                        request.trader_account_id.clone(),
+                    )
+                    .await,
+                );
+            }
+        }
+        route.execution_instructions =
+            optimize_execution_instructions(route.execution_instructions.clone());
+    }
+
     tracing::info!("Found {} routes: {:?}", routes.len(), routes);
 
-    Ok(Json(routes))
+    Ok(Json(routes.into_iter().map(|(route, _)| route).collect()))
 }
 
 #[tokio::main]

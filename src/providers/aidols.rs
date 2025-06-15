@@ -8,8 +8,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        create_storage_deposit_action, create_unwrap_action, create_wrap_action, get_slippage_f64,
-        needs_storage_deposit, RPC_CLIENT, WRAP_NEAR,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -24,35 +23,26 @@ impl Provider for AidolsProvider {
         DexId::Aidols
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
         Box::pin(async move {
-            let (is_buy, needs_to_wrap) = if request.token_in == TokenId::Near {
-                (true, true)
-            } else if request.token_in == TokenId::Nep141(WRAP_NEAR.parse().unwrap()) {
-                (true, false)
-            } else if request.token_out == TokenId::Near {
-                (false, true)
-            } else if request.token_out == TokenId::Nep141(WRAP_NEAR.parse().unwrap()) {
-                (false, false)
+            let (_, nep141_in) = convert_to_nep141(&request.token_in, None, 0).await?;
+            let (_, nep141_out) = convert_to_nep141(&request.token_out, None, 0).await?;
+            let is_buy = nep141_in == WRAP_NEAR;
+
+            let aidol_token = if is_buy {
+                nep141_out.clone()
             } else {
-                return None;
+                nep141_in.clone()
             };
 
-            let other_token = if is_buy {
-                match request.token_out {
-                    TokenId::Nep141(ref account_id) => account_id.clone(),
-                    _ => return None,
-                }
-            } else {
-                match request.token_in {
-                    TokenId::Nep141(ref account_id) => account_id.clone(),
-                    _ => return None,
-                }
-            };
-
-            if !other_token.is_sub_account_of(&AIDOLS_CONTRACT_ID.parse::<AccountId>().unwrap()) {
+            info!("aidol_token: {}", aidol_token);
+            if !aidol_token.is_sub_account_of(&AIDOLS_CONTRACT_ID.parse::<AccountId>().unwrap()) {
                 return None;
             }
+            info!("aidol_token is sub account of aidols");
 
             match request.amount {
                 Amount::AmountIn(exact_amount_in) => {
@@ -64,14 +54,8 @@ impl Provider for AidolsProvider {
                             AIDOLS_CONTRACT_ID.parse().unwrap(),
                             "emulate_swap",
                             serde_json::json!({
-                                "input_token": match request.token_in {
-                                    TokenId::Near => WRAP_NEAR.to_string(),
-                                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                                },
-                                "output_token": match request.token_out {
-                                    TokenId::Near => WRAP_NEAR.to_string(),
-                                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                                },
+                                "input_token": nep141_in,
+                                "output_token": nep141_out,
                                 "amount": exact_amount_in.to_string(),
                             }),
                             QueryFinality::Finality(Finality::DoomSlug),
@@ -101,7 +85,7 @@ impl Provider for AidolsProvider {
                             "amount": exact_amount_in.to_string(),
                             "msg": serde_json::to_string(&serde_json::json!({
                                 "token": if is_buy {
-                                    Some(other_token.to_string())
+                                    Some(aidol_token.to_string())
                                 } else {
                                     None
                                 },
@@ -113,56 +97,26 @@ impl Provider for AidolsProvider {
                         deposit: NearToken::from_yoctonear(1),
                     }));
 
-                    let mut actions = vec![swap_action];
-                    if needs_to_wrap && is_buy {
-                        // Wrap NEAR -> wNEAR before buying a token
-                        actions.insert(
-                            0,
-                            create_wrap_action(NearToken::from_yoctonear(exact_amount_in)),
-                        );
-                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                            if needs_storage_deposit(
-                                trader_account_id,
-                                &TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
-                            )
-                            .await
-                            {
-                                actions.insert(
-                                    0,
-                                    create_storage_deposit_action(&TokenId::Nep141(
-                                        WRAP_NEAR.parse::<AccountId>().unwrap(),
-                                    ))
-                                    .await,
-                                );
-                            }
-                        }
-                    }
-                    let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                        receiver_id: if is_buy {
-                            WRAP_NEAR.parse().unwrap()
-                        } else {
-                            other_token
-                        },
-                        actions,
-                        continue_if_failed: false,
-                    }];
-                    if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                        if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                            transactions.insert(
-                                0,
-                                ExecutionInstruction::NearTransaction {
-                                    receiver_id: match request.token_out {
-                                        TokenId::Near => unreachable!(),
-                                        TokenId::Nep141(ref account_id) => account_id.clone(),
-                                    },
-                                    actions: vec![
-                                        create_storage_deposit_action(&request.token_out).await,
-                                    ],
-                                    continue_if_failed: false,
-                                },
-                            );
-                        }
-                    }
+                    let transactions = [
+                        deposit_storage_if_needed(
+                            &TokenId::Nep141(nep141_out.clone()),
+                            request.trader_account_id.clone(),
+                        )
+                        .await,
+                        deposit_storage_if_needed(
+                            &TokenId::Nep141(nep141_in.clone()),
+                            request.trader_account_id.clone(),
+                        )
+                        .await,
+                        convert_to_nep141(&request.token_in, None, exact_amount_in)
+                            .await?
+                            .0,
+                        vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: nep141_in,
+                            actions: vec![swap_action],
+                        }],
+                    ]
+                    .concat();
                     let route = Route {
                         dex_id: DexId::Aidols,
                         deadline: None,
@@ -170,10 +124,12 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountOut(estimated_amount_out),
                         worst_case_amount: Amount::AmountOut(min_amount_out),
                         execution_instructions: transactions,
-                        needs_unwrap: needs_to_wrap,
+                        needs_unwrap: !is_buy
+                            && request.token_in
+                                != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
                     };
 
-                    Some(route)
+                    Some((route, TokenId::Nep141(nep141_out.clone())))
                 }
                 Amount::AmountOut(exact_amount_out) => {
                     let Ok((required_amount_in, _fee, _is_deployed, is_tradable)): Result<
@@ -184,14 +140,8 @@ impl Provider for AidolsProvider {
                             AIDOLS_CONTRACT_ID.parse().unwrap(),
                             "emulate_swap_by_out",
                             serde_json::json!({
-                                "input_token": match request.token_in {
-                                    TokenId::Near => WRAP_NEAR.to_string(),
-                                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                                },
-                                "output_token": match request.token_out {
-                                    TokenId::Near => WRAP_NEAR.to_string(),
-                                    TokenId::Nep141(ref account_id) => account_id.to_string(),
-                                },
+                                "input_token": nep141_in,
+                                "output_token": nep141_out,
                                 "amount_out": exact_amount_out.to_string(),
                             }),
                             QueryFinality::Finality(Finality::DoomSlug),
@@ -221,7 +171,7 @@ impl Provider for AidolsProvider {
                             "amount": max_amount_in.to_string(),
                             "msg": serde_json::to_string(&serde_json::json!({
                                 "token": if is_buy {
-                                    Some(other_token.to_string())
+                                    Some(aidol_token.to_string())
                                 } else {
                                     None
                                 },
@@ -234,65 +184,24 @@ impl Provider for AidolsProvider {
                         deposit: NearToken::from_yoctonear(1),
                     }));
 
-                    let mut actions = vec![swap_action];
-                    if needs_to_wrap && is_buy {
-                        // Wrap NEAR -> wNEAR before buying a token
-                        actions.push(create_wrap_action(NearToken::from_yoctonear(max_amount_in)));
-
-                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                            if needs_storage_deposit(
-                                trader_account_id,
-                                &TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
-                            )
-                            .await
-                            {
-                                actions.insert(
-                                    0,
-                                    create_storage_deposit_action(&TokenId::Nep141(
-                                        WRAP_NEAR.parse::<AccountId>().unwrap(),
-                                    ))
-                                    .await,
-                                );
-                            }
-                        }
-                    }
-
-                    let mut transactions = vec![ExecutionInstruction::NearTransaction {
-                        receiver_id: if is_buy {
-                            WRAP_NEAR.parse().unwrap()
-                        } else {
-                            other_token
-                        },
-                        actions,
-                        continue_if_failed: false,
-                    }];
-                    if needs_to_wrap && !is_buy {
-                        // Unwrap wNEAR -> NEAR after selling a token
-                        transactions.push(ExecutionInstruction::NearTransaction {
-                            receiver_id: WRAP_NEAR.parse().unwrap(),
-                            actions: vec![create_unwrap_action(NearToken::from_yoctonear(
-                                exact_amount_out,
-                            ))],
-                            continue_if_failed: false,
-                        });
-                    }
-                    if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                        if needs_storage_deposit(trader_account_id, &request.token_out).await {
-                            transactions.insert(
-                                0,
-                                ExecutionInstruction::NearTransaction {
-                                    receiver_id: match request.token_out {
-                                        TokenId::Near => unreachable!(),
-                                        TokenId::Nep141(ref account_id) => account_id.clone(),
-                                    },
-                                    actions: vec![
-                                        create_storage_deposit_action(&request.token_out).await,
-                                    ],
-                                    continue_if_failed: false,
-                                },
-                            );
-                        }
-                    }
+                    let transactions = [
+                        deposit_storage_if_needed(
+                            &TokenId::Nep141(nep141_out.clone()),
+                            request.trader_account_id.clone(),
+                        )
+                        .await,
+                        deposit_storage_if_needed(
+                            &TokenId::Nep141(nep141_in.clone()),
+                            request.trader_account_id.clone(),
+                        )
+                        .await,
+                        convert_to_nep141(&request.token_in, None, 0).await?.0,
+                        vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: nep141_in,
+                            actions: vec![swap_action],
+                        }],
+                    ]
+                    .concat();
                     let route = Route {
                         dex_id: DexId::Aidols,
                         deadline: None,
@@ -300,10 +209,12 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountIn(required_amount_in),
                         worst_case_amount: Amount::AmountIn(max_amount_in),
                         execution_instructions: transactions,
-                        needs_unwrap: needs_to_wrap,
+                        needs_unwrap: is_buy
+                            && request.token_out
+                                != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
                     };
 
-                    Some(route)
+                    Some((route, TokenId::Nep141(nep141_out.clone())))
                 }
             }
         })
