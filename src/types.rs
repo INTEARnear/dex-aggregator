@@ -19,7 +19,7 @@ pub enum Amount {
 pub enum TokenId {
     Near,
     Nep141(AccountId),
-    // Nep141OnRhea(AccountId),
+    Nep141OnRhea(AccountId),
     // Nep141OnIntents(AccountId),
 }
 
@@ -31,7 +31,7 @@ impl Serialize for TokenId {
         match self {
             TokenId::Near => "near".to_string(),
             TokenId::Nep141(account_id) => format!("nep141:{account_id}"),
-            // TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
+            TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
             // TokenId::Nep141OnIntents(account_id) => format!("intents-nep141:{account_id}"),
         }
         .serialize(serializer)
@@ -54,10 +54,10 @@ impl FromStr for TokenId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "near" {
             Ok(TokenId::Near)
-        // } else if let Some(account_id) = s.strip_prefix("rhea-nep141:") {
-        //     Ok(TokenId::Nep141OnRhea(
-        //         account_id.parse().map_err(|_| "Invalid token ID")?,
-        //     ))
+        } else if let Some(account_id) = s.strip_prefix("rhea-nep141:") {
+            Ok(TokenId::Nep141OnRhea(
+                account_id.parse().map_err(|_| "Invalid token ID")?,
+            ))
         // } else if let Some(account_id) = s.strip_prefix("intents-nep141:") {
         //     Ok(TokenId::Nep141OnIntents(
         //         account_id.parse().map_err(|_| "Invalid token ID")?,
@@ -201,7 +201,12 @@ pub struct Route {
     /// swap, and unwrap the difference. When choosing amount_out, it can also happen
     /// when we wrap too much NEAR into wNEAR (because we're accounting for slippage)
     /// but the resulting wNEAR amount spent is less than what we wrapped.
-    pub needs_unwrap: bool,
+    #[serde(rename = "needs_unwrap")]
+    pub has_leftover_after_slippage_that_needs_unwrapping: bool,
+    /// The location of the token to unwrap from. For example, if a certain dex returns
+    /// NEP-141 tokens, but you want them to be native NEAR, you need to call near_withdraw
+    /// or request a quote from this service again (usually it'll have 0% fee / slippage)
+    pub token_output: TokenId,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -262,6 +267,16 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     RheaDcl,
+    /// https://metapool.app/
+    /// Liquid Staking provider
+    ///
+    /// Supports NEAR -> STNEAR and STNEAR -> NEAR, both AmountIn and AmountOut
+    MetaPool,
+    /// https://linearprotocol.org/
+    /// Liquid Staking provider
+    ///
+    /// Supports NEAR -> LiNEAR and LiNEAR -> NEAR, both AmountIn and AmountOut
+    Linear,
 }
 
 const RHEA_STR: &str = "Rhea";
@@ -272,6 +287,8 @@ const GRA_FUN_STR: &str = "GraFun";
 const JUMPDEFI_STR: &str = "Jumpdefi";
 const WRAP_STR: &str = "Wrap";
 const RHEA_DCL_STR: &str = "RheaDcl";
+const METAPOOL_STR: &str = "MetaPool";
+const LINEAR_STR: &str = "Linear";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -284,6 +301,8 @@ impl Display for DexId {
             DexId::Jumpdefi => f.write_str(JUMPDEFI_STR),
             DexId::Wrap => f.write_str(WRAP_STR),
             DexId::RheaDcl => f.write_str(RHEA_DCL_STR),
+            DexId::MetaPool => f.write_str(METAPOOL_STR),
+            DexId::Linear => f.write_str(LINEAR_STR),
         }
     }
 }
@@ -301,6 +320,8 @@ impl FromStr for DexId {
             JUMPDEFI_STR => DexId::Jumpdefi,
             WRAP_STR => DexId::Wrap,
             RHEA_DCL_STR => DexId::RheaDcl,
+            METAPOOL_STR => DexId::MetaPool,
+            LINEAR_STR => DexId::Linear,
             _ => return Err(format!("Invalid dex id: {}", s)),
         })
     }

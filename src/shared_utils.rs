@@ -11,11 +11,28 @@ use near_min_api::{
     QueryFinality, RpcClient,
 };
 use reqwest::{Client, ClientBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{ExecutionInstruction, Slippage, TokenId};
 
 pub const WRAP_NEAR: &str = "wrap.near";
+
+impl TokenId {
+    pub fn location(&self) -> TokenLocation {
+        match self {
+            TokenId::Near => TokenLocation::Native,
+            TokenId::Nep141(_) => TokenLocation::Nep141,
+            TokenId::Nep141OnRhea(_) => TokenLocation::Nep141OnRhea,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenLocation {
+    Native,
+    Nep141,
+    Nep141OnRhea,
+}
 
 pub fn create_wrap_action(amount: NearToken) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
@@ -44,6 +61,9 @@ pub async fn needs_storage_deposit(account_id: &AccountId, token_id: &TokenId) -
     match token_id {
         TokenId::Near => false,
         TokenId::Nep141(token_id) => needs_storage_deposit_for_contract(account_id, token_id).await,
+        TokenId::Nep141OnRhea(_token_id) => {
+            false // TODO: maybe implement storage deposit for Rhea contract here?
+        }
     }
 }
 
@@ -82,6 +102,9 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Action {
             create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap())
         }
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
+        TokenId::Nep141OnRhea(_token_id) => {
+            panic!("Rhea doesn't need a storage deposit") // TODO: maybe needs registration?
+        }
     }
 }
 
@@ -291,30 +314,53 @@ pub async fn convert_to_nep141(
             }
             Some((transactions, WRAP_NEAR.parse::<AccountId>().unwrap()))
         }
-        TokenId::Nep141(account_id) => Some((vec![], account_id.clone())),
+        TokenId::Nep141(token_id) => Some((vec![], token_id.clone())),
+        TokenId::Nep141OnRhea(token_id) => Some((
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "withdraw".to_string(),
+                    args: serde_json::to_vec(&serde_json::json!({
+                        "token_id": token_id.to_string(),
+                        "amount": amount.to_string(),
+                        "skip_unwrap_near": true,
+                    }))
+                    .unwrap(),
+                    gas: NearGas::from_tgas(50).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }))],
+            }],
+            token_id.clone(),
+        )),
     }
 }
 
-// pub async fn convert_to_native(
-//     token_id: &TokenId,
-//     _trader_account_id: Option<AccountId>,
-//     amount: Balance,
-// ) -> Option<Vec<ExecutionInstruction>> {
-//     match token_id {
-//         TokenId::Near => Some(vec![]),
-//         TokenId::Nep141(account_id) if account_id == WRAP_NEAR => {
-//             let mut transactions = vec![];
-//             if amount > 0 {
-//                 transactions.push(ExecutionInstruction::NearTransaction {
-//                     receiver_id: account_id.clone(),
-//                     actions: vec![create_unwrap_action(NearToken::from_yoctonear(amount))],
-//                 });
-//             }
-//             Some(transactions)
-//         }
-//         TokenId::Nep141(_) => None,
-//     }
-// }
+pub async fn convert_to_native(
+    token_id: &TokenId,
+    _trader_account_id: Option<AccountId>,
+    amount: NearToken,
+) -> Option<Vec<ExecutionInstruction>> {
+    match token_id {
+        TokenId::Near => Some(vec![]),
+        TokenId::Nep141(account_id) => {
+            if account_id == WRAP_NEAR {
+                let mut transactions = vec![];
+                if !amount.is_zero() {
+                    transactions.push(ExecutionInstruction::NearTransaction {
+                        receiver_id: account_id.clone(),
+                        actions: vec![create_unwrap_action(amount)],
+                    });
+                }
+                Some(transactions)
+            } else {
+                None
+            }
+        }
+        TokenId::Nep141OnRhea(_) => {
+            None // TODO
+        }
+    }
+}
 
 pub async fn deposit_storage_if_needed(
     token_id: &TokenId,
@@ -334,21 +380,26 @@ pub async fn deposit_storage_if_needed(
             transactions
         }
         TokenId::Near => vec![],
+        TokenId::Nep141OnRhea(_token_id) => {
+            let mut transactions = vec![];
+            if let Some(trader_account_id) = trader_account_id.into() {
+                if needs_storage_deposit(&trader_account_id, token_id).await {
+                    transactions.push(ExecutionInstruction::NearTransaction {
+                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                        actions: vec![create_storage_deposit_action(token_id).await],
+                    });
+                }
+            }
+            transactions
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenLocation {
-    Native,
-    Nep141,
-}
-
-impl From<&TokenId> for TokenLocation {
-    fn from(token_id: &TokenId) -> Self {
-        match token_id {
-            TokenId::Near => TokenLocation::Native,
-            TokenId::Nep141(_) => TokenLocation::Nep141,
-        }
+pub fn is_near(token_id: &TokenId) -> bool {
+    match token_id {
+        TokenId::Near => true,
+        TokenId::Nep141(token_id) => token_id == WRAP_NEAR,
+        TokenId::Nep141OnRhea(token_id) => token_id == WRAP_NEAR,
     }
 }
 
@@ -356,7 +407,7 @@ pub async fn convert_to(
     from: &TokenId,
     to: TokenLocation,
     amount: Balance,
-    _trader_account_id: Option<AccountId>,
+    trader_account_id: Option<AccountId>,
 ) -> Vec<ExecutionInstruction> {
     match (from, to) {
         (TokenId::Near, TokenLocation::Native) => vec![],
@@ -370,6 +421,36 @@ pub async fn convert_to(
                 vec![]
             }
         }
+        (TokenId::Near, TokenLocation::Nep141OnRhea) => [
+            deposit_storage_if_needed(
+                &TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
+                trader_account_id,
+            )
+            .await,
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "near_deposit".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                        gas: NearGas::from_tgas(2).as_gas(),
+                        deposit: NearToken::from_yoctonear(amount),
+                    })),
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "ft_transfer_call".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "receiver_id": "v2.ref-finance.near",
+                            "amount": amount.to_string(),
+                            "msg": "",
+                        }))
+                        .unwrap(),
+                        gas: NearGas::from_tgas(50).as_gas(),
+                        deposit: NearToken::from_yoctonear(1),
+                    })),
+                ],
+            }],
+        ]
+        .concat(),
         (TokenId::Nep141(token_id), TokenLocation::Native) if token_id == WRAP_NEAR => {
             if amount > 0 {
                 vec![ExecutionInstruction::NearTransaction {
@@ -382,5 +463,55 @@ pub async fn convert_to(
         }
         (TokenId::Nep141(_), TokenLocation::Native) => vec![],
         (TokenId::Nep141(_), TokenLocation::Nep141) => vec![],
+        (TokenId::Nep141(token_id), TokenLocation::Nep141OnRhea) => {
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: token_id.clone(),
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "ft_transfer_call".to_string(),
+                    args: serde_json::to_vec(&serde_json::json!({
+                        "receiver_id": "v2.ref-finance.near",
+                        "amount": amount.to_string(),
+                        "msg": "",
+                    }))
+                    .unwrap(),
+                    gas: NearGas::from_tgas(50).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }))],
+            }]
+        }
+        (TokenId::Nep141OnRhea(token_id), TokenLocation::Native) if token_id == WRAP_NEAR => {
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "withdraw".to_string(),
+                    args: serde_json::to_vec(&serde_json::json!({
+                        "token_id": token_id.to_string(),
+                        "amount": amount.to_string(),
+                        "skip_unwrap_near": false,
+                    }))
+                    .unwrap(),
+                    gas: NearGas::from_tgas(50).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }))],
+            }]
+        }
+        (TokenId::Nep141OnRhea(_), TokenLocation::Native) => vec![],
+        (TokenId::Nep141OnRhea(token_id), TokenLocation::Nep141) => {
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "withdraw".to_string(),
+                    args: serde_json::to_vec(&serde_json::json!({
+                        "token_id": token_id.to_string(),
+                        "amount": amount.to_string(),
+                        "skip_unwrap_near": true,
+                    }))
+                    .unwrap(),
+                    gas: NearGas::from_tgas(50).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }))],
+            }]
+        }
+        (TokenId::Nep141OnRhea(_), TokenLocation::Nep141OnRhea) => vec![],
     }
 }

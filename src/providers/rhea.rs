@@ -24,10 +24,7 @@ impl Provider for RheaProvider {
         DexId::Rhea
     }
 
-    fn route(
-        &self,
-        request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
+    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
             let Amount::AmountIn(exact_amount_in) = request.amount else {
                 // smartrouter.ref.finance/findPath doesn't support AmountOut
@@ -95,7 +92,7 @@ impl Provider for RheaProvider {
                     })).unwrap(),
                 }))
                 .unwrap(),
-                gas: NearGas::from_tgas(100).as_gas(),
+                gas: NearGas::from_tgas(150).as_gas(),
                 deposit: NearToken::from_yoctonear(1),
             }));
             let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -103,39 +100,47 @@ impl Provider for RheaProvider {
                 actions: vec![ft_transfer_call_swap_action],
             }];
 
+            let (input_to_nep141, input_nep141) = convert_to_nep141(
+                &request.token_in,
+                request.trader_account_id.clone(),
+                exact_amount_in,
+            )
+            .await?;
+
             let transactions = [
-                deposit_storage_if_needed(&request.token_out, request.trader_account_id.clone())
-                    .await,
-                deposit_storage_if_needed(&request.token_in, request.trader_account_id.clone())
-                    .await,
-                convert_to_nep141(
-                    &request.token_in,
+                deposit_storage_if_needed(
+                    &if unwrapping_near {
+                        TokenId::Near
+                    } else {
+                        TokenId::Nep141(token_out.clone())
+                    },
                     request.trader_account_id.clone(),
-                    exact_amount_in,
                 )
-                .await?
-                .0,
+                .await,
+                deposit_storage_if_needed(
+                    &TokenId::Nep141(input_nep141),
+                    request.trader_account_id.clone(),
+                )
+                .await,
+                input_to_nep141,
                 swap_transactions,
             ]
             .concat();
 
-            let route = Route {
+            Some(Route {
                 dex_id: DexId::Rhea,
                 deadline: None,
                 has_slippage: true,
                 estimated_amount: Amount::AmountOut(response.result_data.amount_out),
                 worst_case_amount: Amount::AmountOut(route.min_amount_out),
                 execution_instructions: transactions,
-                needs_unwrap: false,
-            };
-            Some((
-                route,
-                if unwrapping_near {
+                has_leftover_after_slippage_that_needs_unwrapping: false,
+                token_output: if unwrapping_near {
                     TokenId::Near
                 } else {
                     TokenId::Nep141(token_out)
                 },
-            ))
+            })
         })
     }
 }

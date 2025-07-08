@@ -23,10 +23,7 @@ impl Provider for RheaDclProvider {
         DexId::RheaDcl
     }
 
-    fn route(
-        &self,
-        request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
+    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
             let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
             let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
@@ -96,7 +93,7 @@ impl Provider for RheaDclProvider {
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
-                                gas: NearGas::from_tgas(70).as_gas(),
+                                gas: NearGas::from_tgas(100).as_gas(),
                                 deposit: NearToken::from_yoctonear(1),
                             }));
 
@@ -125,22 +122,20 @@ impl Provider for RheaDclProvider {
                             swap_transactions,
                         ]
                         .concat();
-                        Some((
-                            Route {
-                                dex_id: DexId::RheaDcl,
-                                estimated_amount: Amount::AmountOut(quote.amount),
-                                deadline: None,
-                                has_slippage: true,
-                                worst_case_amount: Amount::AmountOut(min_amount_out),
-                                execution_instructions: transactions,
-                                needs_unwrap: false,
-                            },
-                            if unwrapping_near {
+                        Some(Route {
+                            dex_id: DexId::RheaDcl,
+                            estimated_amount: Amount::AmountOut(quote.amount),
+                            deadline: None,
+                            has_slippage: true,
+                            worst_case_amount: Amount::AmountOut(min_amount_out),
+                            execution_instructions: transactions,
+                            has_leftover_after_slippage_that_needs_unwrapping: false,
+                            token_output: if unwrapping_near {
                                 TokenId::Near
                             } else {
                                 TokenId::Nep141(token_out)
                             },
-                        ))
+                        })
                     } else {
                         None
                     }
@@ -196,7 +191,7 @@ impl Provider for RheaDclProvider {
                                 })).unwrap(),
                             }))
                             .unwrap(),
-                            gas: NearGas::from_tgas(70).as_gas(),
+                            gas: NearGas::from_tgas(100).as_gas(),
                             deposit: NearToken::from_yoctonear(1),
                         }));
 
@@ -204,43 +199,45 @@ impl Provider for RheaDclProvider {
                             receiver_id: token_in,
                             actions: vec![swap_action],
                         }];
+                        let (input_to_nep141, input_nep141) = convert_to_nep141(
+                            &request.token_in,
+                            request.trader_account_id.clone(),
+                            max_amount_in,
+                        )
+                        .await?;
                         let transactions = [
                             deposit_storage_if_needed(
-                                &request.token_out,
+                                &if unwrapping_near {
+                                    TokenId::Near
+                                } else {
+                                    TokenId::Nep141(token_out.clone())
+                                },
                                 request.trader_account_id.clone(),
                             )
                             .await,
                             deposit_storage_if_needed(
-                                &request.token_in,
+                                &TokenId::Nep141(input_nep141),
                                 request.trader_account_id.clone(),
                             )
                             .await,
-                            convert_to_nep141(
-                                &request.token_in,
-                                request.trader_account_id.clone(),
-                                max_amount_in,
-                            )
-                            .await?
-                            .0,
+                            input_to_nep141,
                             swap_transactions,
                         ]
                         .concat();
-                        Some((
-                            Route {
-                                dex_id: DexId::RheaDcl,
-                                estimated_amount: Amount::AmountIn(quote.amount),
-                                deadline: None,
-                                has_slippage: true,
-                                worst_case_amount: Amount::AmountIn(max_amount_in),
-                                execution_instructions: transactions,
-                                needs_unwrap: false,
-                            },
-                            if unwrapping_near {
+                        Some(Route {
+                            dex_id: DexId::RheaDcl,
+                            estimated_amount: Amount::AmountIn(quote.amount),
+                            deadline: None,
+                            has_slippage: true,
+                            worst_case_amount: Amount::AmountIn(max_amount_in),
+                            execution_instructions: transactions,
+                            has_leftover_after_slippage_that_needs_unwrapping: false,
+                            token_output: if unwrapping_near {
                                 TokenId::Near
                             } else {
                                 TokenId::Nep141(token_out)
                             },
-                        ))
+                        })
                     } else {
                         None
                     }

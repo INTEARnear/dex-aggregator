@@ -23,10 +23,7 @@ impl Provider for AidolsProvider {
         DexId::Aidols
     }
 
-    fn route(
-        &self,
-        request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
+    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
             let (_, nep141_in) = convert_to_nep141(&request.token_in, None, 0).await?;
             let (_, nep141_out) = convert_to_nep141(&request.token_out, None, 0).await?;
@@ -38,11 +35,9 @@ impl Provider for AidolsProvider {
                 nep141_in.clone()
             };
 
-            info!("aidol_token: {}", aidol_token);
             if !aidol_token.is_sub_account_of(&AIDOLS_CONTRACT_ID.parse::<AccountId>().unwrap()) {
                 return None;
             }
-            info!("aidol_token is sub account of aidols");
 
             match request.amount {
                 Amount::AmountIn(exact_amount_in) => {
@@ -124,12 +119,13 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountOut(estimated_amount_out),
                         worst_case_amount: Amount::AmountOut(min_amount_out),
                         execution_instructions: transactions,
-                        needs_unwrap: !is_buy
+                        has_leftover_after_slippage_that_needs_unwrapping: !is_buy
                             && request.token_in
                                 != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
+                        token_output: TokenId::Nep141(nep141_out.clone()),
                     };
 
-                    Some((route, TokenId::Nep141(nep141_out.clone())))
+                    Some(route)
                 }
                 Amount::AmountOut(exact_amount_out) => {
                     let Ok((required_amount_in, _fee, _is_deployed, is_tradable)): Result<
@@ -209,12 +205,13 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountIn(required_amount_in),
                         worst_case_amount: Amount::AmountIn(max_amount_in),
                         execution_instructions: transactions,
-                        needs_unwrap: is_buy
+                        has_leftover_after_slippage_that_needs_unwrapping: is_buy
                             && request.token_out
                                 != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
+                        token_output: TokenId::Nep141(nep141_out.clone()),
                     };
 
-                    Some((route, TokenId::Nep141(nep141_out.clone())))
+                    Some(route)
                 }
             }
         })

@@ -13,9 +13,7 @@ const INTENTS_RPC_URL: &str = "https://solver-relay-v2.chaindefuser.com/rpc";
 const INTENTS_CONTRACT_ID: &str = "intents.near";
 
 use crate::{
-    shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, REQWEST_CLIENT, RPC_CLIENT, WRAP_NEAR,
-    },
+    shared_utils::{convert_to_nep141, deposit_storage_if_needed, REQWEST_CLIENT, RPC_CLIENT},
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
@@ -27,15 +25,15 @@ impl Provider for NearIntentsProvider {
         DexId::NearIntents
     }
 
-    fn route(
-        &self,
-        request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
+    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
             let Some(account_id) = request.trader_account_id.as_ref() else {
                 // Need to have trader's account ID for intents
                 return None;
             };
+
+            let nep141_in = convert_to_nep141(&request.token_in, None, 0).await?.1;
+            let nep141_out = convert_to_nep141(&request.token_out, None, 0).await?.1;
 
             let response = REQWEST_CLIENT
                 .post(INTENTS_RPC_URL)
@@ -44,14 +42,8 @@ impl Provider for NearIntentsProvider {
                     id: "dontcare".to_string(),
                     method: "quote".to_string(),
                     params: vec![NearIntentsQuoteParams {
-                        defuse_asset_identifier_out: match request.token_out {
-                            TokenId::Near => format!("nep141:{WRAP_NEAR}"),
-                            TokenId::Nep141(ref account_id) => format!("nep141:{account_id}"),
-                        },
-                        defuse_asset_identifier_in: match request.token_in {
-                            TokenId::Near => format!("nep141:{WRAP_NEAR}"),
-                            TokenId::Nep141(ref account_id) => format!("nep141:{account_id}"),
-                        },
+                        defuse_asset_identifier_in: format!("nep141:{nep141_in}"),
+                        defuse_asset_identifier_out: format!("nep141:{nep141_out}"),
                         amount: request.amount.into(),
                         min_deadline_ms: Duration::from_secs(15).as_millis() as u64,
                         wait_ms: (request.max_wait_ms - 500).min(5000), // account for latency
@@ -71,16 +63,8 @@ impl Provider for NearIntentsProvider {
                 .result
                 .into_iter()
                 .filter(|quote| {
-                    quote.defuse_asset_identifier_in
-                        == match request.token_in {
-                            TokenId::Near => format!("nep141:{WRAP_NEAR}"),
-                            TokenId::Nep141(ref account_id) => format!("nep141:{account_id}"),
-                        }
-                        && quote.defuse_asset_identifier_out
-                            == match request.token_out {
-                                TokenId::Near => format!("nep141:{WRAP_NEAR}"),
-                                TokenId::Nep141(ref account_id) => format!("nep141:{account_id}"),
-                            }
+                    quote.defuse_asset_identifier_in == format!("nep141:{nep141_in}")
+                        && quote.defuse_asset_identifier_out == format!("nep141:{nep141_out}")
                 })
                 .min_by_key(|quote| match request.amount {
                     // If 2 or more quotes return amount more than i128::MAX, don't care about these
@@ -89,7 +73,7 @@ impl Provider for NearIntentsProvider {
                     Amount::AmountIn(_) => -(quote.amount_out.try_into().unwrap_or(i128::MAX)),
                     Amount::AmountOut(_) => quote.amount_in.try_into().unwrap_or(i128::MAX),
                 })?;
-            let (input_to_nep141, input_nep141_id) = convert_to_nep141(
+            let (input_to_nep141, _) = convert_to_nep141(
                 &request.token_in,
                 Some(account_id.clone()),
                 best_quote.amount_in,
@@ -105,20 +89,23 @@ impl Provider for NearIntentsProvider {
             });
             let (withdraw_intent, withdraw_token) = (
                 serde_json::json!({
-                    "intent": match request.token_out {
-                        TokenId::Near => "native_withdraw",
-                        TokenId::Nep141(_) => "ft_withdraw",
+                    "intent": if let TokenId::Near = request.token_out {
+                        "native_withdraw"
+                    } else {
+                        "ft_withdraw"
                     },
-                    "token": match request.token_out {
-                        TokenId::Near => None,
-                        TokenId::Nep141(ref token_id) => Some(token_id.clone()),
+                    "token": if let TokenId::Near = request.token_out {
+                        None
+                    } else {
+                        Some(nep141_out.clone())
                     },
                     "receiver_id": account_id,
                     "amount": best_quote.amount_out.to_string(),
                 }),
-                match request.token_out {
-                    TokenId::Near => TokenId::Near,
-                    TokenId::Nep141(ref account_id) => TokenId::Nep141(account_id.clone()),
+                if let TokenId::Near = request.token_out {
+                    TokenId::Near
+                } else {
+                    TokenId::Nep141(nep141_out.clone())
                 },
             );
             let message = serde_json::json!({
@@ -132,7 +119,7 @@ impl Provider for NearIntentsProvider {
                 quote_hash: best_quote.quote_hash,
             }];
             let deposit_instructions = vec![ExecutionInstruction::NearTransaction {
-                receiver_id: input_nep141_id,
+                receiver_id: nep141_in.clone(),
                 actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                     method_name: "ft_transfer_call".to_string(),
                     args: serde_json::to_string(&serde_json::json!({
@@ -183,8 +170,8 @@ impl Provider for NearIntentsProvider {
                 };
             let instructions = [
                 add_public_key_instructions,
-                deposit_storage_if_needed(&request.token_out, account_id.clone()).await,
-                deposit_storage_if_needed(&request.token_in, account_id.clone()).await,
+                deposit_storage_if_needed(&TokenId::Nep141(nep141_in), account_id.clone()).await,
+                deposit_storage_if_needed(&TokenId::Nep141(nep141_out), account_id.clone()).await,
                 input_to_nep141,
                 deposit_instructions,
                 intents,
@@ -203,11 +190,11 @@ impl Provider for NearIntentsProvider {
                 deadline: Some(best_quote.expiration_time),
                 execution_instructions: instructions,
                 has_slippage: false,
-                needs_unwrap: false,
+                has_leftover_after_slippage_that_needs_unwrapping: false,
+                token_output: withdraw_token,
             };
 
-            // TODO only outputs NEP-141 or NEAR
-            Some((route, withdraw_token))
+            Some(route)
         })
     }
 }

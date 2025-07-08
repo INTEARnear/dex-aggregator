@@ -25,10 +25,7 @@ impl Provider for VeaxProvider {
         DexId::Veax
     }
 
-    fn route(
-        &self,
-        request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<(Route, TokenId)>> + Send>> {
+    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
             let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
             let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
@@ -215,10 +212,16 @@ impl Provider for VeaxProvider {
             }
             let transactions = [
                 veax_storage_deposit_transactions,
-                deposit_storage_if_needed(&request.token_out, request.trader_account_id.clone())
-                    .await,
-                deposit_storage_if_needed(&request.token_in, request.trader_account_id.clone())
-                    .await,
+                deposit_storage_if_needed(
+                    &TokenId::Nep141(token_out.clone()),
+                    request.trader_account_id.clone(),
+                )
+                .await,
+                deposit_storage_if_needed(
+                    &TokenId::Nep141(token_in.clone()),
+                    request.trader_account_id.clone(),
+                )
+                .await,
                 convert_to_nep141(
                     &request.token_in,
                     request.trader_account_id.clone(),
@@ -233,21 +236,20 @@ impl Provider for VeaxProvider {
                 swap_transactions,
             ]
             .concat();
-            Some((
-                Route {
-                    dex_id: DexId::Veax,
-                    estimated_amount,
-                    deadline: None,
-                    has_slippage: true,
-                    worst_case_amount,
-                    execution_instructions: transactions,
-                    needs_unwrap: (request.token_out == TokenId::Near
-                        && matches!(request.amount, Amount::AmountIn(_)))
-                        || (request.token_in == TokenId::Near
-                            && matches!(request.amount, Amount::AmountOut(_))),
-                },
-                TokenId::Nep141(token_out),
-            ))
+            Some(Route {
+                dex_id: DexId::Veax,
+                estimated_amount,
+                deadline: None,
+                has_slippage: true,
+                worst_case_amount,
+                execution_instructions: transactions,
+                has_leftover_after_slippage_that_needs_unwrapping: (request.token_out
+                    == TokenId::Near
+                    && matches!(request.amount, Amount::AmountIn(_)))
+                    || (request.token_in == TokenId::Near
+                        && matches!(request.amount, Amount::AmountOut(_))),
+                token_output: TokenId::Nep141(token_out),
+            })
         })
     }
 }

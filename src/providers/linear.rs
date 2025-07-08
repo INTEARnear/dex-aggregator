@@ -2,11 +2,11 @@ use std::{future::Future, pin::Pin};
 
 use crate::{shared_utils::convert_to_nep141, Amount, DexId, Provider, Route, SwapRequest};
 
-pub struct WrapProvider;
+pub struct LinearProvider;
 
-impl Provider for WrapProvider {
+impl Provider for LinearProvider {
     fn dex_id(&self) -> DexId {
-        DexId::Wrap
+        DexId::Linear
     }
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
