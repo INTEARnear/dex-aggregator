@@ -47,7 +47,7 @@ impl Provider for RheaProvider {
                 return None;
             };
 
-            let Ok(mut response) = response.json::<RheaSmartRouterResponse>().await else {
+            let Ok(response) = response.json::<RheaSmartRouterResponse>().await else {
                 return None;
             };
 
@@ -57,7 +57,17 @@ impl Provider for RheaProvider {
                 return None;
             }
 
-            let route = response.result_data.routes.remove(0);
+            let total_min_amount_out = response
+                .result_data
+                .routes
+                .iter()
+                .map(|route| route.min_amount_out)
+                .sum();
+            let steps = response
+                .result_data
+                .routes
+                .into_iter()
+                .flat_map(|route| route.pools);
 
             let unwrapping_near = request.token_out == TokenId::Near;
             let ft_transfer_call_swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
@@ -67,9 +77,7 @@ impl Provider for RheaProvider {
                     "amount": exact_amount_in.to_string(),
                     "msg": serde_json::to_string(&serde_json::json!({
                         "force": 0,
-                        "actions": route
-                            .pools
-                            .iter()
+                        "actions": steps
                             .map(|step| {
                                 let mut new_step = step.clone();
                                 if let Some(pool) = step.get("pool_id") {
@@ -132,7 +140,7 @@ impl Provider for RheaProvider {
                 deadline: None,
                 has_slippage: true,
                 estimated_amount: Amount::AmountOut(response.result_data.amount_out),
-                worst_case_amount: Amount::AmountOut(route.min_amount_out),
+                worst_case_amount: Amount::AmountOut(total_min_amount_out),
                 execution_instructions: transactions,
                 has_leftover_after_slippage_that_needs_unwrapping: false,
                 token_output: if unwrapping_near {
