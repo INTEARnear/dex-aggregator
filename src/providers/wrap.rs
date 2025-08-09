@@ -1,6 +1,9 @@
 use std::{future::Future, pin::Pin};
 
-use crate::{shared_utils::convert_to_nep141, Amount, DexId, Provider, Route, SwapRequest};
+use crate::{
+    shared_utils::{convert_to_nep141, deposit_storage_if_needed},
+    Amount, DexId, Provider, Route, SwapRequest,
+};
 
 pub struct WrapProvider;
 
@@ -28,7 +31,11 @@ impl Provider for WrapProvider {
                         Amount::AmountOut(amount) => Amount::AmountIn(amount),
                     },
                     dex_id: DexId::Wrap,
-                    execution_instructions: vec![],
+                    execution_instructions: deposit_storage_if_needed(
+                        &request.token_out,
+                        request.trader_account_id,
+                    )
+                    .await,
                     has_leftover_after_slippage_that_needs_unwrapping: false,
                     token_output: request.token_in,
                 });

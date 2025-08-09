@@ -23,6 +23,17 @@ pub enum TokenId {
     // Nep141OnIntents(AccountId),
 }
 
+impl TokenId {
+    pub fn get_account_id(&self) -> AccountId {
+        match self {
+            TokenId::Near => "wrap.near".parse().unwrap(),
+            TokenId::Nep141(account_id) => account_id.to_owned(),
+            TokenId::Nep141OnRhea(account_id) => account_id.to_owned(),
+            // TokenId::Nep141OnIntents(account_id) => account_id.to_owned(),
+        }
+    }
+}
+
 impl Serialize for TokenId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -228,7 +239,7 @@ pub enum ExecutionInstruction {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DexId {
-    /// https://dex.rhea.finance/
+    /// https://app.rhea.finance/
     /// AMM DEX
     ///
     /// Supports AmountIn, doesn't support AmountOut
@@ -262,7 +273,7 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     Wrap,
-    /// https://dex.rhea.finance/
+    /// https://app.rhea.finance/
     /// AMM DEX
     ///
     /// Supports both AmountIn and AmountOut
@@ -277,6 +288,11 @@ pub enum DexId {
     ///
     /// Supports NEAR -> LiNEAR and LiNEAR -> NEAR, both AmountIn and AmountOut
     Linear,
+    /// https://app.rhea.finance/stake
+    /// Staked $RHEA
+    ///
+    /// Supports RHEA -> XRHEA and XRHEA -> RHEA, both AmountIn and AmountOut
+    XRhea,
 }
 
 const RHEA_STR: &str = "Rhea";
@@ -289,6 +305,7 @@ const WRAP_STR: &str = "Wrap";
 const RHEA_DCL_STR: &str = "RheaDcl";
 const METAPOOL_STR: &str = "MetaPool";
 const LINEAR_STR: &str = "Linear";
+const XRHEA_STR: &str = "XRhea";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -303,6 +320,7 @@ impl Display for DexId {
             DexId::RheaDcl => f.write_str(RHEA_DCL_STR),
             DexId::MetaPool => f.write_str(METAPOOL_STR),
             DexId::Linear => f.write_str(LINEAR_STR),
+            DexId::XRhea => f.write_str(XRHEA_STR),
         }
     }
 }
@@ -322,6 +340,7 @@ impl FromStr for DexId {
             RHEA_DCL_STR => DexId::RheaDcl,
             METAPOOL_STR => DexId::MetaPool,
             LINEAR_STR => DexId::Linear,
+            XRHEA_STR => DexId::XRhea,
             _ => return Err(format!("Invalid dex id: {}", s)),
         })
     }

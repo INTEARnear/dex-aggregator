@@ -94,6 +94,7 @@ async fn route_handler(
         &providers::veax::VeaxProvider,
         &providers::metapool::MetapoolProvider,
         &providers::linear::LinearProvider,
+        &providers::xrhea::XRheaProvider,
     ];
 
     let mut routes = Vec::new();

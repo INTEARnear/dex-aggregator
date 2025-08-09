@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{env, future::Future, pin::Pin, time::Duration};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
@@ -35,25 +35,26 @@ impl Provider for NearIntentsProvider {
             let nep141_in = convert_to_nep141(&request.token_in, None, 0).await?.1;
             let nep141_out = convert_to_nep141(&request.token_out, None, 0).await?.1;
 
-            let response = REQWEST_CLIENT
-                .post(INTENTS_RPC_URL)
-                .json(&NearIntentsQuoteRequest {
-                    jsonrpc: "2.0".to_string(),
-                    id: "dontcare".to_string(),
-                    method: "quote".to_string(),
-                    params: vec![NearIntentsQuoteParams {
-                        defuse_asset_identifier_in: format!("nep141:{nep141_in}"),
-                        defuse_asset_identifier_out: format!("nep141:{nep141_out}"),
-                        amount: request.amount.into(),
-                        min_deadline_ms: Duration::from_secs(15).as_millis() as u64,
-                        wait_ms: (request.max_wait_ms - 500).min(5000), // account for latency
-                    }],
-                })
-                .send()
-                .await
-                .unwrap();
+            let mut request_builder = REQWEST_CLIENT.post(INTENTS_RPC_URL);
+            if let Ok(jwt) = env::var("INTENTS_JWT") {
+                request_builder = request_builder.bearer_auth(jwt);
+            }
+            request_builder = request_builder.json(&NearIntentsQuoteRequest {
+                jsonrpc: "2.0".to_string(),
+                id: "dontcare".to_string(),
+                method: "quote".to_string(),
+                params: vec![NearIntentsQuoteParams {
+                    defuse_asset_identifier_in: format!("nep141:{nep141_in}"),
+                    defuse_asset_identifier_out: format!("nep141:{nep141_out}"),
+                    amount: request.amount.into(),
+                    min_deadline_ms: Duration::from_secs(15).as_millis() as u64,
+                    wait_ms: (request.max_wait_ms - 500).min(5000), // account for latency
+                }],
+            });
 
-            let Ok(response) = response.json::<NearIntentsQuoteResponse>().await else {
+            let response = request_builder.send().await.unwrap();
+
+            let Ok(response) = dbg!(response.json::<NearIntentsQuoteResponse>().await) else {
                 return None;
             };
 

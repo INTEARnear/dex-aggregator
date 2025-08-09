@@ -2,14 +2,17 @@ use std::{future::Future, pin::Pin};
 
 use futures_util::TryFutureExt;
 use near_min_api::{
-    types::{Action, Balance, Finality, FunctionCallAction, NearGas, NearToken},
+    types::{AccountId, Action, Balance, Finality, FunctionCallAction, NearGas, NearToken},
     utils::dec_format,
     QueryFinality,
 };
 use serde::Deserialize;
 
 use crate::{
-    shared_utils::{convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, RPC_CLIENT},
+    shared_utils::{
+        convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
+        get_slippage_f64, RPC_CLIENT,
+    },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
@@ -102,6 +105,12 @@ impl Provider for RheaDclProvider {
                             actions: vec![ft_transfer_call_swap_action],
                         }];
                         let transactions = [
+                            deposit_storage_on_contract_if_needed(
+                                &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                                request.trader_account_id.clone(),
+                                NearToken::from_millinear(500),
+                            )
+                            .await,
                             deposit_storage_if_needed(
                                 &request.token_out,
                                 request.trader_account_id.clone(),
@@ -206,6 +215,12 @@ impl Provider for RheaDclProvider {
                         )
                         .await?;
                         let transactions = [
+                            deposit_storage_on_contract_if_needed(
+                                &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                                request.trader_account_id.clone(),
+                                NearToken::from_millinear(500),
+                            )
+                            .await,
                             deposit_storage_if_needed(
                                 &if unwrapping_near {
                                     TokenId::Near

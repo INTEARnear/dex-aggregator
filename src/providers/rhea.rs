@@ -69,6 +69,58 @@ impl Provider for RheaProvider {
                 .into_iter()
                 .flat_map(|route| route.pools);
 
+            // Normalize steps once so we can reuse for both direct Rhea swap and ft_transfer_call paths
+            let actions: Vec<serde_json::Value> = steps
+                .map(|step| {
+                    let mut new_step = step.clone();
+                    if let Some(pool) = step.get("pool_id") {
+                        if let Some(pool_str) = pool.as_str() {
+                            if let Ok(pool_u64) = pool_str.parse::<u64>() {
+                                new_step["pool_id"] = serde_json::Value::from(pool_u64);
+                            }
+                        }
+                    }
+                    if let Some(amount_in) = step.get("amount_in") {
+                        if amount_in == "0" {
+                            new_step.as_object_mut().unwrap().remove("amount_in");
+                        }
+                    }
+                    new_step
+                })
+                .collect();
+
+            // Fast path: swap directly within Rhea ledger if both in/out are Rhea balances
+            if matches!(request.token_in, TokenId::Nep141OnRhea(_))
+                && matches!(request.token_out, TokenId::Nep141OnRhea(_))
+            {
+                info!("Using fast path");
+                let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "swap".to_string(),
+                    args: serde_json::to_vec(&serde_json::json!({
+                        "actions": actions,
+                    }))
+                    .unwrap(),
+                    gas: NearGas::from_tgas(150).as_gas(),
+                    deposit: NearToken::from_yoctonear(1),
+                }));
+
+                let transactions = vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+                    actions: vec![swap_action],
+                }];
+
+                return Some(Route {
+                    dex_id: DexId::Rhea,
+                    deadline: None,
+                    has_slippage: true,
+                    estimated_amount: Amount::AmountOut(response.result_data.amount_out),
+                    worst_case_amount: Amount::AmountOut(total_min_amount_out),
+                    execution_instructions: transactions,
+                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    token_output: request.token_out.clone(),
+                });
+            }
+
             let unwrapping_near = request.token_out == TokenId::Near;
             let ft_transfer_call_swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                 method_name: "ft_transfer_call".to_string(),
@@ -77,24 +129,7 @@ impl Provider for RheaProvider {
                     "amount": exact_amount_in.to_string(),
                     "msg": serde_json::to_string(&serde_json::json!({
                         "force": 0,
-                        "actions": steps
-                            .map(|step| {
-                                let mut new_step = step.clone();
-                                if let Some(pool) = step.get("pool_id") {
-                                    if let Some(pool_str) = pool.as_str() {
-                                        if let Ok(pool_u64) = pool_str.parse::<u64>() {
-                                            new_step["pool_id"] = serde_json::Value::from(pool_u64);
-                                        }
-                                    }
-                                }
-                                if let Some(amount_in) = step.get("amount_in") {
-                                    if amount_in == "0" {
-                                        new_step.as_object_mut().unwrap().remove("amount_in");
-                                    }
-                                }
-                                new_step
-                            })
-                            .collect::<Vec<_>>(),
+                        "actions": actions,
                         "skip_degen_price_sync": true,
                         "skip_unwrap_near": !unwrapping_near,
                     })).unwrap(),

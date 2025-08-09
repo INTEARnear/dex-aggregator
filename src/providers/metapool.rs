@@ -37,9 +37,7 @@ impl Provider for MetapoolProvider {
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
-            if let Some(input_to_native) =
-                convert_to_native(&request.token_in, None, NearToken::from_yoctonear(0)).await
-            {
+            if is_near(&request.token_in) {
                 let (_, nep141_out) = convert_to_nep141(&request.token_out, None, 0).await?;
                 if nep141_out != METAPOOL_CONTRACT {
                     return None;
@@ -76,10 +74,17 @@ impl Provider for MetapoolProvider {
                         let amount_stnear_out = BigDecimal::from(amount)
                             * BigDecimal::from(10u128.pow(24))
                             / BigDecimal::from(state.st_near_price.as_yoctonear());
-                        ToPrimitive::to_u128(&amount_stnear_out)?
+                        ToPrimitive::to_u128(&amount_stnear_out)?.saturating_sub(1)
                     }
                     Amount::AmountOut(amount) => amount,
                 };
+
+                let input_to_native = convert_to_native(
+                    &request.token_in,
+                    request.trader_account_id.clone(),
+                    NearToken::from_yoctonear(amount_near_in),
+                )
+                .await?;
 
                 let stake_instructions = vec![ExecutionInstruction::NearTransaction {
                     receiver_id: METAPOOL_CONTRACT.parse().unwrap(),
@@ -92,12 +97,12 @@ impl Provider for MetapoolProvider {
                 }];
 
                 let execution_instructions = [
+                    input_to_native,
                     deposit_storage_if_needed(
                         &TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
                         request.trader_account_id,
                     )
                     .await,
-                    input_to_native,
                     stake_instructions,
                 ]
                 .concat();
@@ -119,7 +124,7 @@ impl Provider for MetapoolProvider {
                     token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
                 });
             } else if is_near(&request.token_out) {
-                let (input_to_nep141, nep141_in) =
+                let (_input_to_nep141, nep141_in) =
                     convert_to_nep141(&request.token_in, None, 0).await?;
                 if nep141_in != METAPOOL_CONTRACT {
                     return None;
@@ -159,7 +164,7 @@ impl Provider for MetapoolProvider {
                         let amount_near_out = BigDecimal::from(amount_in)
                             / BigDecimal::from(10u128.pow(24))
                             * BigDecimal::from(state.st_near_price.as_yoctonear());
-                        ToPrimitive::to_u128(&amount_near_out)?
+                        ToPrimitive::to_u128(&amount_near_out)?.saturating_sub(1)
                     }
                     Amount::AmountOut(amount_out) => amount_out,
                 };
@@ -223,6 +228,13 @@ impl Provider for MetapoolProvider {
                 } else {
                     amount_near_out
                 };
+
+                let (input_to_nep141, _nep141_in) = convert_to_nep141(
+                    &request.token_in,
+                    request.trader_account_id.clone(),
+                    max_amount_stnear_in,
+                )
+                .await?;
 
                 let liquid_unstake_instructions = vec![ExecutionInstruction::NearTransaction {
                     receiver_id: METAPOOL_CONTRACT.parse().unwrap(),

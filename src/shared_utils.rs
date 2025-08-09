@@ -62,7 +62,31 @@ pub async fn needs_storage_deposit(account_id: &AccountId, token_id: &TokenId) -
         TokenId::Near => false,
         TokenId::Nep141(token_id) => needs_storage_deposit_for_contract(account_id, token_id).await,
         TokenId::Nep141OnRhea(_token_id) => {
-            false // TODO: maybe implement storage deposit for Rhea contract here?
+            let is_registered = RPC_CLIENT
+                .call::<bool>(
+                    "v2.ref-finance.near".parse().unwrap(),
+                    "token_register_of",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "token_id": token_id.get_account_id(),
+                    }),
+                    QueryFinality::Finality(Finality::DoomSlug),
+                )
+                .await
+                .unwrap_or_default();
+            let has_storage_deposit = RPC_CLIENT
+                .call::<StorageDeposit>(
+                    "v2.ref-finance.near".parse().unwrap(),
+                    "storage_balance_of",
+                    serde_json::json!({
+                        "account_id": account_id,
+                    }),
+                    QueryFinality::Finality(Finality::DoomSlug),
+                )
+                .await
+                .map(|s| s.available > NearToken::from_millinear(10))
+                .unwrap_or_default();
+            !has_storage_deposit || !is_registered
         }
     }
 }
@@ -84,26 +108,49 @@ pub async fn needs_storage_deposit_for_contract(
     else {
         return true;
     };
-    storage_deposit.total == 0
+    storage_deposit.total.is_zero()
 }
 
 #[derive(Debug, Deserialize)]
 struct StorageDeposit {
     #[allow(dead_code)]
-    #[serde(with = "dec_format")]
-    available: Balance,
-    #[serde(with = "dec_format")]
-    total: Balance,
+    available: NearToken,
+    total: NearToken,
 }
 
-pub async fn create_storage_deposit_action(token_id: &TokenId) -> Action {
+pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionInstruction> {
     match token_id {
-        TokenId::Nep141(_token_id) => {
-            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap())
-        }
+        TokenId::Nep141(token_account_id) => vec![ExecutionInstruction::NearTransaction {
+            receiver_id: token_account_id.clone(),
+            actions: vec![create_storage_deposit_action_for_contract(
+                "0.00125 NEAR".parse().unwrap(),
+            )],
+        }],
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
         TokenId::Nep141OnRhea(_token_id) => {
-            panic!("Rhea doesn't need a storage deposit") // TODO: maybe needs registration?
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                actions: vec![
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "storage_deposit".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "registration_only": false,
+                        }))
+                        .unwrap(),
+                        gas: NearGas::from_tgas(10).as_gas(),
+                        deposit: NearToken::from_millinear(10),
+                    })),
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "register_tokens".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "token_ids": [token_id.get_account_id()],
+                        }))
+                        .unwrap(),
+                        gas: NearGas::from_tgas(10).as_gas(),
+                        deposit: NearToken::from_yoctonear(1),
+                    })),
+                ],
+            }]
         }
     }
 }
@@ -129,7 +176,7 @@ lazy_static! {
     pub static ref RPC_CLIENT: RpcClient = RpcClient::new(
         std::env::var("RPC_URLS")
             .unwrap_or_else(|_| {
-                "https://rpc.intear.tech,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
+                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
                     .to_string()
             })
             .split(',')
@@ -342,56 +389,70 @@ pub async fn convert_to_native(
 ) -> Option<Vec<ExecutionInstruction>> {
     match token_id {
         TokenId::Near => Some(vec![]),
-        TokenId::Nep141(account_id) => {
-            if account_id == WRAP_NEAR {
-                let mut transactions = vec![];
-                if !amount.is_zero() {
-                    transactions.push(ExecutionInstruction::NearTransaction {
-                        receiver_id: account_id.clone(),
-                        actions: vec![create_unwrap_action(amount)],
-                    });
-                }
-                Some(transactions)
+        TokenId::Nep141(account_id) if account_id == WRAP_NEAR => {
+            if !amount.is_zero() {
+                Some(vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: account_id.clone(),
+                    actions: vec![create_unwrap_action(amount)],
+                }])
             } else {
                 None
             }
         }
-        TokenId::Nep141OnRhea(_) => {
-            None // TODO
+        TokenId::Nep141(_non_wrap_near) => None,
+        TokenId::Nep141OnRhea(account_id) if account_id == WRAP_NEAR => {
+            if !amount.is_zero() {
+                Some(vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                    actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "withdraw".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "token_id": account_id.to_string(),
+                            "amount": amount.as_yoctonear().to_string(),
+                            "skip_unwrap_near": false,
+                        }))
+                        .unwrap(),
+                        gas: NearGas::from_tgas(50).as_gas(),
+                        deposit: NearToken::from_yoctonear(1),
+                    }))],
+                }])
+            } else {
+                None
+            }
+        }
+        TokenId::Nep141OnRhea(_non_wrap_near) => None,
+    }
+}
+
+pub async fn deposit_storage_on_contract_if_needed(
+    contract_id: &AccountIdRef,
+    trader_account_id: impl Into<Option<AccountId>>,
+    amount: NearToken,
+) -> Vec<ExecutionInstruction> {
+    if let Some(trader_account_id) = trader_account_id.into() {
+        if needs_storage_deposit_for_contract(&trader_account_id, contract_id).await {
+            return vec![ExecutionInstruction::NearTransaction {
+                receiver_id: contract_id.to_owned(),
+                actions: vec![create_storage_deposit_action_for_contract(amount)],
+            }];
         }
     }
+    vec![]
 }
 
 pub async fn deposit_storage_if_needed(
     token_id: &TokenId,
     trader_account_id: impl Into<Option<AccountId>>,
 ) -> Vec<ExecutionInstruction> {
-    match token_id {
-        TokenId::Nep141(token_account_id) => {
-            let mut transactions = vec![];
-            if let Some(trader_account_id) = trader_account_id.into() {
-                if needs_storage_deposit(&trader_account_id, token_id).await {
-                    transactions.push(ExecutionInstruction::NearTransaction {
-                        receiver_id: token_account_id.clone(),
-                        actions: vec![create_storage_deposit_action(token_id).await],
-                    });
-                }
-            }
-            transactions
+    let trader_account_id = trader_account_id.into();
+    if let Some(trader_account_id) = trader_account_id {
+        if needs_storage_deposit(&trader_account_id, token_id).await {
+            create_storage_deposit_action(token_id).await
+        } else {
+            vec![]
         }
-        TokenId::Near => vec![],
-        TokenId::Nep141OnRhea(_token_id) => {
-            let mut transactions = vec![];
-            if let Some(trader_account_id) = trader_account_id.into() {
-                if needs_storage_deposit(&trader_account_id, token_id).await {
-                    transactions.push(ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action(token_id).await],
-                    });
-                }
-            }
-            transactions
-        }
+    } else {
+        vec![]
     }
 }
 
