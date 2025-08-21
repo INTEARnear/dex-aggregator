@@ -5,6 +5,7 @@ pub mod metapool;
 pub mod near_intents;
 pub mod rhea;
 pub mod rhea_dcl;
+pub mod rnear;
 pub mod veax;
 pub mod wrap;
 pub mod xrhea;
