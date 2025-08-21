@@ -69,7 +69,6 @@ impl Provider for RheaProvider {
                 .into_iter()
                 .flat_map(|route| route.pools);
 
-            // Normalize steps once so we can reuse for both direct Rhea swap and ft_transfer_call paths
             let actions: Vec<serde_json::Value> = steps
                 .map(|step| {
                     let mut new_step = step.clone();

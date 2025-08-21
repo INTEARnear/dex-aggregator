@@ -293,6 +293,11 @@ pub enum DexId {
     ///
     /// Supports RHEA -> XRHEA and XRHEA -> RHEA, both AmountIn and AmountOut
     XRhea,
+    /// https://app.rhea.finance/stake
+    /// Liquid Staking Provider
+    ///
+    /// Supports NEAR -> rNEAR and rNEAR -> NEAR, both AmountIn and AmountOut
+    RNear,
 }
 
 const RHEA_STR: &str = "Rhea";
@@ -306,6 +311,7 @@ const RHEA_DCL_STR: &str = "RheaDcl";
 const METAPOOL_STR: &str = "MetaPool";
 const LINEAR_STR: &str = "Linear";
 const XRHEA_STR: &str = "XRhea";
+const RNEAR_STR: &str = "RNear";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -321,6 +327,7 @@ impl Display for DexId {
             DexId::MetaPool => f.write_str(METAPOOL_STR),
             DexId::Linear => f.write_str(LINEAR_STR),
             DexId::XRhea => f.write_str(XRHEA_STR),
+            DexId::RNear => f.write_str(RNEAR_STR),
         }
     }
 }
@@ -341,6 +348,7 @@ impl FromStr for DexId {
             METAPOOL_STR => DexId::MetaPool,
             LINEAR_STR => DexId::Linear,
             XRHEA_STR => DexId::XRhea,
+            RNEAR_STR => DexId::RNear,
             _ => return Err(format!("Invalid dex id: {}", s)),
         })
     }
