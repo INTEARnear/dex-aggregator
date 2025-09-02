@@ -1,0 +1,19 @@
+[package]
+name = "rhea-pathfinder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lazy_static = "1"
+itertools = "0.14"
+uint = "0.10"
+warp = "0.3"
+rand = "0.8"
+
+[profile.release]
+overflow-checks = true

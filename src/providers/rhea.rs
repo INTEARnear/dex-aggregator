@@ -41,7 +41,10 @@ impl Provider for RheaProvider {
                 return None;
             }
 
-            let url = format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}");
+            let url = match request.trader_account_id.as_ref() {
+                Some(slime) if slime == "slimedragon.near" => format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Max&slippage={slippage}&amountIn={exact_amount_in}"),
+                _ => format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}"),
+            };
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
                 return None;
