@@ -9,6 +9,7 @@ use near_min_api::utils::dec_format;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -165,18 +166,32 @@ impl PoolDetailInfo {
         token_out: &AccountIdRef,
         amount_in: Balance,
     ) -> Result<Balance, anyhow::Error> {
-        match self {
-            PoolDetailInfo::SimplePoolInfo(info) => {
+        let self_before_modifications = self.clone();
+        let unwind_safe_self = AssertUnwindSafe(&mut *self);
+        let result = std::panic::catch_unwind(move || match unwind_safe_self {
+            AssertUnwindSafe(PoolDetailInfo::SimplePoolInfo(info)) => {
                 info.emulate_swap(token_in, token_out, amount_in)
             }
-            PoolDetailInfo::StablePoolInfo(info) => {
+            AssertUnwindSafe(PoolDetailInfo::StablePoolInfo(info)) => {
                 info.emulate_swap(token_in, token_out, amount_in)
             }
-            PoolDetailInfo::RatedPoolInfo(info) => {
+            AssertUnwindSafe(PoolDetailInfo::RatedPoolInfo(info)) => {
                 info.emulate_swap(token_in, token_out, amount_in)
             }
-            PoolDetailInfo::DegenPoolInfo(info) => {
+            AssertUnwindSafe(PoolDetailInfo::DegenPoolInfo(info)) => {
                 info.emulate_swap(token_in, token_out, amount_in)
+            }
+        });
+        match result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(e),
+            Err(e) => {
+                *self = self_before_modifications;
+                println!(
+                    "Panicked while emulating swap {} -> {}",
+                    token_in, token_out
+                );
+                Err(anyhow::anyhow!("Panic: {:?}", e))
             }
         }
     }
@@ -256,7 +271,7 @@ impl StablePoolInfo {
             return Err(anyhow::anyhow!("Token out not found"));
         };
         let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
-        let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx)?;
+        let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
         self.c_amounts[in_idx] = result.new_source_amount;
         self.c_amounts[out_idx] = result.new_destination_amount;
         if self.c_amounts[out_idx] < stable::MIN_RESERVE {
@@ -265,41 +280,33 @@ impl StablePoolInfo {
         Ok(amount_swapped)
     }
 
-    fn c_amount_to_amount(&self, c_amount: u128, index: usize) -> Result<u128, anyhow::Error> {
+    fn c_amount_to_amount(&self, c_amount: u128, index: usize) -> u128 {
         let value = self.decimals[index];
         if value <= stable::TARGET_DECIMAL {
             let factor = 10_u128
                 .checked_pow((stable::TARGET_DECIMAL - value) as u32)
                 .unwrap();
-            c_amount
-                .checked_div(factor)
-                .ok_or_else(|| anyhow::anyhow!("Cannot divide"))
+            c_amount.checked_div(factor).expect("Cannot divide")
         } else {
             let factor = 10_u128
                 .checked_pow((value - stable::TARGET_DECIMAL) as u32)
                 .unwrap();
-            c_amount
-                .checked_mul(factor)
-                .ok_or_else(|| anyhow::anyhow!("Cannot multiply"))
+            c_amount.checked_mul(factor).expect("Cannot multiply")
         }
     }
 
-    fn amount_to_c_amount(&self, amount: u128, index: usize) -> Result<u128, anyhow::Error> {
+    fn amount_to_c_amount(&self, amount: u128, index: usize) -> u128 {
         let value = self.decimals[index];
         if value <= stable::TARGET_DECIMAL {
             let factor = 10_u128
                 .checked_pow((stable::TARGET_DECIMAL - value) as u32)
                 .unwrap();
-            amount
-                .checked_mul(factor)
-                .ok_or_else(|| anyhow::anyhow!("Cannot multiply"))
+            amount.checked_mul(factor).expect("Cannot multiply")
         } else {
             let factor = 10_u128
                 .checked_pow((value - stable::TARGET_DECIMAL) as u32)
                 .unwrap();
-            amount
-                .checked_div(factor)
-                .ok_or_else(|| anyhow::anyhow!("Cannot divide"))
+            amount.checked_div(factor).expect("Cannot divide")
         }
     }
 
@@ -314,7 +321,7 @@ impl StablePoolInfo {
         token_out: usize,
     ) -> Result<stable::SwapResult, anyhow::Error> {
         // make amounts into comparable-amounts
-        let c_amount_in = self.amount_to_c_amount(amount_in, token_in)?;
+        let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
 
         self.get_invariant()
             .swap_to(
@@ -650,7 +657,7 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
 
         for pair in pool.info.token_account_ids.iter().cloned().combinations(2) {
             let mut tokens_sorted = pair;
-            tokens_sorted.sort();
+            tokens_sorted.sort_unstable();
             let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
             pair_to_pools.entry(key).or_default().push(idx);
         }
@@ -1020,6 +1027,7 @@ enum MaxHops {
     DirectOnly,
     Two,
     Three,
+    Four,
     Max,
 }
 
@@ -1033,14 +1041,14 @@ where
     }
 
     if items.len() <= k {
-        items.sort_by(|a, b| key_fn(b).cmp(&key_fn(a))); // descending order
+        items.sort_unstable_by_key(|a| std::cmp::Reverse(key_fn(a))); // descending order
         return items;
     }
 
-    items.select_nth_unstable_by(k - 1, |a, b| key_fn(b).cmp(&key_fn(a)));
+    items.select_nth_unstable_by_key(k - 1, |a| std::cmp::Reverse(key_fn(a)));
 
     items.truncate(k);
-    items.sort_by(|a, b| key_fn(b).cmp(&key_fn(a))); // descending order
+    items.sort_unstable_by_key(|a| std::cmp::Reverse(key_fn(a))); // descending order
 
     items
 }
@@ -1162,7 +1170,7 @@ fn find_best_routes<'a>(
         });
     }
 
-    if matches!(max_hops, MaxHops::Three | MaxHops::Max) {
+    if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
         // Three hops
         for first_intermediate_token in starting_pool_tokens.iter() {
             if *first_intermediate_token == token_in || *first_intermediate_token == token_out {
@@ -1190,8 +1198,8 @@ fn find_best_routes<'a>(
                     token_in,
                     first_intermediate_token,
                     match max_hops {
-                        MaxHops::Three => MaxHops::DirectOnly,
-                        MaxHops::Max => MaxHops::Two,
+                        MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
+                        MaxHops::Max => MaxHops::Three,
                         _ => unreachable!(),
                     },
                 ) else {
@@ -1212,7 +1220,8 @@ fn find_best_routes<'a>(
                     second_intermediate_token,
                     match max_hops {
                         MaxHops::Three => MaxHops::DirectOnly,
-                        MaxHops::Max => MaxHops::Two,
+                        MaxHops::Four => MaxHops::Two,
+                        MaxHops::Max => MaxHops::Three,
                         _ => unreachable!(),
                     },
                 ) else {
@@ -1232,8 +1241,8 @@ fn find_best_routes<'a>(
                     second_intermediate_token,
                     token_out,
                     match max_hops {
-                        MaxHops::Three => MaxHops::DirectOnly,
-                        MaxHops::Max => MaxHops::Two,
+                        MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
+                        MaxHops::Max => MaxHops::Three,
                         _ => unreachable!(),
                     },
                 ) else {
@@ -1250,10 +1259,20 @@ fn find_best_routes<'a>(
         }
     }
 
-    for route in routes.iter() {
-        let result = route.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default());
-        println!("{}, result: {:?}", route, result);
+    if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
+        println!("Choosing from {} routes", routes.len());
     }
+
+    // Remove duplicate tokens
+    routes.retain(|route| {
+        if route.steps.is_empty() {
+            return false;
+        }
+        let mut seen: HashSet<&AccountIdRef> = HashSet::new();
+        std::iter::once(route.steps[0].token_in)
+            .chain(route.steps.iter().map(|s| s.token_out))
+            .all(|token| seen.insert(token))
+    });
 
     let best_routes = select_top_k(routes, count, |route| {
         i128::try_from(
@@ -1263,6 +1282,10 @@ fn find_best_routes<'a>(
         )
         .unwrap_or_default()
     });
+    println!(
+        "Best routes:\n{}",
+        best_routes.iter().map(|route| route.to_string()).join("\n")
+    );
     Ok(best_routes.clone())
 }
 

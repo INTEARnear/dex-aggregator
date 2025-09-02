@@ -42,7 +42,7 @@ impl Provider for RheaProvider {
             }
 
             let url = match request.trader_account_id.as_ref() {
-                Some(slime) if slime == "slimedragon.near" => format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Max&slippage={slippage}&amountIn={exact_amount_in}"),
+                Some(slime) if slime == "slimedragon.near" => format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}"),
                 _ => format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}"),
             };
 
