@@ -21,5 +21,8 @@ cached = { version = "0.55.1", features = ["async"] }
 bigdecimal = "0.4.8"
 num-traits = "0.2.19"
 
+[profile.release]
+overflow-checks = true
+
 [workspace]
 members = ["rhea-pathfinder"]

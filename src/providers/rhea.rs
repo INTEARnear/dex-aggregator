@@ -9,7 +9,8 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, REQWEST_CLIENT,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, get_token_price,
+        REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -41,9 +42,41 @@ impl Provider for RheaProvider {
                 return None;
             }
 
-            let url = match request.trader_account_id.as_ref() {
-                Some(slime) if slime == "slimedragon.near" => format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}"),
-                _ => format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}"),
+            let should_use_localhost = match request.trader_account_id.as_ref() {
+                Some(slime) if slime == "slimedragon.near" || slime == "test.slimegirl.near" => {
+                    true
+                }
+                _ => {
+                    let usd_price_per_unit =
+                        get_token_price(&request.token_in.get_account_id()).await;
+
+                    if let Some(usd_price_per_unit) = usd_price_per_unit {
+                        // Price is already normalized per smallest unit, so multiply directly by amount
+                        let usd_amount = usd_price_per_unit * exact_amount_in as f64;
+                        if usd_amount < 5.0 {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+
+                            let mut hasher = DefaultHasher::new();
+                            exact_amount_in.hash(&mut hasher);
+                            request.token_in.hash(&mut hasher);
+                            request.token_out.hash(&mut hasher);
+                            let hash_value = hasher.finish();
+
+                            (hash_value % 10) == 0
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            let url = if should_use_localhost {
+                format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}")
+            } else {
+                format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}")
             };
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {

@@ -69,7 +69,7 @@ struct ApiResponsePoolStep {
 
 const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
-const MAX_SPLITS_COUNT: usize = 10;
+const MAX_SPLITS_COUNT: usize = 2;
 const FEE_DIVISOR: u32 = 10_000;
 const FETCH_POOLS_BATCH_SIZE: usize = 1000;
 const TOP_ROUTES_COUNT: usize = 10;
@@ -700,10 +700,17 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let client = Arc::new(RpcClient::new([
-        "https://rpc-ua.intea.rs",
-        "https://rpc.intea.rs",
-    ]));
+    dotenvy::dotenv().ok();
+    let client = Arc::new(RpcClient::new(
+        std::env::var("RPC_URLS")
+            .unwrap_or_else(|_| {
+                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
+                    .to_string()
+            })
+            .split(',')
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>(),
+    ));
 
     start_pools_update_task(client.clone()).await;
 
@@ -855,90 +862,92 @@ fn find_best_split_route<'a>(
     token_in: &'a AccountId,
     token_out: &'a AccountId,
 ) -> Option<SplitRoute<'a>> {
-    // Represent weights in discrete units of `SPLIT_ROUTE_STEP_SIZE` percent.
-    let step = SPLIT_ROUTE_STEP_SIZE;
-    assert_eq!(100 % step, 0);
-    let total_units = 100 / step; // e.g. 5 % step  ⇒ 20 units
-
-    // Pre-compute outputs for each route and each feasible weight unit.
-    // route_outputs[i][u] = Some(output) where `u` ∈ 1..=total_units.
-    let mut route_outputs: Vec<Vec<Option<Balance>>> = Vec::with_capacity(routes.len());
-    for route in routes.iter() {
-        let mut vec = vec![None; (total_units + 1) as usize];
-        for units in 1..=total_units {
-            let weight_pct = units * step;
-            let amount_part = (total_amount * weight_pct as Balance) / 100;
-            if let Ok(out) =
-                route.emulate_swap(token_in, token_out, amount_part, &mut PoolsDelta::default())
-            {
-                vec[units as usize] = Some(out);
-            }
-        }
-        route_outputs.push(vec);
+    if routes.is_empty() {
+        return None;
     }
+    let step = SPLIT_ROUTE_STEP_SIZE as u32;
+    let slices = 100 / step;
+    let mut weights: Vec<u32> = vec![0; routes.len()];
 
-    // dp[s][u] = best (total_out, steps) using exactly `s` splits and `u` weight units.
-    // Dimensions: (MAX_SPLITS_COUNT + 1) × (total_units + 1)
-    let mut dp: Vec<Vec<Option<(Balance, Vec<SplitRouteStep<'a>>)>>> =
-        vec![vec![None; (total_units + 1) as usize]; MAX_SPLITS_COUNT + 1];
-    dp[0][0] = Some((0, Vec::new()));
+    let mut best_split: Option<SplitRoute<'a>> = None;
+    let mut best_out: Balance = 0;
 
-    for (route_idx, route) in routes.iter().cloned().enumerate() {
-        let outputs = &route_outputs[route_idx];
-        let mut next_dp = dp.clone();
+    for _ in 0..slices {
+        let mut local_best_out = best_out;
+        let mut local_best_idx: Option<usize> = None;
 
-        for splits in 0..=MAX_SPLITS_COUNT - 1 {
-            for used_units in 0..=total_units {
-                let Some((current_out, ref steps_vec)) = dp[splits][used_units as usize] else {
+        for (idx, _route) in routes.iter().enumerate() {
+            if weights[idx] == 0 {
+                // Route not yet chosen, check if we can still add new route
+                if weights.iter().filter(|&&w| w > 0).count() >= MAX_SPLITS_COUNT {
                     continue;
-                };
-
-                // Try assigning additional weight units to this route
-                for add_units in 1..=(total_units - used_units) {
-                    let Some(out_val) = outputs[add_units as usize] else {
-                        continue;
-                    };
-
-                    let new_units = used_units + add_units;
-                    let new_splits = splits + 1;
-                    let new_out = current_out + out_val;
-
-                    let weight_pct = add_units * step;
-                    let mut new_steps = steps_vec.clone();
-                    new_steps.push(SplitRouteStep {
-                        route: route.clone(),
-                        weight: weight_pct,
-                    });
-
-                    match &mut next_dp[new_splits][new_units as usize] {
-                        Some((best_out, best_steps)) => {
-                            if new_out > *best_out {
-                                *best_out = new_out;
-                                *best_steps = new_steps;
-                            }
-                        }
-                        slot @ None => {
-                            *slot = Some((new_out, new_steps));
-                        }
+                }
+            }
+            if weights[idx] + step > 100 {
+                continue;
+            }
+            let mut candidate_weights = weights.clone();
+            candidate_weights[idx] += step;
+            // Build candidate split route
+            let mut candidate_steps: Vec<SplitRouteStep<'a>> = routes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let w = candidate_weights[i];
+                    if w > 0 {
+                        Some(SplitRouteStep {
+                            route: r.clone(),
+                            weight: w,
+                        })
+                    } else {
+                        None
                     }
+                })
+                .collect();
+            candidate_steps.sort_by_key(|s| std::cmp::Reverse(s.weight));
+            let candidate_split = SplitRoute::new(candidate_steps);
+            if let Ok(out) = candidate_split.emulate_swap(
+                token_in,
+                token_out,
+                total_amount,
+                &mut PoolsDelta::default(),
+            ) {
+                if out > local_best_out {
+                    local_best_out = out;
+                    local_best_idx = Some(idx);
                 }
             }
         }
 
-        dp = next_dp;
-    }
-
-    // Extract best solution that uses exactly 100 % (i.e., total_units) weight.
-    let mut best: Option<(Balance, Vec<SplitRouteStep<'a>>)> = None;
-    for splits in 1..=MAX_SPLITS_COUNT {
-        if let Some((out, steps)) = dp[splits][total_units as usize].clone()
-            && best.as_ref().is_none_or(|(best_out, _)| out > *best_out)
-        {
-            best = Some((out, steps));
+        if let Some(idx) = local_best_idx {
+            // Accept the improvement
+            weights[idx] += step;
+            best_out = local_best_out;
+            // Rebuild best_split
+            let mut steps: Vec<SplitRouteStep<'a>> = routes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let w = weights[i];
+                    if w > 0 {
+                        Some(SplitRouteStep {
+                            route: r.clone(),
+                            weight: w,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            steps.sort_by_key(|s| std::cmp::Reverse(s.weight));
+            best_split = Some(SplitRoute::new(steps));
+        } else {
+            // No further improvement found
+            break;
         }
     }
 
-    best.map(|(_, steps)| SplitRoute::new(steps))
+    best_split
 }
 
 #[derive(Debug, Clone)]
@@ -1282,10 +1291,6 @@ fn find_best_routes<'a>(
         )
         .unwrap_or_default()
     });
-    println!(
-        "Best routes:\n{}",
-        best_routes.iter().map(|route| route.to_string()).join("\n")
-    );
     Ok(best_routes.clone())
 }
 

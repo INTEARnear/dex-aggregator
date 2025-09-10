@@ -12,6 +12,7 @@ use near_min_api::{
 };
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::types::{ExecutionInstruction, Slippage, TokenId};
 
@@ -183,6 +184,11 @@ lazy_static! {
             .map(|url| url.to_string())
             .collect::<Vec<_>>(),
     );
+    pub static ref TOKEN_PRICES: Mutex<HashMap<AccountId, f64>> = {
+        let prices = Mutex::new(HashMap::new());
+        tokio::spawn(update_token_prices_loop());
+        prices
+    };
 }
 
 pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out: &TokenId) -> f64 {
@@ -283,6 +289,11 @@ pub struct TokenInfo {
     pub created_at: BlockHeight,
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenData {
+    price_usd_raw: String,
+}
+
 #[cached(time = 5, result = true)]
 pub async fn get_all_tokens() -> Result<HashMap<TokenId, TokenInfo>, String> {
     let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
@@ -309,6 +320,40 @@ pub async fn get_current_block_height() -> Result<u64, String> {
         return Err("Failed to get current block".to_string());
     };
     Ok(response.header.height)
+}
+
+async fn update_token_prices() {
+    let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
+        .unwrap_or_else(|_| "https://prices.intear.tech".to_string());
+    let url = format!("{endpoint}/tokens");
+
+    if let Ok(response) = REQWEST_CLIENT.get(url).send().await {
+        if let Ok(tokens) = response.json::<HashMap<String, TokenData>>().await {
+            let mut token_prices = TOKEN_PRICES.lock().await;
+            token_prices.clear();
+
+            for (token_id_str, token_data) in tokens {
+                if let Ok(account_id) = token_id_str.parse::<AccountId>() {
+                    if let Ok(price_raw) = token_data.price_usd_raw.parse::<f64>() {
+                        token_prices.insert(account_id, price_raw / 1e6);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn update_token_prices_loop() {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        update_token_prices().await;
+    }
+}
+
+pub async fn get_token_price(token_id: &AccountId) -> Option<f64> {
+    let token_prices = TOKEN_PRICES.lock().await;
+    token_prices.get(token_id).copied()
 }
 
 /// Merge all neighboring NearTransactions with the same receiver_id

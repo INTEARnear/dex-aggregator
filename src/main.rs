@@ -10,7 +10,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::{
-    shared_utils::{convert_to, optimize_execution_instructions},
+    shared_utils::{convert_to, optimize_execution_instructions, TOKEN_PRICES},
     types::{Amount, DexId, Route, Slippage, SwapRequest},
 };
 
@@ -182,6 +182,10 @@ async fn main() {
         .init();
 
     info!("Starting swap-router HTTP server...");
+
+    // Initialize the token prices cache (this starts the background update task)
+    let _ = &*TOKEN_PRICES;
+    info!("Token prices cache initialized");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

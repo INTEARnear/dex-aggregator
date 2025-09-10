@@ -1878,6 +1878,7 @@ name = "rhea-pathfinder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "itertools",
  "lazy_static",
  "near-min-api",
