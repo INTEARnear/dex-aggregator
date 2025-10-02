@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage_f64, RPC_CLIENT,
+        get_slippage_f64, needs_storage_deposit_for_contract, RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -104,6 +104,34 @@ impl Provider for RheaDclProvider {
                             receiver_id: token_in,
                             actions: vec![ft_transfer_call_swap_action],
                         }];
+                        let (input_to_nep141, input_nep141) = convert_to_nep141(
+                            &request.token_in,
+                            request.trader_account_id.clone(),
+                            exact_amount_in,
+                        )
+                        .await?;
+                        if let Some(trader_account_id) = request.trader_account_id.as_ref() {
+                            if needs_storage_deposit_for_contract(
+                                trader_account_id,
+                                &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                            )
+                            .await
+                            {
+                                if let Ok(account) = RPC_CLIENT
+                                    .view_account(
+                                        trader_account_id.clone(),
+                                        QueryFinality::Finality(Finality::None),
+                                    )
+                                    .await
+                                {
+                                    // Don't use Rhea DCL for accounts with less than 1 NEAR, since
+                                    // the storage deposit of 0.5 NEAR is usually too high for them.
+                                    if account.amount < NearToken::from_near(1) {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
                         let transactions = [
                             deposit_storage_on_contract_if_needed(
                                 &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
@@ -117,17 +145,11 @@ impl Provider for RheaDclProvider {
                             )
                             .await,
                             deposit_storage_if_needed(
-                                &request.token_in,
+                                &TokenId::Nep141(input_nep141),
                                 request.trader_account_id.clone(),
                             )
                             .await,
-                            convert_to_nep141(
-                                &request.token_in,
-                                request.trader_account_id.clone(),
-                                exact_amount_in,
-                            )
-                            .await?
-                            .0,
+                            input_to_nep141,
                             swap_transactions,
                         ]
                         .concat();
