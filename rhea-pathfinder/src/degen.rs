@@ -189,7 +189,7 @@ impl DegenSwap {
         token_out_idx: usize,             // token_out index in token vector,
         current_c_amounts: &Vec<Balance>, // in-pool tokens comparable amounts vector,
         fees: &Fees,
-    ) -> Option<SwapResult> {
+    ) -> Result<SwapResult, anyhow::Error> {
         let degen_in = self.degens[token_in_idx];
         let degen_out = self.degens[token_out_idx];
 
@@ -203,23 +203,28 @@ impl DegenSwap {
                 &current_c_amounts_degen,
                 token_in_idx,
                 token_out_idx,
-            )?
+            )
+            .ok_or_else(|| anyhow::anyhow!("Failed to compute y in degen swap"))?
             .as_u128();
 
         let dy = current_c_amounts_degen[token_out_idx]
-            .checked_sub(y)?
+            .checked_sub(y)
+            .ok_or_else(|| anyhow::anyhow!("Underflow computing dy in degen swap"))?
             .saturating_sub(1); // * ? curve sub -1 just in case there were some rounding errors
 
         let trade_fee = fees.trade_fee(dy);
-        let amount_swapped = dy.checked_sub(trade_fee)?;
+        let amount_swapped = dy.checked_sub(trade_fee)
+            .ok_or_else(|| anyhow::anyhow!("Underflow subtracting trade fee in degen swap"))?;
 
-        let new_destination_amount =
-            current_c_amounts_degen[token_out_idx].checked_sub(amount_swapped)?;
-        let new_source_amount =
-            current_c_amounts_degen[token_in_idx].checked_add(token_in_amount_degen)?;
+        let new_destination_amount = current_c_amounts_degen[token_out_idx]
+            .checked_sub(amount_swapped)
+            .ok_or_else(|| anyhow::anyhow!("Insufficient liquidity in degen pool"))?;
+        let new_source_amount = current_c_amounts_degen[token_in_idx]
+            .checked_add(token_in_amount_degen)
+            .ok_or_else(|| anyhow::anyhow!("Overflow adding source amount in degen swap"))?;
 
         // * degen back result
-        Some(SwapResult::new(
+        Ok(SwapResult::new(
             self.div_degen(new_source_amount, degen_in),
             self.div_degen(new_destination_amount, degen_out),
             self.div_degen(amount_swapped, degen_out),

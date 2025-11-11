@@ -87,11 +87,9 @@ async fn route_handler(
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
-        &providers::grafun::GraFunProvider,
         &providers::near_intents::NearIntentsProvider,
         &providers::wrap::WrapProvider,
         &providers::rhea_dcl::RheaDclProvider,
-        &providers::veax::VeaxProvider,
         &providers::metapool::MetapoolProvider,
         &providers::linear::LinearProvider,
         &providers::xrhea::XRheaProvider,

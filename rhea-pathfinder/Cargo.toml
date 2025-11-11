@@ -15,3 +15,5 @@ uint = "0.10"
 warp = "0.3"
 rand = "0.8"
 dotenvy = "0.15.7"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

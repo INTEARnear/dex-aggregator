@@ -19,6 +19,7 @@ use warp::Filter;
 
 use near_min_api::{QueryFinality, RpcClient, types::Finality};
 use serde::{Deserialize, Serialize};
+use tracing::{Level, error, info, warn};
 
 use crate::degen::DegenSwap;
 use crate::rated::RatedSwap;
@@ -31,7 +32,7 @@ struct ApiResponse<T> {
     result_data: Option<T>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct SplitRouteApiResponse {
     routes: Vec<ApiResponseROute>,
     contract_in: AccountId,
@@ -42,7 +43,7 @@ struct SplitRouteApiResponse {
     amount_out: Balance,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct ApiResponseROute {
     pools: Vec<ApiResponsePoolStep>,
     #[serde(with = "dec_format")]
@@ -53,7 +54,7 @@ struct ApiResponseROute {
     amount_out: Balance,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct ApiResponsePoolStep {
     #[serde(with = "dec_format")]
     pool_id: u64,
@@ -184,10 +185,13 @@ impl PoolDetailInfo {
         });
         match result {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // println!("Error emulating swap {amount_in} {token_in} -> {token_out}: {e:?}");
+                Err(e)
+            }
             Err(e) => {
                 *self = self_before_modifications;
-                println!(
+                warn!(
                     "Panicked while emulating swap {} -> {}",
                     token_in, token_out
                 );
@@ -222,12 +226,17 @@ impl SimplePoolInfo {
         };
         let in_balance = U256::from(self.amounts[token_in]);
         let out_balance = U256::from(self.amounts[token_out]);
-        if in_balance == U256::zero()
-            || out_balance == U256::zero()
-            || token_in == token_out
-            || amount_in == 0
-        {
-            return Err(anyhow::anyhow!("Invalid parameters"));
+        if in_balance == U256::zero() {
+            return Err(anyhow::anyhow!("In balance is zero"));
+        }
+        if out_balance == U256::zero() {
+            return Err(anyhow::anyhow!("Out balance is zero"));
+        }
+        if token_in == token_out {
+            return Err(anyhow::anyhow!("Token in is equal to token out"));
+        }
+        if amount_in == 0 {
+            return Err(anyhow::anyhow!("Amount in is zero"));
         }
         let amount_with_fee = U256::from(amount_in) * U256::from(FEE_DIVISOR - self.total_fee);
         let received = (amount_with_fee * out_balance
@@ -364,7 +373,7 @@ impl RatedPoolInfo {
         let Some(out_idx) = self.token_account_ids.iter().position(|id| id == token_out) else {
             return Err(anyhow::anyhow!("Token out not found"));
         };
-        let result = self.internal_get_return(in_idx, amount_in, out_idx);
+        let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
         let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
         self.c_amounts[in_idx] = result.new_source_amount;
         self.c_amounts[out_idx] = result.new_destination_amount;
@@ -379,7 +388,7 @@ impl RatedPoolInfo {
         token_in: usize,
         amount_in: Balance,
         token_out: usize,
-    ) -> rated::SwapResult {
+    ) -> Result<rated::SwapResult, anyhow::Error> {
         self.internal_get_return_with_rates(token_in, amount_in, token_out, &self.rates)
     }
 
@@ -389,19 +398,17 @@ impl RatedPoolInfo {
         amount_in: Balance,
         token_out: usize,
         rates: &Vec<Balance>,
-    ) -> rated::SwapResult {
+    ) -> Result<rated::SwapResult, anyhow::Error> {
         // make amounts into comparable-amounts
         let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
 
-        self.get_invariant_with_rates(rates)
-            .swap_to(
-                token_in,
-                c_amount_in,
-                token_out,
-                &self.c_amounts,
-                &rated::Fees::new(self.total_fee),
-            )
-            .expect("Cannot swap")
+        self.get_invariant_with_rates(rates).swap_to(
+            token_in,
+            c_amount_in,
+            token_out,
+            &self.c_amounts,
+            &rated::Fees::new(self.total_fee),
+        )
     }
 
     fn amount_to_c_amount(&self, amount: u128, index: usize) -> u128 {
@@ -454,7 +461,7 @@ impl DegenPoolInfo {
         let Some(out_idx) = self.token_account_ids.iter().position(|id| id == token_out) else {
             return Err(anyhow::anyhow!("Token out not found"));
         };
-        let result = self.internal_get_return(in_idx, amount_in, out_idx);
+        let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
         let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
         self.c_amounts[in_idx] = result.new_source_amount;
         self.c_amounts[out_idx] = result.new_destination_amount;
@@ -485,7 +492,7 @@ impl DegenPoolInfo {
         token_in: usize,
         amount_in: Balance,
         token_out: usize,
-    ) -> degen::SwapResult {
+    ) -> Result<degen::SwapResult, anyhow::Error> {
         self.internal_get_return_with_degens(token_in, amount_in, token_out, &self.degens)
     }
 
@@ -495,19 +502,17 @@ impl DegenPoolInfo {
         amount_in: Balance,
         token_out: usize,
         degens: &Vec<Balance>,
-    ) -> degen::SwapResult {
+    ) -> Result<degen::SwapResult, anyhow::Error> {
         // make amounts into comparable-amounts
         let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
 
-        self.get_invariant_with_degens(degens)
-            .swap_to(
-                token_in,
-                c_amount_in,
-                token_out,
-                &self.c_amounts,
-                &degen::Fees::new(self.total_fee),
-            )
-            .expect("Cannot swap")
+        self.get_invariant_with_degens(degens).swap_to(
+            token_in,
+            c_amount_in,
+            token_out,
+            &self.c_amounts,
+            &degen::Fees::new(self.total_fee),
+        )
     }
 
     fn get_invariant_with_degens(&self, degens: &Vec<Balance>) -> DegenSwap {
@@ -565,7 +570,7 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
             QueryFinality::Finality(Finality::None),
         )
         .await?;
-    println!("Number of pools for data fetch: {}", number_of_pools);
+    info!("Number of pools for data fetch: {}", number_of_pools);
 
     let mut pools_batch_requests = Vec::new();
     let mut detail_infos_batch_requests = Vec::new();
@@ -680,7 +685,7 @@ async fn start_pools_update_task(client: Arc<RpcClient>) {
                     *cache = Some(Arc::new(pools));
                 }
                 Err(e) => {
-                    eprintln!("Failed to update pools: {}", e);
+                    error!("Failed to update pools: {}", e);
                 }
             }
 
@@ -701,6 +706,14 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .pretty()
+        .with_file(true)
+        .with_line_number(true)
+        .with_max_level(Level::INFO)
+        .init();
+
     let client = Arc::new(RpcClient::new(
         std::env::var("RPC_URLS")
             .unwrap_or_else(|_| {
@@ -718,7 +731,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .and(warp::query::<FindPathQuery>())
         .and_then(handle_find_path);
 
-    println!("Server listening on http://localhost:12345/findPath ...");
+    info!("Server listening on http://localhost:12345/findPath ...");
     warp::serve(api).run(([127, 0, 0, 1], 12345)).await;
 
     Ok(())
@@ -731,6 +744,14 @@ async fn route<'a>(
     pools: &'a Pools,
     max_hops: MaxHops,
 ) -> Result<SplitRoute<'a>, anyhow::Error> {
+    let span = tracing::span!(
+        Level::INFO,
+        "find_best_routes",
+        token_in = token_in.to_string(),
+        token_out = token_out.to_string(),
+        amount = amount,
+    );
+    let _enter = span.enter();
     let now = Instant::now();
     let routes = find_best_routes(
         pools,
@@ -740,24 +761,54 @@ async fn route<'a>(
         max_hops,
         TOP_ROUTES_COUNT,
     )?;
+    info!("Found routes: {routes:#?}");
     let duration = now.elapsed();
-    println!("Time to find best routes: {:?}", duration);
+    info!("Time to find best routes: {:?}", duration);
+
+    if routes.is_empty() {
+        return Err(anyhow::anyhow!("No routes found"));
+    }
 
     let now = Instant::now();
-    let Some(best_split) = find_best_split_route(routes, amount, token_in, token_out) else {
+    let Some(best_split) = find_best_split_route(routes.clone(), amount, token_in, token_out)
+    else {
         return Err(anyhow::anyhow!("No valid split route found"));
     };
     let duration = now.elapsed();
-    println!("Time to find best split route: {:?}", duration);
+    info!("Time to find best split route {best_split:#?} {duration:?}");
 
-    let estimated_out =
+    let best_split_estimated_out =
         best_split.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default())?;
 
-    if estimated_out == 0 {
+    if best_split_estimated_out == 0 {
+        warn!("Estimated output is 0");
         return Err(anyhow::anyhow!("Estimated output is 0"));
     }
 
-    Ok(best_split.clone())
+    // There's a bug, sometimes a bad route is chose. Make sure the best
+    // route is at least better or equal to the simplest (top 1) route.
+    let mut best_split = best_split;
+    let mut best_split_estimated_out = best_split_estimated_out;
+    for route in routes {
+        let single_split = SplitRoute::new(vec![SplitRouteStep {
+            route: route,
+            weight: 100,
+        }]);
+        let single_split_out = if let Ok(out) =
+            single_split.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default())
+        {
+            out
+        } else {
+            continue;
+        };
+        if single_split_out > best_split_estimated_out {
+            best_split = single_split;
+            best_split_estimated_out = single_split_out;
+        }
+    }
+    info!("Best split route: {best_split:#?} {best_split_estimated_out:?}");
+
+    Ok(best_split)
 }
 
 #[derive(Debug, Clone)]
@@ -792,7 +843,8 @@ impl<'a> SplitRoute<'a> {
     ) -> Result<Balance, anyhow::Error> {
         let mut total_out: Balance = 0;
         for step in &self.steps {
-            let amount_part = (amount_in * step.weight as Balance) / 100;
+            let amount_part = u128::try_from(U256::from(amount_in) * U256::from(step.weight) / 100)
+                .map_err(|_| anyhow::anyhow!("Partial amount overflows u128"))?;
             let out = step
                 .route
                 .emulate_swap(token_in, token_out, amount_part, pools_delta)?;
@@ -814,7 +866,9 @@ impl<'a> SplitRoute<'a> {
         let mut total_estimated_out: Balance = 0;
         let mut pools_delta = PoolsDelta::default();
         for step in &self.steps {
-            let amount_part = (total_amount_in * step.weight as Balance) / 100;
+            let amount_part =
+                u128::try_from(U256::from(total_amount_in) * U256::from(step.weight) / 100)
+                    .map_err(|_| anyhow::anyhow!("Partial amount overflows u128"))?;
             let estimated_out =
                 step.route
                     .emulate_swap(token_in, token_out, amount_part, &mut pools_delta)?;
@@ -844,7 +898,9 @@ impl<'a> SplitRoute<'a> {
                 min_amount_out,
                 amount_out: 0,
             });
-            total_estimated_out += estimated_out;
+            total_estimated_out = total_estimated_out
+                .checked_add(estimated_out)
+                .ok_or_else(|| anyhow::anyhow!("Total estimated out overflows u128"))?;
         }
         Ok(SplitRouteApiResponse {
             routes: routes_resp,
@@ -1269,7 +1325,7 @@ fn find_best_routes<'a>(
     }
 
     if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
-        println!("Choosing from {} routes", routes.len());
+        info!("Choosing from {} routes", routes.len());
     }
 
     // Remove duplicate tokens
@@ -1308,7 +1364,7 @@ struct FindPathQuery {
 
 async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
     let request_id = rand::thread_rng().gen_range(1..1000000);
-    println!(
+    info!(
         "Received request: request_id={:06}, amount_in={}, token_in={}, token_out={}, max_hops={:?}, slippage={:?}",
         request_id,
         query.amount_in,
@@ -1347,17 +1403,17 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
                         &mut PoolsDelta::default(),
                     )
                     .unwrap_or(0);
-                println!(
+                info!(
                     "Request id: {:06}, Estimated amount out: {}",
                     request_id, estimated_out
                 );
 
-                match split_route.to_api_response(
+                match dbg!(split_route.to_api_response(
                     &query.token_in,
                     &query.token_out,
                     query.amount_in,
                     slippage_bp,
-                ) {
+                )) {
                     Ok(data) => {
                         let resp = ApiResponse {
                             result_code: RC_SUCCESS,

@@ -188,7 +188,7 @@ impl RatedSwap {
         token_out_idx: usize,             // token_out index in token vector,
         current_c_amounts: &Vec<Balance>, // in-pool tokens comparable amounts vector,
         fees: &Fees,
-    ) -> Option<SwapResult> {
+    ) -> Result<SwapResult, anyhow::Error> {
         let rate_in = self.rates[token_in_idx];
         let rate_out = self.rates[token_out_idx];
 
@@ -202,23 +202,28 @@ impl RatedSwap {
                 &current_c_amounts_rated,
                 token_in_idx,
                 token_out_idx,
-            )?
+            )
+            .ok_or_else(|| anyhow::anyhow!("Failed to compute y in rated swap"))?
             .as_u128();
 
         let dy = current_c_amounts_rated[token_out_idx]
-            .checked_sub(y)?
+            .checked_sub(y)
+            .ok_or_else(|| anyhow::anyhow!("Underflow computing dy in rated swap"))?
             .saturating_sub(1); // * ? curve sub -1 just in case there were some rounding errors
 
         let trade_fee = fees.trade_fee(dy);
-        let amount_swapped = dy.checked_sub(trade_fee)?;
+        let amount_swapped = dy.checked_sub(trade_fee)
+            .ok_or_else(|| anyhow::anyhow!("Underflow subtracting trade fee in rated swap"))?;
 
-        let new_destination_amount =
-            current_c_amounts_rated[token_out_idx].checked_sub(amount_swapped)?;
-        let new_source_amount =
-            current_c_amounts_rated[token_in_idx].checked_add(token_in_amount_rated)?;
+        let new_destination_amount = current_c_amounts_rated[token_out_idx]
+            .checked_sub(amount_swapped)
+            .ok_or_else(|| anyhow::anyhow!("Insufficient liquidity in rated pool"))?;
+        let new_source_amount = current_c_amounts_rated[token_in_idx]
+            .checked_add(token_in_amount_rated)
+            .ok_or_else(|| anyhow::anyhow!("Overflow adding source amount in rated swap"))?;
 
         // * rate back result
-        Some(SwapResult::new(
+        Ok(SwapResult::new(
             self.div_rate(new_source_amount, rate_in),
             self.div_rate(new_destination_amount, rate_out),
             self.div_rate(amount_swapped, rate_out),

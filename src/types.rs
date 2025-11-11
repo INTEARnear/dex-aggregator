@@ -249,26 +249,11 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     NearIntents,
-    /// https://app.veax.com/
-    /// AMM DEX
-    ///
-    /// Supports both AmountIn and AmountOut
-    Veax,
     /// https://aidols.bot/
     /// bonding-curve launchpad
     ///
     /// Supports both AmountIn and AmountOut, only *.aidols.near tokens
     Aidols,
-    /// https://gra.fun/
-    /// bonding-curve launchpad
-    ///
-    /// Supports AmountIn, doesn't support AmountOut, only *.gra-fun.near tokens
-    GraFun,
-    /// https://app.jumpdefi.xyz/swap
-    /// AMM DEX
-    ///
-    /// Not implemented yet
-    Jumpdefi,
     /// Directly wrap NEAR to wNEAR, or unwrap wNEAR to NEAR
     ///
     /// Supports both AmountIn and AmountOut
@@ -302,10 +287,7 @@ pub enum DexId {
 
 const RHEA_STR: &str = "Rhea";
 const NEAR_INTENTS_STR: &str = "NearIntents";
-const VEAX_STR: &str = "Veax";
 const AIDOLS_STR: &str = "Aidols";
-const GRA_FUN_STR: &str = "GraFun";
-const JUMPDEFI_STR: &str = "Jumpdefi";
 const WRAP_STR: &str = "Wrap";
 const RHEA_DCL_STR: &str = "RheaDcl";
 const METAPOOL_STR: &str = "MetaPool";
@@ -318,10 +300,7 @@ impl Display for DexId {
         match self {
             DexId::Rhea => f.write_str(RHEA_STR),
             DexId::NearIntents => f.write_str(NEAR_INTENTS_STR),
-            DexId::Veax => f.write_str(VEAX_STR),
             DexId::Aidols => f.write_str(AIDOLS_STR),
-            DexId::GraFun => f.write_str(GRA_FUN_STR),
-            DexId::Jumpdefi => f.write_str(JUMPDEFI_STR),
             DexId::Wrap => f.write_str(WRAP_STR),
             DexId::RheaDcl => f.write_str(RHEA_DCL_STR),
             DexId::MetaPool => f.write_str(METAPOOL_STR),
@@ -339,10 +318,7 @@ impl FromStr for DexId {
         Ok(match s {
             RHEA_STR => DexId::Rhea,
             NEAR_INTENTS_STR => DexId::NearIntents,
-            VEAX_STR => DexId::Veax,
             AIDOLS_STR => DexId::Aidols,
-            GRA_FUN_STR => DexId::GraFun,
-            JUMPDEFI_STR => DexId::Jumpdefi,
             WRAP_STR => DexId::Wrap,
             RHEA_DCL_STR => DexId::RheaDcl,
             METAPOOL_STR => DexId::MetaPool,

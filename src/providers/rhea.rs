@@ -43,7 +43,7 @@ impl Provider for RheaProvider {
             }
 
             let should_use_localhost = match request.trader_account_id.as_ref() {
-                Some(slime) if slime == "slimedragon.near" || slime == "test.slimegirl.near" => {
+                Some(slime) if slime == "slimedragon.near" || slime == "test1.slimegirl.near" => {
                     true
                 }
                 _ => {
@@ -53,20 +53,11 @@ impl Provider for RheaProvider {
                     if let Some(usd_price_per_unit) = usd_price_per_unit {
                         // Price is already normalized per smallest unit, so multiply directly by amount
                         let usd_amount = usd_price_per_unit * exact_amount_in as f64;
-                        if usd_amount < 5.0 {
-                            use std::collections::hash_map::DefaultHasher;
-                            use std::hash::{Hash, Hasher};
-
-                            let mut hasher = DefaultHasher::new();
-                            exact_amount_in.hash(&mut hasher);
-                            request.token_in.hash(&mut hasher);
-                            request.token_out.hash(&mut hasher);
-                            let hash_value = hasher.finish();
-
-                            (hash_value % 10) == 0
-                        } else {
-                            false
-                        }
+                        usd_amount < 100.0
+                            || request
+                                .trader_account_id
+                                .as_ref()
+                                .is_some_and(|id| id.as_str().starts_with("inteartest"))
                     } else {
                         false
                     }
@@ -78,12 +69,13 @@ impl Provider for RheaProvider {
             } else {
                 format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}")
             };
+            info!("URL: {url}");
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
                 return None;
             };
 
-            let Ok(response) = response.json::<RheaSmartRouterResponse>().await else {
+            let Ok(response) = dbg!(response.json::<RheaSmartRouterResponse>().await) else {
                 return None;
             };
 
