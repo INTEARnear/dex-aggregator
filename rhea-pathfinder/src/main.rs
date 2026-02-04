@@ -790,10 +790,7 @@ async fn route<'a>(
     let mut best_split = best_split;
     let mut best_split_estimated_out = best_split_estimated_out;
     for route in routes {
-        let single_split = SplitRoute::new(vec![SplitRouteStep {
-            route: route,
-            weight: 100,
-        }]);
+        let single_split = SplitRoute::new(vec![SplitRouteStep { route, weight: 100 }]);
         let single_split_out = if let Ok(out) =
             single_split.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default())
         {
@@ -921,7 +918,7 @@ fn find_best_split_route<'a>(
     if routes.is_empty() {
         return None;
     }
-    let step = SPLIT_ROUTE_STEP_SIZE as u32;
+    let step = SPLIT_ROUTE_STEP_SIZE;
     let slices = 100 / step;
     let mut weights: Vec<u32> = vec![0; routes.len()];
 
@@ -967,11 +964,10 @@ fn find_best_split_route<'a>(
                 token_out,
                 total_amount,
                 &mut PoolsDelta::default(),
-            ) {
-                if out > local_best_out {
-                    local_best_out = out;
-                    local_best_idx = Some(idx);
-                }
+            ) && out > local_best_out
+            {
+                local_best_out = out;
+                local_best_idx = Some(idx);
             }
         }
 

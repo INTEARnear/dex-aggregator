@@ -216,9 +216,8 @@ impl Provider for IntearPlachProvider {
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
         Box::pin(async move {
-            let Amount::AmountIn(exact_amount_in) = request.amount else {
-                // smartrouter.ref.finance/findPath doesn't support AmountOut
-                return None;
+            let amount_hint = match request.amount {
+                Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
             };
 
             let slippage =
@@ -226,7 +225,7 @@ impl Provider for IntearPlachProvider {
 
             let (_, token_in) = match &request.token_in {
                 t if is_near(t) => (
-                    convert_to_native(t, None, NearToken::from_yoctonear(exact_amount_in)).await?,
+                    convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
                     AssetId::Near,
                 ),
                 _ => convert_to_nep141(&request.token_in, None, 0)
@@ -235,7 +234,7 @@ impl Provider for IntearPlachProvider {
             };
             let (_, token_out) = match &request.token_out {
                 t if is_near(t) => (
-                    convert_to_native(t, None, NearToken::from_yoctonear(exact_amount_in)).await?,
+                    convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
                     AssetId::Near,
                 ),
                 _ => convert_to_nep141(&request.token_out, None, 0)
@@ -247,7 +246,11 @@ impl Provider for IntearPlachProvider {
                 return None;
             }
 
-            let url = format!("http://localhost:12346/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}");
+            let amount_query = match request.amount {
+                Amount::AmountIn(amount_in) => format!("amountIn={amount_in}"),
+                Amount::AmountOut(amount_out) => format!("amountOut={amount_out}"),
+            };
+            let url = format!("http://localhost:12346/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&{amount_query}");
             info!("URL: {url}");
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
@@ -263,39 +266,93 @@ impl Provider for IntearPlachProvider {
                 return None;
             };
 
-            if response.routes.is_empty() {
-                return None;
-            }
-
-            let total_min_amount_out = response
-                .routes
-                .iter()
-                .map(|route| route.min_amount_out)
-                .sum();
-            let steps = response
-                .routes
-                .into_iter()
-                .flat_map(|route| route.pools)
-                .collect::<Vec<_>>();
-            let swaps = steps
-                .iter()
-                .map(|step| Operation::SwapSimple {
-                    dex_id: PLACH_DEX_ID.to_string(),
-                    message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
-                    asset_in: step.token_in.clone(),
-                    asset_out: step.token_out.clone(),
-                    amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(
-                        step.amount_in,
-                    ))),
-                    constraint: Some(U128::from(step.min_amount_out)),
-                })
-                .collect::<Vec<_>>();
+            let (
+                swaps,
+                total_min_amount_out,
+                total_max_amount_in,
+                estimated_amount,
+                worst_case_amount,
+            ) = match response {
+                SplitRouteApiResponse::ExactIn {
+                    routes, amount_out, ..
+                } => {
+                    if routes.is_empty() {
+                        return None;
+                    }
+                    let total_min_amount_out =
+                        routes.iter().map(|route| route.min_amount_out).sum();
+                    let steps = routes
+                        .into_iter()
+                        .flat_map(|route| route.pools)
+                        .collect::<Vec<_>>();
+                    let swaps = steps
+                        .iter()
+                        .map(|step| Operation::SwapSimple {
+                            dex_id: PLACH_DEX_ID.to_string(),
+                            message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
+                            asset_in: step.token_in.clone(),
+                            asset_out: step.token_out.clone(),
+                            amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(
+                                U128::from(step.amount_in),
+                            )),
+                            constraint: (step.min_amount_out > 0)
+                                .then(|| U128::from(step.min_amount_out)),
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        swaps,
+                        total_min_amount_out,
+                        0,
+                        Amount::AmountOut(amount_out),
+                        Amount::AmountOut(total_min_amount_out),
+                    )
+                }
+                SplitRouteApiResponse::ExactOut {
+                    routes,
+                    amount_in,
+                    max_amount_in,
+                    amount_out: _,
+                    ..
+                } => {
+                    if routes.is_empty() {
+                        return None;
+                    }
+                    let steps = routes
+                        .into_iter()
+                        .flat_map(|route| route.pools)
+                        .collect::<Vec<_>>();
+                    let swaps = steps
+                        .iter()
+                        .map(|step| Operation::SwapSimple {
+                            dex_id: PLACH_DEX_ID.to_string(),
+                            message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
+                            asset_in: step.token_in.clone(),
+                            asset_out: step.token_out.clone(),
+                            amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(
+                                U128::from(step.amount_out),
+                            )),
+                            constraint: (step.max_amount_in > 0)
+                                .then(|| U128::from(step.max_amount_in)),
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        swaps,
+                        0,
+                        max_amount_in,
+                        Amount::AmountIn(amount_in),
+                        Amount::AmountIn(max_amount_in),
+                    )
+                }
+            };
 
             let mut operations = swaps;
             operations.push(Operation::Withdraw {
                 asset_id: token_out.clone(),
                 amount: WithdrawAmount::Full {
-                    at_least: Some(U128::from(total_min_amount_out)),
+                    at_least: Some(match request.amount {
+                        Amount::AmountIn(_) => U128::from(total_min_amount_out),
+                        Amount::AmountOut(amount_out) => U128::from(amount_out),
+                    }),
                 },
                 to: None,
                 rescue_address: None,
@@ -351,12 +408,17 @@ impl Provider for IntearPlachProvider {
                 vec![]
             };
 
+            let input_amount = match request.amount {
+                Amount::AmountIn(amount_in) => amount_in,
+                Amount::AmountOut(_) => total_max_amount_in,
+            };
+
             let transactions = match token_in {
                 AssetId::Near => {
                     let input_to_native = convert_to_native(
                         &request.token_in,
                         request.trader_account_id.clone(),
-                        NearToken::from_yoctonear(exact_amount_in),
+                        NearToken::from_yoctonear(input_amount),
                     )
                     .await?;
                     let deposit_near_action = Action::FunctionCall(Box::new(FunctionCallAction {
@@ -366,7 +428,7 @@ impl Provider for IntearPlachProvider {
                         }))
                         .unwrap(),
                         gas: NearGas::from_tgas(150).as_gas(),
-                        deposit: NearToken::from_yoctonear(exact_amount_in),
+                        deposit: NearToken::from_yoctonear(input_amount),
                     }));
                     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -400,7 +462,7 @@ impl Provider for IntearPlachProvider {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": INTEAR_DEX_CONTRACT_ID,
-                                "amount": exact_amount_in.to_string(),
+                                "amount": input_amount.to_string(),
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "operations": operations,
                                 })).unwrap(),
@@ -417,7 +479,7 @@ impl Provider for IntearPlachProvider {
                     let (input_to_nep141, input_nep141) = convert_to_nep141(
                         &request.token_in,
                         request.trader_account_id.clone(),
-                        exact_amount_in,
+                        input_amount,
                     )
                     .await?;
                     assert_eq!(token_in_id, input_nep141);
@@ -453,8 +515,8 @@ impl Provider for IntearPlachProvider {
                 dex_id: DexId::Plach,
                 deadline: None,
                 has_slippage: true,
-                estimated_amount: Amount::AmountOut(response.amount_out),
-                worst_case_amount: Amount::AmountOut(total_min_amount_out),
+                estimated_amount,
+                worst_case_amount,
                 execution_instructions: [registration_transactions, transactions].concat(),
                 has_leftover_after_slippage_that_needs_unwrapping: false,
                 token_output: match token_out {
@@ -477,20 +539,34 @@ struct ApiResponse {
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
-struct SplitRouteApiResponse {
-    routes: Vec<ApiResponseRoute>,
-    contract_in: AssetId,
-    contract_out: AssetId,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
+#[serde(tag = "quote_type", rename_all = "snake_case")]
+enum SplitRouteApiResponse {
+    ExactIn {
+        routes: Vec<ExactInRoute>,
+        contract_in: AssetId,
+        contract_out: AssetId,
+        #[serde(with = "dec_format")]
+        amount_in: Balance,
+        #[serde(with = "dec_format")]
+        amount_out: Balance,
+    },
+    ExactOut {
+        routes: Vec<ExactOutRoute>,
+        contract_in: AssetId,
+        contract_out: AssetId,
+        #[serde(with = "dec_format")]
+        amount_in: Balance,
+        #[serde(with = "dec_format")]
+        max_amount_in: Balance,
+        #[serde(with = "dec_format")]
+        amount_out: Balance,
+    },
 }
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
-struct ApiResponseRoute {
-    pools: Vec<ApiResponsePoolStep>,
+struct ExactInRoute {
+    pools: Vec<ExactInPoolStep>,
     #[serde(with = "dec_format")]
     amount_in: Balance,
     #[serde(with = "dec_format")]
@@ -501,7 +577,32 @@ struct ApiResponseRoute {
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
-struct ApiResponsePoolStep {
+struct ExactOutRoute {
+    pools: Vec<ExactOutPoolStep>,
+    #[serde(with = "dec_format")]
+    amount_in: Balance,
+    #[serde(with = "dec_format")]
+    max_amount_in: Balance,
+    #[serde(with = "dec_format")]
+    amount_out: Balance,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct ExactInPoolStep {
+    #[serde(with = "dec_format")]
+    pool_id: u32,
+    token_in: AssetId,
+    token_out: AssetId,
+    #[serde(with = "dec_format")]
+    amount_in: Balance,
+    #[serde(with = "dec_format")]
+    min_amount_out: Balance,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct ExactOutPoolStep {
     #[serde(with = "dec_format")]
     pool_id: u32,
     token_in: AssetId,
@@ -511,5 +612,5 @@ struct ApiResponsePoolStep {
     #[serde(with = "dec_format")]
     amount_out: Balance,
     #[serde(with = "dec_format")]
-    min_amount_out: Balance,
+    max_amount_in: Balance,
 }
