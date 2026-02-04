@@ -948,7 +948,10 @@ fn find_best_split_route<'a>(
     };
 
     for _ in 0..slices {
-        let mut local_best_metric = best_metric;
+        let mut local_best_metric = match total_amount {
+            QuoteAmount::ExactIn(_) => best_metric,
+            QuoteAmount::ExactOut(_) => Balance::MAX,
+        };
         let mut local_best_idx: Option<usize> = None;
 
         for (idx, _route) in routes.iter().enumerate() {
@@ -1024,6 +1027,10 @@ fn find_best_split_route<'a>(
             // No further improvement found
             break;
         }
+    }
+
+    if weights.iter().copied().sum::<u32>() != 100 {
+        return None;
     }
 
     best_split
