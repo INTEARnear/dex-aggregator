@@ -9,8 +9,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, get_token_price,
-        REQWEST_CLIENT,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -42,33 +41,7 @@ impl Provider for RheaProvider {
                 return None;
             }
 
-            let should_use_localhost = match request.trader_account_id.as_ref() {
-                Some(slime) if slime == "slimedragon.near" || slime == "test1.slimegirl.near" => {
-                    true
-                }
-                _ => {
-                    let usd_price_per_unit =
-                        get_token_price(&request.token_in.get_account_id()).await;
-
-                    if let Some(usd_price_per_unit) = usd_price_per_unit {
-                        // Price is already normalized per smallest unit, so multiply directly by amount
-                        let usd_amount = usd_price_per_unit * exact_amount_in as f64;
-                        usd_amount < 100.0
-                            || request
-                                .trader_account_id
-                                .as_ref()
-                                .is_some_and(|id| id.as_str().starts_with("inteartest"))
-                    } else {
-                        false
-                    }
-                }
-            };
-
-            let url = if should_use_localhost {
-                format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}")
-            } else {
-                format!("https://smartrouter.ref.finance/findPath?tokenIn={token_in}&tokenOut={token_out}&pathDeep=3&slippage={slippage}&amountIn={exact_amount_in}")
-            };
+            let url = format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={exact_amount_in}");
             info!("URL: {url}");
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
@@ -125,6 +98,7 @@ impl Provider for RheaProvider {
                     method_name: "swap".to_string(),
                     args: serde_json::to_vec(&serde_json::json!({
                         "actions": actions,
+                        "referral_id": "dex-aggregator.intear.near",
                     }))
                     .unwrap(),
                     gas: NearGas::from_tgas(150).as_gas(),
@@ -159,6 +133,7 @@ impl Provider for RheaProvider {
                         "actions": actions,
                         "skip_degen_price_sync": true,
                         "skip_unwrap_near": !unwrapping_near,
+                        "referral_id": "dex-aggregator.intear.near",
                     })).unwrap(),
                 }))
                 .unwrap(),

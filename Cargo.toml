@@ -20,9 +20,11 @@ tower-http = { version = "0.6.2", features = ["cors"] }
 cached = { version = "0.55.1", features = ["async"] }
 bigdecimal = "0.4.8"
 num-traits = "0.2.19"
+borsh = "1.6.0"
+base64 = "0.21.0"
 
 [profile.release]
 overflow-checks = true
 
 [workspace]
-members = ["rhea-pathfinder"]
+members = ["rhea-pathfinder", "plach-pathfinder"]

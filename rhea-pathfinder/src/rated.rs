@@ -212,7 +212,8 @@ impl RatedSwap {
             .saturating_sub(1); // * ? curve sub -1 just in case there were some rounding errors
 
         let trade_fee = fees.trade_fee(dy);
-        let amount_swapped = dy.checked_sub(trade_fee)
+        let amount_swapped = dy
+            .checked_sub(trade_fee)
             .ok_or_else(|| anyhow::anyhow!("Underflow subtracting trade fee in rated swap"))?;
 
         let new_destination_amount = current_c_amounts_rated[token_out_idx]

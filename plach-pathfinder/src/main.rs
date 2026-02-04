@@ -1,29 +1,25 @@
-mod degen;
-mod rated;
-mod stable;
-
-use itertools::Itertools;
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
+use borsh::{BorshDeserialize, BorshSerialize};
+use crypto_bigint::U256;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, AccountIdRef, Balance};
+use near_min_api::types::{AccountId, Balance};
 use near_min_api::utils::dec_format;
 use rand::Rng;
+use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::panic::AssertUnwindSafe;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use uint::construct_uint;
 use warp::Filter;
 
 use near_min_api::{QueryFinality, RpcClient, types::Finality};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, error, info, warn};
-
-use crate::degen::DegenSwap;
-use crate::rated::RatedSwap;
-use crate::stable::StableSwap;
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -35,8 +31,8 @@ struct ApiResponse<T> {
 #[derive(Serialize, Debug)]
 struct SplitRouteApiResponse {
     routes: Vec<ApiResponseRoute>,
-    contract_in: AccountId,
-    contract_out: AccountId,
+    contract_in: AssetId,
+    contract_out: AssetId,
     #[serde(with = "dec_format")]
     amount_in: Balance,
     #[serde(with = "dec_format")]
@@ -57,9 +53,9 @@ struct ApiResponseRoute {
 #[derive(Serialize, Debug)]
 struct ApiResponsePoolStep {
     #[serde(with = "dec_format")]
-    pool_id: u64,
-    token_in: AccountId,
-    token_out: AccountId,
+    pool_id: u32,
+    token_in: AssetId,
+    token_out: AssetId,
     #[serde(with = "dec_format")]
     amount_in: Balance,
     #[serde(with = "dec_format")]
@@ -68,11 +64,11 @@ struct ApiResponsePoolStep {
     min_amount_out: Balance,
 }
 
-const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
+const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
+const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
 const MAX_SPLITS_COUNT: usize = 2;
-const FEE_DIVISOR: u32 = 10_000;
-const FETCH_POOLS_BATCH_SIZE: usize = 1000;
+const FETCH_POOLS_BATCH_SIZE: u32 = 1000;
 const TOP_ROUTES_COUNT: usize = 10;
 
 const RC_SUCCESS: i32 = 0;
@@ -81,107 +77,197 @@ const RC_ROUTE_ERROR: i32 = 2;
 const RC_RESPONSE_BUILD_ERROR: i32 = 3;
 const RC_INVALID_SLIPPAGE: i32 = 4;
 
-construct_uint! {
-    struct U256(4);
+#[derive(Debug, Clone)]
+pub struct Pool {
+    id: u32,
+    data: PoolData,
 }
 
-construct_uint! {
-    struct U384(6);
+#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+pub enum PoolData {
+    Private {
+        assets: (AssetWithBalance, AssetWithBalance),
+        fees: FeeConfiguration,
+        owner_id: AccountId,
+    },
+    Public {
+        assets: (AssetWithBalance, AssetWithBalance),
+        fees: FeeConfiguration,
+        total_shares: Option<Balance>,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum PoolKind {
-    SimplePool,
-    StableSwap,
-    RatedSwap,
-    DegenSwap,
+#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
+pub struct FeeConfiguration {
+    pub receivers: Vec<(FeeReceiver, FeeFraction)>,
 }
 
-mod dec_format_vec {
-    use std::str::FromStr;
+#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
+pub enum FeeReceiver {
+    Account(AssetId),
+}
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+type FeeFraction = u32;
 
-    pub fn serialize<S, T>(value: &Vec<T>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: ToString,
-    {
-        let vec_of_strings = value.iter().map(|v| v.to_string()).collect::<Vec<String>>();
-        vec_of_strings.serialize(serializer)
+#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
+pub struct AssetWithBalance {
+    pub asset_id: AssetId,
+    #[serde(with = "dec_format")]
+    pub balance: Balance,
+}
+
+#[derive(Debug, PartialEq, BorshDeserialize, Clone, PartialOrd, Eq, Ord, Hash)]
+pub enum AssetId {
+    Near,
+    Nep141(AccountId),
+    Nep245(AccountId, String),
+    Nep171(AccountId, String),
+}
+
+impl Display for AssetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Near => write!(f, "near"),
+            Self::Nep141(contract_id) => write!(f, "nep141:{contract_id}"),
+            Self::Nep245(contract_id, token_id) => write!(f, "nep245:{contract_id}:{token_id}"),
+            Self::Nep171(contract_id, token_id) => write!(f, "nep171:{contract_id}:{token_id}"),
+        }
     }
+}
 
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: FromStr,
-    {
-        let vec_of_strings = Vec::<String>::deserialize(deserializer)?;
-        let vec_of_values = vec_of_strings
-            .iter()
-            .map(|v| {
-                v.parse::<T>()
-                    .map_err(|_| de::Error::custom("Failed to parse value"))
-            })
-            .collect::<Result<Vec<T>, D::Error>>()?;
-        Ok(vec_of_values)
+impl FromStr for AssetId {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "near" => Ok(Self::Near),
+            _ => match s.split_once(':') {
+                Some(("nep141", contract_id)) => {
+                    Ok(Self::Nep141(contract_id.parse().map_err(|e| {
+                        format!("Invalid account id {contract_id}: {e}")
+                    })?))
+                }
+                Some(("nep245", rest)) => {
+                    if let Some((contract_id, token_id)) = rest.split_once(':') {
+                        Ok(Self::Nep245(
+                            contract_id
+                                .parse()
+                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
+                            token_id.to_string(),
+                        ))
+                    } else {
+                        Err(format!("Invalid asset id: {s}"))
+                    }
+                }
+                Some(("nep171", rest)) => {
+                    if let Some((contract_id, token_id)) = rest.split_once(':') {
+                        Ok(Self::Nep171(
+                            contract_id
+                                .parse()
+                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
+                            token_id.to_string(),
+                        ))
+                    } else {
+                        Err(format!("Invalid asset id: {s}"))
+                    }
+                }
+                _ => Err(format!("Invalid asset id: {s}")),
+            },
+        }
     }
 }
 
-#[derive(Debug)]
-struct Pool {
-    id: u64,
-    info: PoolInfo,
-    detail: PoolDetailInfo,
+impl Serialize for AssetId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Serialize::serialize(&self.to_string(), serializer)
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PoolInfo {
-    #[serde(with = "dec_format_vec")]
-    amounts: Vec<Balance>,
-    amp: u64,
-    pool_kind: PoolKind,
-    shares_total_supply: String,
-    token_account_ids: Vec<AccountId>,
-    total_fee: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-enum PoolDetailInfo {
-    SimplePoolInfo(SimplePoolInfo),
-    StablePoolInfo(StablePoolInfo),
-    RatedPoolInfo(RatedPoolInfo),
-    DegenPoolInfo(DegenPoolInfo),
+impl<'de> Deserialize<'de> for AssetId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String as Deserialize<'de>>::deserialize(deserializer)?;
+        Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Default)]
 struct PoolsDelta {
-    changed_pools: HashMap<u64, Pool>,
+    changed_pools: HashMap<u32, Pool>,
 }
 
-impl PoolDetailInfo {
+fn u128_to_u256(value: u128) -> U256 {
+    U256::from(value)
+}
+
+fn u256_to_u128(value: U256) -> u128 {
+    assert!(value.bits() <= 128, "Value must be less than 128 bits");
+    let bytes = value.to_le_bytes();
+    let first_chunk = bytes.first_chunk().unwrap();
+    u128::from_le_bytes(*first_chunk)
+}
+
+impl Pool {
     fn emulate_swap(
         &mut self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
+        token_in: &AssetId,
+        token_out: &AssetId,
         amount_in: Balance,
     ) -> Result<Balance, anyhow::Error> {
         let self_before_modifications = self.clone();
-        let unwind_safe_self = AssertUnwindSafe(&mut *self);
-        let result = std::panic::catch_unwind(move || match unwind_safe_self {
-            AssertUnwindSafe(PoolDetailInfo::SimplePoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
+        let mut unwind_safe_self = AssertUnwindSafe(&mut *self);
+        let result = std::panic::catch_unwind(move || {
+            const MAX_FEE_FRACTION: FeeFraction = 1000000;
+
+            fn collect_fees(amount_in: u128, fees: &FeeConfiguration) -> u128 {
+                let mut total_fees = 0u128;
+                for (_, fee_fraction) in fees.receivers.iter() {
+                    let fee_amount = u256_to_u128(
+                        u128_to_u256(amount_in) * u128_to_u256(*fee_fraction as u128)
+                            / u128_to_u256(MAX_FEE_FRACTION as u128),
+                    );
+                    total_fees = total_fees.checked_add(fee_amount).expect("Overflow");
+                }
+                amount_in.checked_sub(total_fees).expect("Fee exceeds 100%")
             }
-            AssertUnwindSafe(PoolDetailInfo::StablePoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
-            AssertUnwindSafe(PoolDetailInfo::RatedPoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
-            AssertUnwindSafe(PoolDetailInfo::DegenPoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
+
+            let (assets, fees) = match &mut unwind_safe_self.data {
+                PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => {
+                    (assets, fees)
+                }
+            };
+            let first_in = match (
+                assets.0.asset_id == *token_in && assets.1.asset_id == *token_out,
+                assets.1.asset_id == *token_in && assets.0.asset_id == *token_out,
+            ) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => panic!("Invalid assets or pool ID"),
+            };
+            let (in_balance, out_balance) = if first_in {
+                (&mut assets.0.balance, &mut assets.1.balance)
+            } else {
+                (&mut assets.1.balance, &mut assets.0.balance)
+            };
+            println!("in_balance: {in_balance}");
+            println!("out_balance: {out_balance}");
+            let amount_in_after_fees = collect_fees(amount_in, fees);
+            // u128 * u128 or u128 + u128 can't overflow u256; in_balance was checked to be positive
+            #[allow(clippy::arithmetic_side_effects)]
+            let amount_out = u256_to_u128(
+                u128_to_u256(amount_in_after_fees) * u128_to_u256(*out_balance)
+                    / (u128_to_u256(*in_balance) + u128_to_u256(amount_in_after_fees)),
+            );
+            println!("amount_out: {amount_out}");
+            *in_balance = in_balance
+                .checked_add(amount_in_after_fees)
+                .expect("Overflow");
+            *out_balance = out_balance.checked_sub(amount_out).expect("Underflow");
+            Ok(amount_out)
         });
         match result {
             Ok(Ok(result)) => Ok(result),
@@ -201,346 +287,27 @@ impl PoolDetailInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-struct SimplePoolInfo {
-    token_account_ids: Vec<AccountId>,
-    #[serde(with = "dec_format_vec")]
-    amounts: Vec<Balance>,
-    total_fee: u32,
-    #[serde(with = "dec_format")]
-    shares_total_supply: Balance,
-}
-
-impl SimplePoolInfo {
-    fn emulate_swap(
-        &mut self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
-        amount_in: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let Some(token_in) = self.token_account_ids.iter().position(|id| id == token_in) else {
-            return Err(anyhow::anyhow!("Token in not found"));
-        };
-        let Some(token_out) = self.token_account_ids.iter().position(|id| id == token_out) else {
-            return Err(anyhow::anyhow!("Token out not found"));
-        };
-        let in_balance = U256::from(self.amounts[token_in]);
-        let out_balance = U256::from(self.amounts[token_out]);
-        if in_balance == U256::zero() {
-            return Err(anyhow::anyhow!("In balance is zero"));
-        }
-        if out_balance == U256::zero() {
-            return Err(anyhow::anyhow!("Out balance is zero"));
-        }
-        if token_in == token_out {
-            return Err(anyhow::anyhow!("Token in is equal to token out"));
-        }
-        if amount_in == 0 {
-            return Err(anyhow::anyhow!("Amount in is zero"));
-        }
-        let amount_with_fee = U256::from(amount_in) * U256::from(FEE_DIVISOR - self.total_fee);
-        let received = (amount_with_fee * out_balance
-            / (U256::from(FEE_DIVISOR) * in_balance + amount_with_fee))
-            .as_u128();
-        self.amounts[token_in] += amount_in;
-        self.amounts[token_out] -= received;
-        Ok(received)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-struct StablePoolInfo {
-    token_account_ids: Vec<AccountId>,
-    decimals: Vec<u8>,
-    #[serde(with = "dec_format_vec")]
-    amounts: Vec<Balance>,
-    #[serde(with = "dec_format_vec")]
-    c_amounts: Vec<Balance>,
-    total_fee: u32,
-    #[serde(with = "dec_format")]
-    shares_total_supply: Balance,
-    amp: u64,
-}
-
-pub fn u128_ratio(a: u128, num: u128, denom: u128) -> u128 {
-    (U256::from(a) * U256::from(num) / U256::from(denom)).as_u128()
-}
-
-impl StablePoolInfo {
-    fn emulate_swap(
-        &mut self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
-        amount_in: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let Some(in_idx) = self.token_account_ids.iter().position(|id| id == token_in) else {
-            return Err(anyhow::anyhow!("Token in not found"));
-        };
-        let Some(out_idx) = self.token_account_ids.iter().position(|id| id == token_out) else {
-            return Err(anyhow::anyhow!("Token out not found"));
-        };
-        let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
-        let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
-        self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
-        if self.c_amounts[out_idx] < stable::MIN_RESERVE {
-            return Err(anyhow::anyhow!("Min reserve not met"));
-        }
-        Ok(amount_swapped)
-    }
-
-    fn c_amount_to_amount(&self, c_amount: u128, index: usize) -> u128 {
-        let value = self.decimals[index];
-        if value <= stable::TARGET_DECIMAL {
-            let factor = 10_u128
-                .checked_pow((stable::TARGET_DECIMAL - value) as u32)
-                .unwrap();
-            c_amount.checked_div(factor).expect("Cannot divide")
-        } else {
-            let factor = 10_u128
-                .checked_pow((value - stable::TARGET_DECIMAL) as u32)
-                .unwrap();
-            c_amount.checked_mul(factor).expect("Cannot multiply")
-        }
-    }
-
-    fn amount_to_c_amount(&self, amount: u128, index: usize) -> u128 {
-        let value = self.decimals[index];
-        if value <= stable::TARGET_DECIMAL {
-            let factor = 10_u128
-                .checked_pow((stable::TARGET_DECIMAL - value) as u32)
-                .unwrap();
-            amount.checked_mul(factor).expect("Cannot multiply")
-        } else {
-            let factor = 10_u128
-                .checked_pow((value - stable::TARGET_DECIMAL) as u32)
-                .unwrap();
-            amount.checked_div(factor).expect("Cannot divide")
-        }
-    }
-
-    fn get_invariant(&self) -> StableSwap {
-        StableSwap::new(self.amp)
-    }
-
-    fn internal_get_return(
-        &self,
-        token_in: usize,
-        amount_in: Balance,
-        token_out: usize,
-    ) -> Result<stable::SwapResult, anyhow::Error> {
-        // make amounts into comparable-amounts
-        let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
-
-        self.get_invariant()
-            .swap_to(
-                token_in,
-                c_amount_in,
-                token_out,
-                &self.c_amounts,
-                &stable::Fees::new(self.total_fee),
-            )
-            .ok_or_else(|| anyhow::anyhow!("Cannot swap"))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-struct RatedPoolInfo {
-    token_account_ids: Vec<AccountId>,
-    decimals: Vec<u8>,
-    #[serde(with = "dec_format_vec")]
-    amounts: Vec<Balance>,
-    #[serde(with = "dec_format_vec")]
-    c_amounts: Vec<Balance>,
-    total_fee: u32,
-    #[serde(with = "dec_format")]
-    shares_total_supply: Balance,
-    amp: u64,
-    #[serde(with = "dec_format_vec")]
-    rates: Vec<Balance>,
-}
-
-impl RatedPoolInfo {
-    fn emulate_swap(
-        &mut self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
-        amount_in: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let Some(in_idx) = self.token_account_ids.iter().position(|id| id == token_in) else {
-            return Err(anyhow::anyhow!("Token in not found"));
-        };
-        let Some(out_idx) = self.token_account_ids.iter().position(|id| id == token_out) else {
-            return Err(anyhow::anyhow!("Token out not found"));
-        };
-        let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
-        let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
-        self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
-        if self.c_amounts[out_idx] < rated::MIN_RESERVE {
-            return Err(anyhow::anyhow!("Min reserve not met"));
-        }
-        Ok(amount_swapped)
-    }
-
-    fn internal_get_return(
-        &self,
-        token_in: usize,
-        amount_in: Balance,
-        token_out: usize,
-    ) -> Result<rated::SwapResult, anyhow::Error> {
-        self.internal_get_return_with_rates(token_in, amount_in, token_out, &self.rates)
-    }
-
-    fn internal_get_return_with_rates(
-        &self,
-        token_in: usize,
-        amount_in: Balance,
-        token_out: usize,
-        rates: &Vec<Balance>,
-    ) -> Result<rated::SwapResult, anyhow::Error> {
-        // make amounts into comparable-amounts
-        let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
-
-        self.get_invariant_with_rates(rates).swap_to(
-            token_in,
-            c_amount_in,
-            token_out,
-            &self.c_amounts,
-            &rated::Fees::new(self.total_fee),
-        )
-    }
-
-    fn amount_to_c_amount(&self, amount: u128, index: usize) -> u128 {
-        let value = self.decimals.get(index).unwrap();
-        let factor = 10_u128
-            .checked_pow((rated::TARGET_DECIMAL - value) as u32)
-            .unwrap();
-        amount.checked_mul(factor).unwrap()
-    }
-
-    fn c_amount_to_amount(&self, c_amount: u128, index: usize) -> u128 {
-        let value = self.decimals.get(index).unwrap();
-        let factor = 10_u128
-            .checked_pow((rated::TARGET_DECIMAL - value) as u32)
-            .unwrap();
-        c_amount.checked_div(factor).unwrap()
-    }
-
-    fn get_invariant_with_rates(&self, rates: &Vec<Balance>) -> RatedSwap {
-        RatedSwap::new(self.amp, rates)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-struct DegenPoolInfo {
-    token_account_ids: Vec<AccountId>,
-    decimals: Vec<u8>,
-    #[serde(with = "dec_format_vec")]
-    amounts: Vec<Balance>,
-    #[serde(with = "dec_format_vec")]
-    c_amounts: Vec<Balance>,
-    total_fee: u32,
-    #[serde(with = "dec_format")]
-    shares_total_supply: Balance,
-    amp: u64,
-    #[serde(with = "dec_format_vec")]
-    degens: Vec<Balance>,
-}
-
-impl DegenPoolInfo {
-    fn emulate_swap(
-        &mut self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
-        amount_in: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let Some(in_idx) = self.token_account_ids.iter().position(|id| id == token_in) else {
-            return Err(anyhow::anyhow!("Token in not found"));
-        };
-        let Some(out_idx) = self.token_account_ids.iter().position(|id| id == token_out) else {
-            return Err(anyhow::anyhow!("Token out not found"));
-        };
-        let result = self.internal_get_return(in_idx, amount_in, out_idx)?;
-        let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
-        self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
-        if self.c_amounts[out_idx] < degen::MIN_RESERVE {
-            return Err(anyhow::anyhow!("Min reserve not met"));
-        }
-        Ok(amount_swapped)
-    }
-
-    fn amount_to_c_amount(&self, amount: u128, index: usize) -> u128 {
-        let value = self.decimals.get(index).unwrap();
-        let factor = 10_u128
-            .checked_pow((degen::TARGET_DECIMAL - value) as u32)
-            .unwrap();
-        amount.checked_mul(factor).unwrap()
-    }
-
-    fn c_amount_to_amount(&self, c_amount: u128, index: usize) -> u128 {
-        let value = self.decimals.get(index).unwrap();
-        let factor = 10_u128
-            .checked_pow((degen::TARGET_DECIMAL - value) as u32)
-            .unwrap();
-        c_amount.checked_div(factor).unwrap()
-    }
-
-    fn internal_get_return(
-        &self,
-        token_in: usize,
-        amount_in: Balance,
-        token_out: usize,
-    ) -> Result<degen::SwapResult, anyhow::Error> {
-        self.internal_get_return_with_degens(token_in, amount_in, token_out, &self.degens)
-    }
-
-    fn internal_get_return_with_degens(
-        &self,
-        token_in: usize,
-        amount_in: Balance,
-        token_out: usize,
-        degens: &Vec<Balance>,
-    ) -> Result<degen::SwapResult, anyhow::Error> {
-        // make amounts into comparable-amounts
-        let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
-
-        self.get_invariant_with_degens(degens).swap_to(
-            token_in,
-            c_amount_in,
-            token_out,
-            &self.c_amounts,
-            &degen::Fees::new(self.total_fee),
-        )
-    }
-
-    fn get_invariant_with_degens(&self, degens: &Vec<Balance>) -> DegenSwap {
-        DegenSwap::new(self.amp, degens)
-    }
-}
-
 lazy_static! {
     static ref POOLS_CACHE: Arc<RwLock<Option<Arc<Pools>>>> = Arc::new(RwLock::new(None));
 }
 
 struct Pools {
     pools: Vec<Pool>,
-    pools_existing: HashSet<BTreeSet<AccountId>>,
-    token_to_pools: HashMap<AccountId, Vec<usize>>,
-    pair_to_pools: HashMap<(AccountId, AccountId), Vec<usize>>,
+    pools_existing: HashSet<BTreeSet<AssetId>>,
+    token_to_pools: HashMap<AssetId, Vec<usize>>,
+    pair_to_pools: HashMap<(AssetId, AssetId), Vec<usize>>,
 }
 
 impl Pools {
-    fn has_direct_pool(&self, token_a: &AccountId, token_b: &AccountId) -> bool {
+    fn has_direct_pool(&self, token_a: &AssetId, token_b: &AssetId) -> bool {
         let pair = BTreeSet::from([token_a.clone(), token_b.clone()]);
         self.pools_existing.contains(&pair)
     }
 
     fn direct_pools<'a>(
         &'a self,
-        token_a: &AccountId,
-        token_b: &AccountId,
+        token_a: &AssetId,
+        token_b: &AssetId,
     ) -> impl Iterator<Item = &'a Pool> {
         let key = if token_a <= token_b {
             (token_a.clone(), token_b.clone())
@@ -553,7 +320,7 @@ impl Pools {
             .flat_map(move |indices| indices.iter().map(move |&idx| &self.pools[idx]))
     }
 
-    fn pools_with_token<'a>(&'a self, token: &AccountId) -> impl Iterator<Item = &'a Pool> {
+    fn pools_with_token<'a>(&'a self, token: &AssetId) -> impl Iterator<Item = &'a Pool> {
         self.token_to_pools
             .get(token)
             .into_iter()
@@ -562,114 +329,103 @@ impl Pools {
 }
 
 async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
-    let number_of_pools: u64 = client
+    let number_of_pools: String = client
         .call(
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_number_of_pools",
-            (),
+            INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+            "dex_view",
+            json!({
+                "dex_id": PLACH_DEX_ID,
+                "method": "get_pool_count",
+                "args": BASE64_STANDARD.encode(borsh::to_vec(&()).unwrap()),
+            }),
             QueryFinality::Finality(Finality::None),
         )
         .await?;
+    let number_of_pools = BASE64_STANDARD.decode(number_of_pools)?;
+    let number_of_pools = borsh::from_slice(&number_of_pools)?;
     info!("Number of pools for data fetch: {}", number_of_pools);
 
     let mut pools_batch_requests = Vec::new();
-    let mut detail_infos_batch_requests = Vec::new();
 
-    for i in (0..number_of_pools).step_by(FETCH_POOLS_BATCH_SIZE) {
-        let request_args = serde_json::json!({
-            "from_index": i,
-            "limit": FETCH_POOLS_BATCH_SIZE,
-        });
+    for i in (0..number_of_pools).step_by(FETCH_POOLS_BATCH_SIZE as usize) {
+        #[derive(BorshSerialize)]
+        struct RequestArgs {
+            start_index: u32,
+            limit: u32,
+        }
+        let request_args = RequestArgs {
+            start_index: i,
+            limit: FETCH_POOLS_BATCH_SIZE,
+        };
 
         pools_batch_requests.push((
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_pools",
-            request_args.clone(),
-            QueryFinality::Finality(Finality::None),
-        ));
-
-        detail_infos_batch_requests.push((
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_pool_detail_infos",
-            request_args,
+            INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+            "dex_view",
+            json!({
+                "dex_id": PLACH_DEX_ID,
+                "method": "get_pools",
+                "args": BASE64_STANDARD.encode(borsh::to_vec(&request_args).unwrap()),
+            }),
             QueryFinality::Finality(Finality::None),
         ));
     }
 
-    let (pools, detail_infos) = tokio::try_join!(
-        async {
-            let batches: Vec<Result<Vec<PoolInfo>, _>> =
-                client.batch_call(pools_batch_requests).await?;
-            let mut pools = Vec::new();
-            for result in batches {
-                let pool_batch = result?;
-                pools.extend(pool_batch);
-            }
-            Ok::<Vec<PoolInfo>, anyhow::Error>(pools)
-        },
-        async {
-            let batches: Vec<Result<Vec<PoolDetailInfo>, _>> =
-                client.batch_call(detail_infos_batch_requests).await?;
-            let mut detail_infos = Vec::new();
-            for result in batches {
-                let detail_batch = result?;
-                detail_infos.extend(detail_batch);
-            }
-            Ok::<Vec<PoolDetailInfo>, anyhow::Error>(detail_infos)
-        }
-    )?;
-
-    if pools.len() != detail_infos.len() {
-        return Err(anyhow::anyhow!(
-            "Pools and detail infos have different lengths"
-        ));
+    let batches: Vec<Result<String, _>> = client.batch_call(pools_batch_requests).await?;
+    let mut pools = Vec::new();
+    for result in batches {
+        let pool_batch = result?;
+        let pool_batch = BASE64_STANDARD.decode(pool_batch)?;
+        let pool_batch: Vec<PoolData> = borsh::from_slice(&pool_batch)?;
+        pools.extend(pool_batch);
     }
+    let pools = pools
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| Pool { id: i as u32, data })
+        .collect::<Vec<_>>();
 
     let pools_existing = {
         let mut pools_existing = HashSet::new();
         for pool in pools.iter() {
-            for i in 2..=pool.token_account_ids.len() {
-                pools_existing.extend(
-                    pool.token_account_ids
-                        .iter()
-                        .cloned()
-                        .combinations(i)
-                        .map(BTreeSet::from_iter),
-                );
-            }
+            let assets = match &pool.data {
+                PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => assets,
+            };
+            pools_existing.insert(BTreeSet::from_iter([
+                assets.0.asset_id.clone(),
+                assets.1.asset_id.clone(),
+            ]));
+            pools_existing.insert(BTreeSet::from_iter([
+                assets.1.asset_id.clone(),
+                assets.0.asset_id.clone(),
+            ]));
         }
         pools_existing
     };
 
-    let pools_vec: Vec<Pool> = pools
-        .into_iter()
-        .zip(detail_infos.into_iter())
-        .enumerate()
-        .map(|(i, (info, detail))| Pool {
-            id: i as u64,
-            info,
-            detail,
-        })
-        .collect();
+    let mut token_to_pools: HashMap<AssetId, Vec<usize>> = HashMap::new();
+    let mut pair_to_pools: HashMap<(AssetId, AssetId), Vec<usize>> = HashMap::new();
 
-    let mut token_to_pools: HashMap<AccountId, Vec<usize>> = HashMap::new();
-    let mut pair_to_pools: HashMap<(AccountId, AccountId), Vec<usize>> = HashMap::new();
+    for (idx, pool) in pools.iter().enumerate() {
+        let assets = match &pool.data {
+            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => assets,
+        };
+        token_to_pools
+            .entry(assets.0.asset_id.clone())
+            .or_default()
+            .push(idx);
+        token_to_pools
+            .entry(assets.1.asset_id.clone())
+            .or_default()
+            .push(idx);
 
-    for (idx, pool) in pools_vec.iter().enumerate() {
-        for token in &pool.info.token_account_ids {
-            token_to_pools.entry(token.clone()).or_default().push(idx);
-        }
-
-        for pair in pool.info.token_account_ids.iter().cloned().combinations(2) {
-            let mut tokens_sorted = pair;
-            tokens_sorted.sort_unstable();
-            let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
-            pair_to_pools.entry(key).or_default().push(idx);
-        }
+        let mut tokens_sorted = [assets.0.asset_id.clone(), assets.1.asset_id.clone()];
+        tokens_sorted.sort_unstable();
+        let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
+        pair_to_pools.entry(key).or_default().push(idx);
     }
 
     Ok(Pools {
-        pools: pools_vec,
+        pools,
         pools_existing,
         token_to_pools,
         pair_to_pools,
@@ -731,15 +487,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .and(warp::query::<FindPathQuery>())
         .and_then(handle_find_path);
 
-    info!("Server listening on http://localhost:12345/findPath ...");
-    warp::serve(api).run(([127, 0, 0, 1], 12345)).await;
+    info!("Server listening on http://localhost:12346/findPath ...");
+    warp::serve(api).run(([127, 0, 0, 1], 12346)).await;
 
     Ok(())
 }
 
 async fn route<'a>(
-    token_in: &'a AccountId,
-    token_out: &'a AccountId,
+    token_in: &'a AssetId,
+    token_out: &'a AssetId,
     amount: Balance,
     pools: &'a Pools,
     max_hops: MaxHops,
@@ -836,15 +592,16 @@ impl<'a> SplitRoute<'a> {
 
     fn emulate_swap(
         &self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
+        token_in: &AssetId,
+        token_out: &AssetId,
         amount_in: Balance,
         pools_delta: &mut PoolsDelta,
     ) -> Result<Balance, anyhow::Error> {
         let mut total_out: Balance = 0;
         for step in &self.steps {
-            let amount_part = u128::try_from(U256::from(amount_in) * U256::from(step.weight) / 100)
-                .map_err(|_| anyhow::anyhow!("Partial amount overflows u128"))?;
+            let amount_part = u256_to_u128(
+                u128_to_u256(amount_in) * u128_to_u256(step.weight as u128) / u128_to_u256(100),
+            );
             let out = step
                 .route
                 .emulate_swap(token_in, token_out, amount_part, pools_delta)?;
@@ -857,8 +614,8 @@ impl<'a> SplitRoute<'a> {
 impl<'a> SplitRoute<'a> {
     fn to_api_response(
         &self,
-        token_in: &AccountId,
-        token_out: &AccountId,
+        token_in: &AssetId,
+        token_out: &AssetId,
         total_amount_in: Balance,
         slippage_bp: u128,
     ) -> Result<SplitRouteApiResponse, anyhow::Error> {
@@ -866,9 +623,10 @@ impl<'a> SplitRoute<'a> {
         let mut total_estimated_out: Balance = 0;
         let mut pools_delta = PoolsDelta::default();
         for step in &self.steps {
-            let amount_part =
-                u128::try_from(U256::from(total_amount_in) * U256::from(step.weight) / 100)
-                    .map_err(|_| anyhow::anyhow!("Partial amount overflows u128"))?;
+            let amount_part = u256_to_u128(
+                u128_to_u256(total_amount_in) * u128_to_u256(step.weight as u128)
+                    / u128_to_u256(100),
+            );
             let estimated_out =
                 step.route
                     .emulate_swap(token_in, token_out, amount_part, &mut pools_delta)?;
@@ -915,8 +673,8 @@ impl<'a> SplitRoute<'a> {
 fn find_best_split_route<'a>(
     routes: Vec<Route<'a>>,
     total_amount: Balance,
-    token_in: &'a AccountId,
-    token_out: &'a AccountId,
+    token_in: &'a AssetId,
+    token_out: &'a AssetId,
 ) -> Option<SplitRoute<'a>> {
     if routes.is_empty() {
         return None;
@@ -1020,8 +778,8 @@ struct Route<'a> {
 #[derive(Debug, Clone, Copy)]
 struct RouteStep<'a> {
     pool: &'a Pool,
-    token_in: &'a AccountIdRef,
-    token_out: &'a AccountIdRef,
+    token_in: &'a AssetId,
+    token_out: &'a AssetId,
 }
 
 impl<'a> Display for Route<'a> {
@@ -1030,7 +788,7 @@ impl<'a> Display for Route<'a> {
             return write!(f, "(empty route)");
         };
         f.write_str("Route: ")?;
-        f.write_str(first_step.token_in.as_str())?;
+        f.write_str(first_step.token_in.to_string().as_str())?;
         for step in self.steps.iter() {
             write!(f, " --- ({}) ---> {}", step.pool.id, step.token_out)?;
         }
@@ -1041,8 +799,8 @@ impl<'a> Display for Route<'a> {
 impl Route<'_> {
     fn emulate_swap(
         &self,
-        token_in: &AccountIdRef,
-        token_out: &AccountIdRef,
+        token_in: &AssetId,
+        token_out: &AssetId,
         amount_in: Balance,
         pools_delta: &mut PoolsDelta,
     ) -> Result<Balance, anyhow::Error> {
@@ -1057,26 +815,11 @@ impl Route<'_> {
             } else {
                 step.pool
             };
-            let mut detail = pool.detail.clone();
-            let mut info = pool.info.clone();
-            let token_in_idx = info
-                .token_account_ids
-                .iter()
-                .position(|id| id == current_token)
-                .unwrap();
-            let token_out_idx = info
-                .token_account_ids
-                .iter()
-                .position(|id| id == step.token_out)
-                .unwrap();
-            info.amounts[token_in_idx] += current_amount;
-            current_amount = detail.emulate_swap(current_token, step.token_out, current_amount)?;
-            info.amounts[token_out_idx] -= current_amount;
-            let new_pool = Pool {
-                id: pool.id,
-                info,
-                detail,
-            };
+            let mut new_pool = pool.clone();
+
+            current_amount =
+                new_pool.emulate_swap(current_token, step.token_out, current_amount)?;
+
             pools_delta.changed_pools.insert(new_pool.id, new_pool);
             current_token = step.token_out;
         }
@@ -1121,8 +864,8 @@ where
 fn find_best_route<'a>(
     pools: &'a Pools,
     amount: Balance,
-    token_in: &'a AccountId,
-    token_out: &'a AccountId,
+    token_in: &'a AssetId,
+    token_out: &'a AssetId,
     max_hops: MaxHops,
 ) -> Result<Route<'a>, anyhow::Error> {
     let routes = find_best_routes(pools, amount, token_in, token_out, max_hops, 1)?;
@@ -1135,8 +878,8 @@ fn find_best_route<'a>(
 fn find_best_routes<'a>(
     pools: &'a Pools,
     amount: Balance,
-    token_in: &'a AccountId,
-    token_out: &'a AccountId,
+    token_in: &'a AssetId,
+    token_out: &'a AssetId,
     max_hops: MaxHops,
     count: usize,
 ) -> Result<Vec<Route<'a>>, anyhow::Error> {
@@ -1148,7 +891,7 @@ fn find_best_routes<'a>(
         3,
         |pool| {
             i128::try_from(
-                pool.detail
+                (*pool)
                     .clone()
                     .emulate_swap(token_in, token_out, amount)
                     .unwrap_or_default(),
@@ -1179,10 +922,18 @@ fn find_best_routes<'a>(
     let ending_pool_candidates = pools.pools_with_token(token_out);
 
     let starting_pool_tokens = starting_pool_candidates
-        .flat_map(|pool| &pool.info.token_account_ids)
+        .flat_map(|pool| match &pool.data {
+            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
+                vec![&assets.0.asset_id, &assets.1.asset_id]
+            }
+        })
         .collect::<HashSet<_>>();
     let ending_pool_tokens = ending_pool_candidates
-        .flat_map(|pool| &pool.info.token_account_ids)
+        .flat_map(|pool| match &pool.data {
+            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
+                vec![&assets.0.asset_id, &assets.1.asset_id]
+            }
+        })
         .collect::<HashSet<_>>();
     let possible_intermediate_tokens = starting_pool_tokens
         .intersection(&ending_pool_tokens)
@@ -1333,7 +1084,7 @@ fn find_best_routes<'a>(
         if route.steps.is_empty() {
             return false;
         }
-        let mut seen: HashSet<&AccountIdRef> = HashSet::new();
+        let mut seen: HashSet<&AssetId> = HashSet::new();
         std::iter::once(route.steps[0].token_in)
             .chain(route.steps.iter().map(|s| s.token_out))
             .all(|token| seen.insert(token))
@@ -1355,8 +1106,8 @@ fn find_best_routes<'a>(
 struct FindPathQuery {
     #[serde(with = "dec_format")]
     amount_in: Balance,
-    token_in: AccountId,
-    token_out: AccountId,
+    token_in: AssetId,
+    token_out: AssetId,
     max_hops: MaxHops,
     #[serde(default)]
     slippage: Option<f64>, // e.g., 0.005 for 0.5 %

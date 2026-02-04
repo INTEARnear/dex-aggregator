@@ -86,7 +86,8 @@ impl Provider for NearIntentsProvider {
                 "diff": {
                     best_quote.defuse_asset_identifier_in.clone(): format!("-{}", best_quote.amount_in.to_string()),
                     best_quote.defuse_asset_identifier_out.clone(): best_quote.amount_out.to_string(),
-                }
+                },
+                "referral": "dex-aggregator.intear.near",
             });
             let (withdraw_intent, withdraw_token) = (
                 serde_json::json!({

@@ -94,6 +94,7 @@ async fn route_handler(
         &providers::linear::LinearProvider,
         &providers::xrhea::XRheaProvider,
         &providers::rnear::RNearProvider,
+        &providers::intear_plach::IntearPlachProvider,
     ];
 
     let mut routes = Vec::new();
