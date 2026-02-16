@@ -283,6 +283,7 @@ pub enum DexId {
     ///
     /// Supports NEAR -> rNEAR and rNEAR -> NEAR, both AmountIn and AmountOut
     RNear,
+    /// https://dex.intea.rs/
     /// AMM DEX
     ///
     /// Supports both AmountIn and AmountOut

@@ -250,7 +250,12 @@ impl Provider for IntearPlachProvider {
                 Amount::AmountIn(amount_in) => format!("amountIn={amount_in}"),
                 Amount::AmountOut(amount_out) => format!("amountOut={amount_out}"),
             };
-            let url = format!("http://localhost:12346/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&{amount_query}");
+            let max_hops = match request.amount {
+                Amount::AmountIn(_) => "Four",
+                // Intear dex doesn't support multi-step routing with AmountOut yet
+                Amount::AmountOut(_) => "DirectOnly",
+            };
+            let url = format!("http://localhost:12346/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops={max_hops}&slippage={slippage}&{amount_query}");
             info!("URL: {url}");
 
             let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
@@ -262,9 +267,7 @@ impl Provider for IntearPlachProvider {
             };
 
             info!("Found Plach route: {:?}", response.result_data);
-            let Some(response) = response.result_data else {
-                return None;
-            };
+            let response = response.result_data?;
 
             let (
                 swaps,
@@ -292,9 +295,13 @@ impl Provider for IntearPlachProvider {
                             message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
                             asset_in: step.token_in.clone(),
                             asset_out: step.token_out.clone(),
-                            amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(
-                                U128::from(step.amount_in),
-                            )),
+                            amount: if step.amount_in > 0 {
+                                SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(
+                                    step.amount_in,
+                                )))
+                            } else {
+                                SwapOperationAmount::OutputOfLastIn
+                            },
                             constraint: (step.min_amount_out > 0)
                                 .then(|| U128::from(step.min_amount_out)),
                         })
