@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use near_min_api::{
-    types::{Action, Balance, FunctionCallAction, NearGas, NearToken},
+    types::{Action, Balance, FunctionCallAction, Gas, NearGas, NearToken},
     utils::dec_format,
 };
 use serde::Deserialize;
@@ -9,7 +9,8 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, REQWEST_CLIENT,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, DEFAULT_REFERRER_ID,
+        REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -98,10 +99,10 @@ impl Provider for RheaProvider {
                     method_name: "swap".to_string(),
                     args: serde_json::to_vec(&serde_json::json!({
                         "actions": actions,
-                        "referral_id": "dex-aggregator.intear.near",
+                        "referral_id": DEFAULT_REFERRER_ID,
                     }))
                     .unwrap(),
-                    gas: NearGas::from_tgas(150).as_gas(),
+                    gas: Gas(NearGas::from_tgas(150)),
                     deposit: NearToken::from_yoctonear(1),
                 }));
 
@@ -117,7 +118,7 @@ impl Provider for RheaProvider {
                     estimated_amount: Amount::AmountOut(response.result_data.amount_out),
                     worst_case_amount: Amount::AmountOut(total_min_amount_out),
                     execution_instructions: transactions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: request.token_out.clone(),
                 });
             }
@@ -133,11 +134,11 @@ impl Provider for RheaProvider {
                         "actions": actions,
                         "skip_degen_price_sync": true,
                         "skip_unwrap_near": !unwrapping_near,
-                        "referral_id": "dex-aggregator.intear.near",
+                        "referral_id": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                     })).unwrap(),
                 }))
                 .unwrap(),
-                gas: NearGas::from_tgas(150).as_gas(),
+                gas: Gas(NearGas::from_tgas(150)),
                 deposit: NearToken::from_yoctonear(1),
             }));
             let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -179,7 +180,7 @@ impl Provider for RheaProvider {
                 estimated_amount: Amount::AmountOut(response.result_data.amount_out),
                 worst_case_amount: Amount::AmountOut(total_min_amount_out),
                 execution_instructions: transactions,
-                has_leftover_after_slippage_that_needs_unwrapping: false,
+                deprecated_needs_unwrap_always_false: false,
                 token_output: if unwrapping_near {
                     TokenId::Near
                 } else {

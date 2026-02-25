@@ -97,12 +97,23 @@ async fn route_handler(
         &providers::intear_plach::IntearPlachProvider,
     ];
 
+    let dexes = request.dexes.clone().unwrap_or(vec![
+        DexId::Rhea,
+        // omitting NearIntents
+        DexId::Aidols,
+        DexId::Wrap,
+        DexId::RheaDcl,
+        DexId::MetaPool,
+        DexId::Linear,
+        DexId::XRhea,
+        DexId::RNear,
+        DexId::Plach,
+    ]);
+
     let mut routes = Vec::new();
     for provider in providers {
-        if let Some(dexes) = request.dexes.as_ref() {
-            if !dexes.contains(&provider.dex_id()) {
-                continue;
-            }
+        if !dexes.contains(&provider.dex_id()) {
+            continue;
         }
 
         let request_cloned = request.clone();
@@ -128,7 +139,7 @@ async fn route_handler(
     });
 
     for route in routes.iter_mut() {
-        if !route.has_leftover_after_slippage_that_needs_unwrapping {
+        if !route.deprecated_needs_unwrap_always_false {
             let amount_out = match (
                 request.amount,
                 route.estimated_amount,
@@ -160,6 +171,7 @@ async fn route_handler(
                     )
                     .await,
                 );
+                route.token_output = request.token_out.clone();
             }
         }
         route.execution_instructions =

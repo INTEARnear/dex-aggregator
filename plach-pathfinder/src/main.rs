@@ -3,7 +3,7 @@ use base64::prelude::BASE64_STANDARD;
 use borsh::{BorshDeserialize, BorshSerialize};
 use crypto_bigint::U256;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance};
+use near_min_api::types::{AccountId, Balance, U128};
 use near_min_api::utils::dec_format;
 use rand::Rng;
 use serde_json::json;
@@ -12,7 +12,7 @@ use std::fmt::{self, Display};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use warp::Filter;
@@ -35,44 +35,33 @@ enum SplitRouteApiResponse {
         routes: Vec<ExactInRoute>,
         contract_in: AssetId,
         contract_out: AssetId,
-        #[serde(with = "dec_format")]
-        amount_in: Balance,
-        #[serde(with = "dec_format")]
-        amount_out: Balance,
+        amount_in: U128,
+        amount_out: U128,
     },
     ExactOut {
         routes: Vec<ExactOutRoute>,
         contract_in: AssetId,
         contract_out: AssetId,
-        #[serde(with = "dec_format")]
-        amount_in: Balance,
-        #[serde(with = "dec_format")]
-        max_amount_in: Balance,
-        #[serde(with = "dec_format")]
-        amount_out: Balance,
+        amount_in: U128,
+        max_amount_in: U128,
+        amount_out: U128,
     },
 }
 
 #[derive(Serialize, Debug)]
 struct ExactInRoute {
     pools: Vec<ExactInPoolStep>,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    min_amount_out: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
+    amount_in: U128,
+    min_amount_out: U128,
+    amount_out: U128,
 }
 
 #[derive(Serialize, Debug)]
 struct ExactOutRoute {
     pools: Vec<ExactOutPoolStep>,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    max_amount_in: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
+    amount_in: U128,
+    max_amount_in: U128,
+    amount_out: U128,
 }
 
 #[derive(Serialize, Debug)]
@@ -81,10 +70,8 @@ struct ExactInPoolStep {
     pool_id: u32,
     token_in: AssetId,
     token_out: AssetId,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    min_amount_out: Balance,
+    amount_in: U128,
+    min_amount_out: U128,
 }
 
 #[derive(Serialize, Debug)]
@@ -93,12 +80,9 @@ struct ExactOutPoolStep {
     pool_id: u32,
     token_in: AssetId,
     token_out: AssetId,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
-    #[serde(with = "dec_format")]
-    max_amount_in: Balance,
+    amount_in: U128,
+    amount_out: U128,
+    max_amount_in: U128,
 }
 
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
@@ -106,7 +90,7 @@ const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
 const MAX_SPLITS_COUNT: usize = 2;
 const FETCH_POOLS_BATCH_SIZE: u32 = 1000;
-const TOP_ROUTES_COUNT: usize = 10;
+const TOP_ROUTES_COUNT: usize = 2;
 
 const RC_SUCCESS: i32 = 0;
 const RC_POOL_FETCH_ERROR: i32 = 1;
@@ -124,18 +108,112 @@ pub struct Pool {
 pub enum PoolData {
     Private {
         assets: (AssetWithBalance, AssetWithBalance),
-        fees: FeeConfiguration,
+        fees: CurrentFees,
+        fee_configuration: FeeConfiguration,
         owner_id: AccountId,
+        locked: bool,
     },
     Public {
         assets: (AssetWithBalance, AssetWithBalance),
-        fees: FeeConfiguration,
-        total_shares: Option<Balance>,
+        fees: CurrentFees,
+        fee_configuration: FeeConfiguration,
+        total_shares: Option<U128>,
+    },
+    Launch {
+        near_amount: U128,
+        launched_asset: AssetWithBalance,
+        fees: CurrentFees,
+        fee_configuration: FeeConfiguration,
+        phantom_liquidity_near: U128,
     },
 }
 
+#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+// #[serde(untagged)]
+pub enum FeeConfiguration {
+    V1(CurrentFees),
+    V2(V1FeeConfiguration),
+}
+
+#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+pub struct V1FeeConfiguration {
+    receivers: Vec<(FeeReceiver, FeeAmount)>,
+}
+
+type Timestamp = u64;
+
+#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+pub enum FeeAmount {
+    Fixed(FeeFraction),
+    Scheduled {
+        start: (Timestamp, FeeFraction),
+        end: (Timestamp, FeeFraction),
+        curve: ScheduledFeeCurve,
+    },
+    Dynamic {
+        min: FeeFraction,
+        max: FeeFraction,
+    },
+}
+
+#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+pub enum ScheduledFeeCurve {
+    Linear,
+}
+
+impl FeeAmount {
+    pub fn get_fee_fraction(&self) -> FeeFraction {
+        match self {
+            FeeAmount::Fixed(fee_fraction) => *fee_fraction,
+            FeeAmount::Scheduled { start, end, curve } => {
+                let (start_time, start_fee_fraction) = *start;
+                let (end_time, end_fee_fraction) = *end;
+                let current_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as Timestamp;
+                let Some(time_elapsed) = current_timestamp.checked_sub(start_time) else {
+                    return start_fee_fraction;
+                };
+                if current_timestamp >= end_time {
+                    return end_fee_fraction;
+                }
+
+                // Was checked in .validate() check
+                let total_duration = end_time.checked_sub(start_time).unwrap();
+                let fee_range = start_fee_fraction.checked_sub(end_fee_fraction).unwrap();
+
+                let fee_decrease = match curve {
+                    ScheduledFeeCurve::Linear => {
+                        #[allow(clippy::arithmetic_side_effects)]
+                        // Multiplying u128 by u128 can't overflow u256, and total_duration
+                        // is not 0 due to .validate() check
+                        FeeFraction::try_from(u256_to_u128(
+                            u128_to_u256(fee_range as u128) * u128_to_u256(time_elapsed as u128)
+                                / u128_to_u256(total_duration as u128),
+                        ))
+                        .expect("Fee decrease overflows u32")
+                    }
+                };
+
+                assert!(
+                    fee_decrease <= fee_range,
+                    "Fee decrease must be less than end and start fee difference"
+                );
+
+                start_fee_fraction
+                    .checked_sub(fee_decrease)
+                    .expect("Fee calculation underflow")
+            }
+            FeeAmount::Dynamic { min: _, max: _ } => {
+                unimplemented!("Dynamic fee configuration is not implemented yet");
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
-pub struct FeeConfiguration {
+pub struct CurrentFees {
     pub receivers: Vec<(FeeReceiver, FeeFraction)>,
 }
 
@@ -152,8 +230,7 @@ const MAX_FEE_FRACTION: FeeFraction = 1_000_000;
 #[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
 pub struct AssetWithBalance {
     pub asset_id: AssetId,
-    #[serde(with = "dec_format")]
-    pub balance: Balance,
+    pub balance: U128,
 }
 
 #[derive(Debug, PartialEq, BorshDeserialize, Clone, PartialOrd, Eq, Ord, Hash)]
@@ -251,14 +328,14 @@ fn u256_to_u128(value: U256) -> u128 {
     u128::from_le_bytes(*first_chunk)
 }
 
-fn total_fee_fraction(fees: &FeeConfiguration) -> u128 {
+fn total_fee_fraction(fees: &CurrentFees) -> u128 {
     fees.receivers
         .iter()
         .map(|(_, fee)| *fee as u128)
         .sum::<u128>()
 }
 
-fn collect_fees(amount_in: u128, fees: &FeeConfiguration) -> u128 {
+fn collect_fees(amount_in: u128, fees: &CurrentFees) -> u128 {
     let mut total_fees = 0u128;
     for (_, fee_fraction) in fees.receivers.iter() {
         let fee_amount = u256_to_u128(
@@ -268,16 +345,6 @@ fn collect_fees(amount_in: u128, fees: &FeeConfiguration) -> u128 {
         total_fees = total_fees.checked_add(fee_amount).expect("Overflow");
     }
     amount_in.checked_sub(total_fees).expect("Fee exceeds 100%")
-}
-
-fn deserialize_dec_format_opt<'de, D>(deserializer: D) -> Result<Option<Balance>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = <Option<String> as Deserialize>::deserialize(deserializer)?;
-    value
-        .map(|v| v.parse::<Balance>().map_err(serde::de::Error::custom))
-        .transpose()
 }
 
 impl Pool {
@@ -290,23 +357,41 @@ impl Pool {
         let self_before_modifications = self.clone();
         let mut unwind_safe_self = AssertUnwindSafe(&mut *self);
         let result = std::panic::catch_unwind(move || {
-            let (assets, fees) = match &mut unwind_safe_self.data {
-                PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => {
-                    (assets, fees)
-                }
-            };
+            let (asset0_id, asset0_balance, asset1_id, asset1_balance, fees) =
+                match &mut unwind_safe_self.data {
+                    PoolData::Private { assets, fees, .. }
+                    | PoolData::Public { assets, fees, .. } => (
+                        assets.0.asset_id.clone(),
+                        &mut assets.0.balance,
+                        assets.1.asset_id.clone(),
+                        &mut assets.1.balance,
+                        fees,
+                    ),
+                    PoolData::Launch {
+                        near_amount,
+                        launched_asset,
+                        fees,
+                        ..
+                    } => (
+                        AssetId::Near,
+                        near_amount,
+                        launched_asset.asset_id.clone(),
+                        &mut launched_asset.balance,
+                        fees,
+                    ),
+                };
             let first_in = match (
-                assets.0.asset_id == *token_in && assets.1.asset_id == *token_out,
-                assets.1.asset_id == *token_in && assets.0.asset_id == *token_out,
+                asset0_id == *token_in && asset1_id == *token_out,
+                asset1_id == *token_in && asset0_id == *token_out,
             ) {
                 (true, false) => true,
                 (false, true) => false,
                 _ => panic!("Invalid assets or pool ID"),
             };
             let (in_balance, out_balance) = if first_in {
-                (&mut assets.0.balance, &mut assets.1.balance)
+                (&mut asset0_balance.0, &mut asset1_balance.0)
             } else {
-                (&mut assets.1.balance, &mut assets.0.balance)
+                (&mut asset1_balance.0, &mut asset0_balance.0)
             };
             println!("in_balance: {in_balance}");
             println!("out_balance: {out_balance}");
@@ -354,23 +439,41 @@ impl Pool {
                 return Err(anyhow::anyhow!("Amount must be greater than 0"));
             }
 
-            let (assets, fees) = match &mut unwind_safe_self.data {
-                PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => {
-                    (assets, fees)
-                }
-            };
+            let (asset0_id, asset0_balance, asset1_id, asset1_balance, fees) =
+                match &mut unwind_safe_self.data {
+                    PoolData::Private { assets, fees, .. }
+                    | PoolData::Public { assets, fees, .. } => (
+                        assets.0.asset_id.clone(),
+                        &mut assets.0.balance,
+                        assets.1.asset_id.clone(),
+                        &mut assets.1.balance,
+                        fees,
+                    ),
+                    PoolData::Launch {
+                        near_amount,
+                        launched_asset,
+                        fees,
+                        ..
+                    } => (
+                        AssetId::Near,
+                        near_amount,
+                        launched_asset.asset_id.clone(),
+                        &mut launched_asset.balance,
+                        fees,
+                    ),
+                };
             let first_in = match (
-                assets.0.asset_id == *token_in && assets.1.asset_id == *token_out,
-                assets.1.asset_id == *token_in && assets.0.asset_id == *token_out,
+                asset0_id == *token_in && asset1_id == *token_out,
+                asset1_id == *token_in && asset0_id == *token_out,
             ) {
                 (true, false) => true,
                 (false, true) => false,
                 _ => panic!("Invalid assets or pool ID"),
             };
             let (in_balance, out_balance) = if first_in {
-                (&mut assets.0.balance, &mut assets.1.balance)
+                (&mut asset0_balance.0, &mut asset1_balance.0)
             } else {
-                (&mut assets.1.balance, &mut assets.0.balance)
+                (&mut asset1_balance.0, &mut asset0_balance.0)
             };
             if amount_out >= *out_balance {
                 return Err(anyhow::anyhow!("Amount must be less than out balance"));
@@ -518,17 +621,16 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
     let pools_existing = {
         let mut pools_existing = HashSet::new();
         for pool in pools.iter() {
-            let assets = match &pool.data {
-                PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => assets,
+            let (asset0_id, asset1_id) = match &pool.data {
+                PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
+                    (assets.0.asset_id.clone(), assets.1.asset_id.clone())
+                }
+                PoolData::Launch { launched_asset, .. } => {
+                    (AssetId::Near, launched_asset.asset_id.clone())
+                }
             };
-            pools_existing.insert(BTreeSet::from_iter([
-                assets.0.asset_id.clone(),
-                assets.1.asset_id.clone(),
-            ]));
-            pools_existing.insert(BTreeSet::from_iter([
-                assets.1.asset_id.clone(),
-                assets.0.asset_id.clone(),
-            ]));
+            pools_existing.insert(BTreeSet::from_iter([asset0_id.clone(), asset1_id.clone()]));
+            pools_existing.insert(BTreeSet::from_iter([asset1_id, asset0_id]));
         }
         pools_existing
     };
@@ -537,19 +639,24 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
     let mut pair_to_pools: HashMap<(AssetId, AssetId), Vec<usize>> = HashMap::new();
 
     for (idx, pool) in pools.iter().enumerate() {
-        let assets = match &pool.data {
-            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => assets,
+        let (asset0_id, asset1_id) = match &pool.data {
+            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
+                (assets.0.asset_id.clone(), assets.1.asset_id.clone())
+            }
+            PoolData::Launch { launched_asset, .. } => {
+                (AssetId::Near, launched_asset.asset_id.clone())
+            }
         };
         token_to_pools
-            .entry(assets.0.asset_id.clone())
+            .entry(asset0_id.clone())
             .or_default()
             .push(idx);
         token_to_pools
-            .entry(assets.1.asset_id.clone())
+            .entry(asset1_id.clone())
             .or_default()
             .push(idx);
 
-        let mut tokens_sorted = [assets.0.asset_id.clone(), assets.1.asset_id.clone()];
+        let mut tokens_sorted = [asset0_id, asset1_id];
         tokens_sorted.sort_unstable();
         let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
         pair_to_pools.entry(key).or_default().push(idx);
@@ -686,7 +793,7 @@ async fn route<'a>(
         return Err(anyhow::anyhow!("Estimated amount is 0"));
     }
 
-    // There's a bug, sometimes a bad route is chose. Make sure the best
+    // There could be a bug, sometimes a bad route is chose. Make sure the best
     // route is at least better or equal to the simplest (top 1) route.
     let mut best_split = best_split;
     let mut best_split_metric = best_split_metric;
@@ -810,11 +917,48 @@ impl<'a> SplitRoute<'a> {
                 let mut routes_resp = Vec::new();
                 let mut total_estimated_out: Balance = 0;
                 let mut pools_delta = PoolsDelta::default();
-                for step in &self.steps {
-                    let amount_part = u256_to_u128(
-                        u128_to_u256(total_amount_in) * u128_to_u256(step.weight as u128)
-                            / u128_to_u256(100),
+                let mut amount_parts: Vec<Balance> = self
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        u256_to_u128(
+                            u128_to_u256(total_amount_in) * u128_to_u256(step.weight as u128)
+                                / u128_to_u256(100),
+                        )
+                    })
+                    .collect();
+                let total_split_amount_in: Balance = amount_parts.iter().copied().sum();
+                if total_split_amount_in < total_amount_in {
+                    let leftover = total_amount_in - total_split_amount_in;
+                    const ROUNDING_ERROR_THRESHOLD: u128 = 50;
+                    if leftover < ROUNDING_ERROR_THRESHOLD {
+                        if let Some(first_amount) = amount_parts.first_mut() {
+                            *first_amount = first_amount.checked_add(leftover).unwrap_or_else(|| {
+                                panic!(
+                                    "Overflow while adding leftover to first split: first={}, leftover={}",
+                                    *first_amount, leftover
+                                )
+                            });
+                        } else {
+                            panic!(
+                                "No split steps available to apply leftover amount: leftover={}",
+                                leftover
+                            );
+                        }
+                    } else {
+                        panic!(
+                            "Total split amount_in is less than requested amount_in by too much: split_total={}, requested={}, leftover={}",
+                            total_split_amount_in, total_amount_in, leftover
+                        );
+                    }
+                } else if total_split_amount_in > total_amount_in {
+                    panic!(
+                        "Total split amount_in exceeds requested amount_in: split_total={}, requested={}",
+                        total_split_amount_in, total_amount_in
                     );
+                }
+
+                for (step, amount_part) in self.steps.iter().zip(amount_parts.into_iter()) {
                     let estimated_out = step.route.emulate_swap_exact_in(
                         token_in,
                         token_out,
@@ -833,8 +977,8 @@ impl<'a> SplitRoute<'a> {
                             pool_id: route_step.pool.id,
                             token_in: current_token.clone(),
                             token_out: route_step.token_out.to_owned(),
-                            amount_in: if is_first { amount_part } else { 0 },
-                            min_amount_out: if is_last { min_amount_out } else { 0 },
+                            amount_in: U128(if is_first { amount_part } else { 0 }),
+                            min_amount_out: U128(if is_last { min_amount_out } else { 0 }),
                         });
 
                         current_token = route_step.token_out.to_owned();
@@ -842,9 +986,9 @@ impl<'a> SplitRoute<'a> {
 
                     routes_resp.push(ExactInRoute {
                         pools: pools_resp,
-                        amount_in: amount_part,
-                        min_amount_out,
-                        amount_out: estimated_out,
+                        amount_in: U128(amount_part),
+                        min_amount_out: U128(min_amount_out),
+                        amount_out: U128(estimated_out),
                     });
                     total_estimated_out = total_estimated_out
                         .checked_add(estimated_out)
@@ -854,8 +998,8 @@ impl<'a> SplitRoute<'a> {
                     routes: routes_resp,
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: total_amount_in,
-                    amount_out: total_estimated_out,
+                    amount_in: U128(total_amount_in),
+                    amount_out: U128(total_estimated_out),
                 })
             }
             QuoteAmount::ExactOut(total_amount_out) => {
@@ -890,13 +1034,13 @@ impl<'a> SplitRoute<'a> {
                             pool_id: route_step.pool.id,
                             token_in: current_token.clone(),
                             token_out: route_step.token_out.to_owned(),
-                            amount_in: step_amount.0,
-                            amount_out: step_amount.1,
-                            max_amount_in: u256_to_u128(
+                            amount_in: U128(step_amount.0),
+                            amount_out: U128(step_amount.1),
+                            max_amount_in: U128(u256_to_u128(
                                 u128_to_u256(step_amount.0)
                                     * u128_to_u256(10_000u128 + slippage_bp)
                                     / u128_to_u256(10_000),
-                            ),
+                            )),
                         });
 
                         current_token = route_step.token_out.to_owned();
@@ -904,9 +1048,9 @@ impl<'a> SplitRoute<'a> {
 
                     routes_resp.push(ExactOutRoute {
                         pools: pools_resp,
-                        amount_in,
-                        max_amount_in,
-                        amount_out: amount_out_part,
+                        amount_in: U128(amount_in),
+                        max_amount_in: U128(max_amount_in),
+                        amount_out: U128(amount_out_part),
                     });
                     total_estimated_in = total_estimated_in
                         .checked_add(amount_in)
@@ -919,9 +1063,9 @@ impl<'a> SplitRoute<'a> {
                     routes: routes_resp,
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: total_estimated_in,
-                    max_amount_in: total_max_amount_in,
-                    amount_out: total_amount_out,
+                    amount_in: U128(total_estimated_in),
+                    max_amount_in: U128(total_max_amount_in),
+                    amount_out: U128(total_amount_out),
                 })
             }
         }
@@ -1247,12 +1391,18 @@ fn find_best_routes<'a>(
             PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
                 vec![&assets.0.asset_id, &assets.1.asset_id]
             }
+            PoolData::Launch { launched_asset, .. } => {
+                vec![&AssetId::Near, &launched_asset.asset_id]
+            }
         })
         .collect::<HashSet<_>>();
     let ending_pool_tokens = ending_pool_candidates
         .flat_map(|pool| match &pool.data {
             PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
                 vec![&assets.0.asset_id, &assets.1.asset_id]
+            }
+            PoolData::Launch { launched_asset, .. } => {
+                vec![&AssetId::Near, &launched_asset.asset_id]
             }
         })
         .collect::<HashSet<_>>();
@@ -1590,9 +1740,9 @@ fn find_best_routes<'a>(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FindPathQuery {
-    #[serde(default, deserialize_with = "deserialize_dec_format_opt")]
+    #[serde(default, with = "dec_format")]
     amount_in: Option<Balance>,
-    #[serde(default, deserialize_with = "deserialize_dec_format_opt")]
+    #[serde(default, with = "dec_format")]
     amount_out: Option<Balance>,
     token_in: AssetId,
     token_out: AssetId,

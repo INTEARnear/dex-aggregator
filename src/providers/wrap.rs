@@ -36,7 +36,7 @@ impl Provider for WrapProvider {
                         request.trader_account_id,
                     )
                     .await,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: request.token_in,
                 });
             }

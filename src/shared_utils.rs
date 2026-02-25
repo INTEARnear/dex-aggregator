@@ -1,22 +1,25 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
+use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
         AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, Finality,
-        FunctionCallAction, NearGas, NearToken,
+        FunctionCallAction, Gas, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
 };
+use num_traits::FromPrimitive;
 use reqwest::{Client, ClientBuilder};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex;
 
 use crate::types::{ExecutionInstruction, Slippage, TokenId};
 
 pub const WRAP_NEAR: &str = "wrap.near";
+pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
 
 impl TokenId {
     pub fn location(&self) -> TokenLocation {
@@ -39,7 +42,7 @@ pub fn create_wrap_action(amount: NearToken) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "near_deposit".to_string(),
         args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-        gas: NearGas::from_tgas(2).as_gas(),
+        gas: Gas(NearGas::from_tgas(2)),
         deposit: amount,
     }))
 }
@@ -53,7 +56,7 @@ pub fn create_unwrap_action(amount: NearToken) -> Action {
         .unwrap()
         .as_bytes()
         .to_vec(),
-        gas: NearGas::from_tgas(5).as_gas(),
+        gas: Gas(NearGas::from_tgas(5)),
         deposit: NearToken::from_yoctonear(1),
     }))
 }
@@ -139,7 +142,7 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionI
                             "token_ids": [token_id.get_account_id()],
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(10).as_gas(),
+                        gas: Gas(NearGas::from_tgas(10)),
                         deposit: NearToken::from_yoctonear(1),
                     })),
                 ],
@@ -155,7 +158,7 @@ pub fn create_storage_deposit_action_for_contract(amount: NearToken) -> Action {
             "registration_only": true,
         }))
         .unwrap(),
-        gas: NearGas::from_tgas(10).as_gas(),
+        gas: Gas(NearGas::from_tgas(10)),
         deposit: amount,
     }))
 }
@@ -171,7 +174,7 @@ pub fn create_storage_deposit_action_for_someone(
             "account_id": account_id,
         }))
         .unwrap(),
-        gas: NearGas::from_tgas(10).as_gas(),
+        gas: Gas(NearGas::from_tgas(10)),
         deposit: amount,
     }))
 }
@@ -214,23 +217,25 @@ pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out:
                     0.6
                 } else {
                     let price_change_24h =
-                        (token_info.price_usd_raw_24h_ago - token_info.price_usd_raw).abs();
-                    let price_change_24h_relative = price_change_24h / token_info.price_usd_raw;
+                        (token_info.price_usd_raw_24h_ago - token_info.price_usd_raw.clone()).abs();
+                    let price_change_24h_relative =
+                        price_change_24h / token_info.price_usd_raw.clone();
 
                     let mut scale = 0f64;
-                    if price_change_24h_relative > 0.5 {
+                    if price_change_24h_relative > BigDecimal::from_f64(0.5).unwrap() {
                         scale += 0.1;
                     }
-                    if price_change_24h_relative > 0.2 {
+                    if price_change_24h_relative > BigDecimal::from_f64(0.2).unwrap() {
                         scale += 0.05;
                     }
 
                     let volume_to_mcap_ratio = token_info.volume_usd_24h
-                        / (token_info.circulating_supply as f64 * token_info.price_usd_raw);
-                    if volume_to_mcap_ratio > 1.00 {
+                        / (BigDecimal::from(token_info.circulating_supply)
+                            * token_info.price_usd_raw);
+                    if volume_to_mcap_ratio > BigDecimal::from_f64(1.00).unwrap() {
                         scale += 0.1
                     }
-                    if volume_to_mcap_ratio > 0.2 {
+                    if volume_to_mcap_ratio > BigDecimal::from_f64(0.2).unwrap() {
                         scale += 0.05;
                     }
 
@@ -286,15 +291,23 @@ pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out:
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TokenInfo {
-    #[serde(with = "dec_format")]
-    pub price_usd_raw: f64,
-    #[serde(with = "dec_format")]
-    pub price_usd_raw_24h_ago: f64,
+    #[serde(deserialize_with = "deserialize_bigdecimal")]
+    pub price_usd_raw: BigDecimal,
+    #[serde(deserialize_with = "deserialize_bigdecimal")]
+    pub price_usd_raw_24h_ago: BigDecimal,
     #[serde(with = "dec_format")]
     pub circulating_supply: Balance,
     pub liquidity_usd: f64,
     pub volume_usd_24h: f64,
     pub created_at: BlockHeight,
+}
+
+fn deserialize_bigdecimal<'de, D>(deserializer: D) -> Result<BigDecimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    BigDecimal::from_str(&s).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,7 +440,7 @@ pub async fn convert_to_nep141(
                         "skip_unwrap_near": true,
                     }))
                     .unwrap(),
-                    gas: NearGas::from_tgas(50).as_gas(),
+                    gas: Gas(NearGas::from_tgas(50)),
                     deposit: NearToken::from_yoctonear(1),
                 }))],
             }],
@@ -466,7 +479,7 @@ pub async fn convert_to_native(
                             "skip_unwrap_near": false,
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     }))],
                 }])
@@ -548,7 +561,7 @@ pub async fn convert_to(
                     Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "near_deposit".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                        gas: NearGas::from_tgas(2).as_gas(),
+                        gas: Gas(NearGas::from_tgas(2)),
                         deposit: NearToken::from_yoctonear(amount),
                     })),
                     Action::FunctionCall(Box::new(FunctionCallAction {
@@ -559,7 +572,7 @@ pub async fn convert_to(
                             "msg": "",
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     })),
                 ],
@@ -587,7 +600,7 @@ pub async fn convert_to(
                     "msg": "",
                 }))
                 .unwrap(),
-                gas: NearGas::from_tgas(50).as_gas(),
+                gas: Gas(NearGas::from_tgas(50)),
                 deposit: NearToken::from_yoctonear(1),
             }))];
             if needs_storage_deposit(
@@ -620,7 +633,7 @@ pub async fn convert_to(
                         "skip_unwrap_near": false,
                     }))
                     .unwrap(),
-                    gas: NearGas::from_tgas(50).as_gas(),
+                    gas: Gas(NearGas::from_tgas(50)),
                     deposit: NearToken::from_yoctonear(1),
                 }))],
             }]
@@ -637,7 +650,7 @@ pub async fn convert_to(
                         "skip_unwrap_near": true,
                     }))
                     .unwrap(),
-                    gas: NearGas::from_tgas(50).as_gas(),
+                    gas: Gas(NearGas::from_tgas(50)),
                     deposit: NearToken::from_yoctonear(1),
                 }))],
             }]

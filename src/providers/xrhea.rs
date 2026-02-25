@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
-    types::{Action, Finality, FunctionCallAction, NearGas, NearToken, U128},
+    types::{Action, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128},
     QueryFinality,
 };
 use num_traits::ToPrimitive;
@@ -83,7 +83,7 @@ impl Provider for XRheaProvider {
                             .unwrap(),
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     }))],
                 }];
@@ -112,7 +112,7 @@ impl Provider for XRheaProvider {
                     },
                     dex_id: DexId::XRhea,
                     execution_instructions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
                 });
             } else if nep141_in == XRHEA_CONTRACT {
@@ -166,7 +166,7 @@ impl Provider for XRheaProvider {
                             "msg": ""
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     }))],
                 }];
@@ -195,7 +195,7 @@ impl Provider for XRheaProvider {
                     },
                     dex_id: DexId::XRhea,
                     execution_instructions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: TokenId::Nep141(RHEA_CONTRACT.parse().unwrap()),
                 });
             }

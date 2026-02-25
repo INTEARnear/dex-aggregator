@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use futures_util::TryFutureExt;
 use near_min_api::{
-    types::{AccountId, Action, Balance, Finality, FunctionCallAction, NearGas, NearToken},
+    types::{AccountId, Action, Balance, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     utils::dec_format,
     QueryFinality,
 };
@@ -96,7 +96,7 @@ impl Provider for RheaDclProvider {
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
-                                gas: NearGas::from_tgas(100).as_gas(),
+                                gas: Gas(NearGas::from_tgas(100)),
                                 deposit: NearToken::from_yoctonear(1),
                             }));
 
@@ -160,7 +160,7 @@ impl Provider for RheaDclProvider {
                             has_slippage: true,
                             worst_case_amount: Amount::AmountOut(min_amount_out),
                             execution_instructions: transactions,
-                            has_leftover_after_slippage_that_needs_unwrapping: false,
+                            deprecated_needs_unwrap_always_false: false,
                             token_output: if unwrapping_near {
                                 TokenId::Near
                             } else {
@@ -222,7 +222,7 @@ impl Provider for RheaDclProvider {
                                 })).unwrap(),
                             }))
                             .unwrap(),
-                            gas: NearGas::from_tgas(100).as_gas(),
+                            gas: Gas(NearGas::from_tgas(100)),
                             deposit: NearToken::from_yoctonear(1),
                         }));
 
@@ -268,7 +268,7 @@ impl Provider for RheaDclProvider {
                             has_slippage: true,
                             worst_case_amount: Amount::AmountIn(max_amount_in),
                             execution_instructions: transactions,
-                            has_leftover_after_slippage_that_needs_unwrapping: false,
+                            deprecated_needs_unwrap_always_false: false,
                             token_output: if unwrapping_near {
                                 TokenId::Near
                             } else {

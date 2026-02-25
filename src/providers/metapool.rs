@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
-    types::{Action, Finality, FunctionCallAction, NearGas, NearToken},
+    types::{Action, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     QueryFinality,
 };
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -91,7 +91,7 @@ impl Provider for MetapoolProvider {
                     actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "deposit_and_stake".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                        gas: NearGas::from_tgas(10).as_gas(),
+                        gas: Gas(NearGas::from_tgas(10)),
                         deposit: NearToken::from_yoctonear(amount_near_in),
                     }))],
                 }];
@@ -120,7 +120,7 @@ impl Provider for MetapoolProvider {
                     },
                     dex_id: DexId::MetaPool,
                     execution_instructions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
                 });
             } else if is_near(&request.token_out) {
@@ -245,7 +245,7 @@ impl Provider for MetapoolProvider {
                             "min_expected_near": min_amount_near_out.to_string(),
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(10).as_gas(),
+                        gas: Gas(NearGas::from_tgas(10)),
                         deposit: NearToken::from_yoctonear(0),
                     }))],
                 }];
@@ -266,7 +266,7 @@ impl Provider for MetapoolProvider {
                     },
                     dex_id: DexId::MetaPool,
                     execution_instructions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: TokenId::Near,
                 });
             }

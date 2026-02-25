@@ -1,14 +1,15 @@
 use std::{future::Future, pin::Pin};
 
 use near_min_api::{
-    types::{AccountId, Action, Finality, FunctionCallAction, NearGas, NearToken, U128},
+    types::{AccountId, Action, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128},
     QueryFinality,
 };
 use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, RPC_CLIENT, WRAP_NEAR,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, DEFAULT_REFERRER_ID,
+        RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -35,7 +36,7 @@ impl Provider for AidolsProvider {
                 nep141_in.clone()
             };
 
-            if !aidol_token.is_sub_account_of(&AIDOLS_CONTRACT_ID.parse::<AccountId>().unwrap()) {
+            if !aidol_token.is_sub_account_of(AIDOLS_CONTRACT_ID.parse::<AccountId>().unwrap()) {
                 return None;
             }
 
@@ -85,10 +86,11 @@ impl Provider for AidolsProvider {
                                     None
                                 },
                                 "min_swap_amount": min_amount_out.to_string(),
+                                "referral": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                             })).unwrap(),
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     }));
 
@@ -119,10 +121,8 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountOut(estimated_amount_out),
                         worst_case_amount: Amount::AmountOut(min_amount_out),
                         execution_instructions: transactions,
-                        has_leftover_after_slippage_that_needs_unwrapping: !is_buy
-                            && request.token_in
-                                != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
                         token_output: TokenId::Nep141(nep141_out.clone()),
+                        deprecated_needs_unwrap_always_false: false,
                     };
 
                     Some(route)
@@ -173,10 +173,11 @@ impl Provider for AidolsProvider {
                                 },
                                 "amount_out": exact_amount_out.to_string(),
                                 "min_swap_amount": u128::MAX.to_string(), // not used but required
+                                "referral": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                             })).unwrap(),
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(50).as_gas(),
+                        gas: Gas(NearGas::from_tgas(50)),
                         deposit: NearToken::from_yoctonear(1),
                     }));
 
@@ -205,9 +206,7 @@ impl Provider for AidolsProvider {
                         estimated_amount: Amount::AmountIn(required_amount_in),
                         worst_case_amount: Amount::AmountIn(max_amount_in),
                         execution_instructions: transactions,
-                        has_leftover_after_slippage_that_needs_unwrapping: is_buy
-                            && request.token_out
-                                != TokenId::Nep141(WRAP_NEAR.parse::<AccountId>().unwrap()),
+                        deprecated_needs_unwrap_always_false: false,
                         token_output: TokenId::Nep141(nep141_out.clone()),
                     };
 

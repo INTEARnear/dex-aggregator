@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
-    types::{Action, Finality, FunctionCallAction, NearGas, NearToken},
+    types::{Action, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     QueryFinality,
 };
 use num_traits::ToPrimitive;
@@ -83,7 +83,7 @@ impl Provider for LinearProvider {
                     actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "deposit_and_stake".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                        gas: NearGas::from_tgas(10).as_gas(),
+                        gas: Gas(NearGas::from_tgas(10)),
                         deposit: NearToken::from_yoctonear(amount_near_in),
                     }))],
                 }];
@@ -112,7 +112,7 @@ impl Provider for LinearProvider {
                     },
                     dex_id: DexId::Linear,
                     execution_instructions,
-                    has_leftover_after_slippage_that_needs_unwrapping: false,
+                    deprecated_needs_unwrap_always_false: false,
                     token_output: TokenId::Nep141(LINEAR_CONTRACT.parse().unwrap()),
                 });
             }

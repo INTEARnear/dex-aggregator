@@ -2,7 +2,7 @@ use std::{env, future::Future, pin::Pin, time::Duration};
 
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{Action, Balance, CryptoHash, Finality, FunctionCallAction, NearGas, NearToken},
+    types::{Action, Balance, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     utils::dec_format,
     QueryFinality,
 };
@@ -13,7 +13,10 @@ const INTENTS_RPC_URL: &str = "https://solver-relay-v2.chaindefuser.com/rpc";
 const INTENTS_CONTRACT_ID: &str = "intents.near";
 
 use crate::{
-    shared_utils::{convert_to_nep141, deposit_storage_if_needed, REQWEST_CLIENT, RPC_CLIENT},
+    shared_utils::{
+        convert_to_nep141, deposit_storage_if_needed, DEFAULT_REFERRER_ID, REQWEST_CLIENT,
+        RPC_CLIENT,
+    },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
@@ -87,7 +90,7 @@ impl Provider for NearIntentsProvider {
                     best_quote.defuse_asset_identifier_in.clone(): format!("-{}", best_quote.amount_in.to_string()),
                     best_quote.defuse_asset_identifier_out.clone(): best_quote.amount_out.to_string(),
                 },
-                "referral": "dex-aggregator.intear.near",
+                "referral": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
             });
             let (withdraw_intent, withdraw_token) = (
                 serde_json::json!({
@@ -132,7 +135,7 @@ impl Provider for NearIntentsProvider {
                     .unwrap()
                     .as_bytes()
                     .to_vec(),
-                    gas: NearGas::from_tgas(40).as_gas(),
+                    gas: Gas(NearGas::from_tgas(40)),
                     deposit: NearToken::from_yoctonear(1),
                 }))],
             }];
@@ -160,7 +163,7 @@ impl Provider for NearIntentsProvider {
                                 .unwrap()
                                 .as_bytes()
                                 .to_vec(),
-                                gas: NearGas::from_tgas(5).as_gas(),
+                                gas: Gas(NearGas::from_tgas(5)),
                                 deposit: NearToken::from_yoctonear(1),
                             }))],
                         }]
@@ -192,7 +195,7 @@ impl Provider for NearIntentsProvider {
                 deadline: Some(best_quote.expiration_time),
                 execution_instructions: instructions,
                 has_slippage: false,
-                has_leftover_after_slippage_that_needs_unwrapping: false,
+                deprecated_needs_unwrap_always_false: false,
                 token_output: withdraw_token,
             };
 

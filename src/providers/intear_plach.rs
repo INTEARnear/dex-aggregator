@@ -3,7 +3,9 @@ use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin, str::Fro
 use base64::{prelude::BASE64_STANDARD, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use near_min_api::{
-    types::{AccountId, Action, Balance, Finality, FunctionCallAction, NearGas, NearToken, U128},
+    types::{
+        AccountId, Action, Balance, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128,
+    },
     utils::dec_format,
     QueryFinality,
 };
@@ -13,7 +15,7 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, is_near,
-        REQWEST_CLIENT, RPC_CLIENT,
+        DEFAULT_REFERRER_ID, REQWEST_CLIENT, RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -364,12 +366,14 @@ impl Provider for IntearPlachProvider {
                 to: None,
                 rescue_address: None,
             });
-            operations.push(Operation::Withdraw {
-                asset_id: token_in.clone(),
-                amount: WithdrawAmount::Full { at_least: None },
-                to: None,
-                rescue_address: None,
-            });
+            if matches!(request.amount, Amount::AmountOut(_)) {
+                operations.push(Operation::Withdraw {
+                    asset_id: token_in.clone(),
+                    amount: WithdrawAmount::Full { at_least: None },
+                    to: None,
+                    rescue_address: None,
+                });
+            }
 
             let both_registered =
                 if let Some(trader_account_id) = request.trader_account_id.as_ref() {
@@ -397,7 +401,7 @@ impl Provider for IntearPlachProvider {
                         Action::FunctionCall(Box::new(FunctionCallAction {
                             method_name: "storage_deposit".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                            gas: NearGas::from_tgas(10).as_gas(),
+                            gas: Gas(NearGas::from_tgas(5)),
                             deposit: "0.005 NEAR".parse().unwrap(),
                         })),
                         Action::FunctionCall(Box::new(FunctionCallAction {
@@ -406,7 +410,7 @@ impl Provider for IntearPlachProvider {
                                 "asset_ids": vec![token_in.clone(), token_out.clone()],
                             }))
                             .unwrap(),
-                            gas: NearGas::from_tgas(10).as_gas(),
+                            gas: Gas(NearGas::from_tgas(5)),
                             deposit: NearToken::from_yoctonear(1),
                         })),
                     ],
@@ -431,10 +435,13 @@ impl Provider for IntearPlachProvider {
                     let deposit_near_action = Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "deposit_near".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({
-                            "operations": operations,
+                            "operations": {
+                                "operations": operations,
+                                "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                            },
                         }))
                         .unwrap(),
-                        gas: NearGas::from_tgas(150).as_gas(),
+                        gas: Gas(NearGas::from_tgas(280)),
                         deposit: NearToken::from_yoctonear(input_amount),
                     }));
                     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -472,10 +479,11 @@ impl Provider for IntearPlachProvider {
                                 "amount": input_amount.to_string(),
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "operations": operations,
+                                    "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                                 })).unwrap(),
                             }))
                             .unwrap(),
-                            gas: NearGas::from_tgas(150).as_gas(),
+                            gas: Gas(NearGas::from_tgas(280)),
                             deposit: NearToken::from_yoctonear(1),
                         }));
                     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -525,7 +533,7 @@ impl Provider for IntearPlachProvider {
                 estimated_amount,
                 worst_case_amount,
                 execution_instructions: [registration_transactions, transactions].concat(),
-                has_leftover_after_slippage_that_needs_unwrapping: false,
+                deprecated_needs_unwrap_always_false: false,
                 token_output: match token_out {
                     AssetId::Near => TokenId::Near,
                     AssetId::Nep141(token_out_id) => TokenId::Nep141(token_out_id.clone()),

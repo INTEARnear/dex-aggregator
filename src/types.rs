@@ -111,6 +111,10 @@ pub struct SwapRequest {
     /// The public key to use for signing. Can be used for `add_public_key` method in
     /// NEAR Intents.
     pub signing_public_key: Option<PublicKey>,
+    /// The account ID of the referrer. If provided, the route will include referral
+    /// parameter for DEXes that support it (DexId::Rhea, DexId::NearIntents,
+    /// DexId::Aidols, DexId::Plach)
+    pub referrer_id: Option<AccountId>,
 }
 
 mod comma_separated {
@@ -204,19 +208,15 @@ pub struct Route {
     pub dex_id: DexId,
     /// How to execute the swap. Need to be executed sequentially.
     pub execution_instructions: Vec<ExecutionInstruction>,
-    /// Whether the route needs to unwrap the tokens after completing the swap. Only
-    /// true for dexes that don't auto-unwrap tokens, and when token_out is NEAR.
-    /// A transaction is not included in `execution_instructions` because the unwrapping
-    /// can't be done deterministically due to slippage. The recommended behavior is
-    /// to remember the current wrap.near balance and compare it to the balance after the
-    /// swap, and unwrap the difference. When choosing amount_out, it can also happen
-    /// when we wrap too much NEAR into wNEAR (because we're accounting for slippage)
-    /// but the resulting wNEAR amount spent is less than what we wrapped.
+    // to be removed on Mar 11
     #[serde(rename = "needs_unwrap")]
-    pub has_leftover_after_slippage_that_needs_unwrapping: bool,
+    pub deprecated_needs_unwrap_always_false: bool,
     /// The location of the token to unwrap from. For example, if a certain dex returns
     /// NEP-141 tokens, but you want them to be native NEAR, you need to call near_withdraw
-    /// or request a quote from this service again (usually it'll have 0% fee / slippage)
+    /// or request a quote from this service again (usually it'll have 0% fee / slippage).
+    /// The recommended behavior if this is different from your desired token output is to
+    /// request a second quote, converting this token_output to your desired token output,
+    /// after the received amount is known.
     pub token_output: TokenId,
 }
 
@@ -245,7 +245,8 @@ pub enum DexId {
     /// Supports AmountIn, doesn't support AmountOut
     Rhea,
     /// https://app.near-intents.org/
-    /// guaranteed-quote DEX & Bridge
+    /// (sometimes) guaranteed-quote DEX & Bridge. Known to be unreliable & tricky
+    /// to implement for integrators, so excluded from default route selection.
     ///
     /// Supports both AmountIn and AmountOut
     NearIntents,
