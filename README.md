@@ -19,7 +19,7 @@ It's separated into 3 crates:
 - `Rhea`: uses `rhea-pathfinder`
 - `NearIntents`: uses solver bus (non custodial) to get quotes. Very slow compared to other DEXes, and doesn't guarantee execution no matter what slippage you use, since non-custodial part of Near Intents does not support slippage. If a solver withdraws their quote off-chain (happens once in 50-100 swaps usually), tokens will get stuck on Near Intents inner balance, and need a manual withdrawal (up to integrators to implement)
 - `Aidols`: calls `emulate_swap` or `emulate_swap_by_out` for *.aidols.near tokens. Fails if the token has already bonded to Rhea
-- `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different_output_token_locations))
+- `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different-output-token-locations))
 - `RheaDcl`: scans all direct pairs (max possible by contract is 4 between 2 tokens, due to 4 different fee tiers) and emulates each of them on chain using `quote` view method. Advanced cross-pool routing is not implemented due to there being only ~6 pools with over $0 daily volume, and DCL contract not being open source
 - `MetaPool`: staking NEAR into STNEAR & liquid withdrawal. Slippage is only ever possible between epoch boundaries, so API assumes there's no slippage
 - `Linear`: staking NEAR into LiNEAR. Doesn't implement liquid withdrawal (official way is to sell on Rhea). Slippage is only ever possible between epoch boundaries, so API assumes there's no slippage
