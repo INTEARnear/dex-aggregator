@@ -246,7 +246,8 @@ pub enum DexId {
     Rhea,
     /// https://app.near-intents.org/
     /// (sometimes) guaranteed-quote DEX & Bridge. Known to be unreliable & tricky
-    /// to implement for integrators, so excluded from default route selection.
+    /// to implement for integrators & extremely slow compared to other DEXes, so
+    /// excluded from default route selection.
     ///
     /// Supports both AmountIn and AmountOut
     NearIntents,
