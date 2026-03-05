@@ -88,8 +88,9 @@ struct ExactOutPoolStep {
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
+const SMALL_AMOUNT_ROUTE_STEP_SIZE: u32 = 25; // %
 const MAX_SPLITS_COUNT: usize = 2;
-const FETCH_POOLS_BATCH_SIZE: u32 = 1000;
+const FETCH_POOLS_BATCH_SIZE: u32 = 20;
 const TOP_ROUTES_COUNT: usize = 2;
 
 const RC_SUCCESS: i32 = 0;
@@ -577,7 +578,6 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
         .await?;
     let number_of_pools = BASE64_STANDARD.decode(number_of_pools)?;
     let number_of_pools = borsh::from_slice(&number_of_pools)?;
-    info!("Number of pools for data fetch: {}", number_of_pools);
 
     let mut pools_batch_requests = Vec::new();
 
@@ -661,6 +661,7 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
         let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
         pair_to_pools.entry(key).or_default().push(idx);
     }
+    info!("Updated {number_of_pools} pools");
 
     Ok(Pools {
         pools,
@@ -1081,7 +1082,26 @@ fn find_best_split_route<'a>(
     if routes.is_empty() {
         return None;
     }
-    let step = SPLIT_ROUTE_STEP_SIZE;
+    const SMALL_AMOUNT_THRESHOLD: Balance = 1000;
+    let is_small_amount = match total_amount {
+        QuoteAmount::ExactIn(amount) => {
+            amount < SMALL_AMOUNT_THRESHOLD
+                || routes[0]
+                    .emulate_swap_exact_in(token_in, token_out, amount, &mut PoolsDelta::default())
+                    .map_or(true, |t| t < SMALL_AMOUNT_THRESHOLD)
+        }
+        QuoteAmount::ExactOut(amount) => {
+            amount < SMALL_AMOUNT_THRESHOLD
+                || routes[0]
+                    .emulate_swap_exact_out(token_in, token_out, amount, &mut PoolsDelta::default())
+                    .map_or(true, |t| t.0 < SMALL_AMOUNT_THRESHOLD)
+        }
+    };
+    let step = if is_small_amount {
+        SMALL_AMOUNT_ROUTE_STEP_SIZE
+    } else {
+        SPLIT_ROUTE_STEP_SIZE
+    };
     let slices = 100 / step;
     let mut weights: Vec<u32> = vec![0; routes.len()];
 

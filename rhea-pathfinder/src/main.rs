@@ -70,6 +70,7 @@ struct ApiResponsePoolStep {
 
 const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
+const SMALL_AMOUNT_ROUTE_STEP_SIZE: u32 = 25; // %
 const MAX_SPLITS_COUNT: usize = 2;
 const FEE_DIVISOR: u32 = 10_000;
 const FETCH_POOLS_BATCH_SIZE: usize = 1000;
@@ -918,7 +919,21 @@ fn find_best_split_route<'a>(
     if routes.is_empty() {
         return None;
     }
-    let step = SPLIT_ROUTE_STEP_SIZE;
+    const SMALL_AMOUNT_THRESHOLD: Balance = 1000;
+    let is_small_amount = total_amount < SMALL_AMOUNT_THRESHOLD
+        || routes[0]
+            .emulate_swap(
+                token_in,
+                token_out,
+                total_amount,
+                &mut PoolsDelta::default(),
+            )
+            .map_or(true, |t| t < SMALL_AMOUNT_THRESHOLD);
+    let step = if is_small_amount {
+        SMALL_AMOUNT_ROUTE_STEP_SIZE
+    } else {
+        SPLIT_ROUTE_STEP_SIZE
+    };
     let slices = 100 / step;
     let mut weights: Vec<u32> = vec![0; routes.len()];
 
