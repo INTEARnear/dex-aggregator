@@ -1,17 +1,19 @@
 use std::{future::Future, pin::Pin};
 
+use bigdecimal::{BigDecimal, RoundingMode};
 use futures_util::TryFutureExt;
 use near_min_api::{
     types::{AccountId, Action, Balance, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     utils::dec_format,
     QueryFinality,
 };
+use num_traits::ToPrimitive;
 use serde::Deserialize;
 
 use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage_f64, needs_storage_deposit_for_contract, RPC_CLIENT,
+        get_slippage, needs_storage_deposit_for_contract, RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -69,15 +71,13 @@ impl Provider for RheaDclProvider {
                         .collect::<Vec<_>>();
                     let best_route = routes.iter().max_by_key(|(_, v)| v.amount);
                     if let Some((pool_id, quote)) = best_route {
-                        let min_amount_out = (quote.amount as f64
-                            * (1.0
-                                - get_slippage_f64(
-                                    request.slippage,
-                                    &request.token_in,
-                                    &request.token_out,
-                                )
-                                .await))
-                            .floor() as Balance;
+                        let slippage =
+                            get_slippage(request.slippage, &request.token_in, &request.token_out)
+                                .await;
+                        let min_amount_out = ToPrimitive::to_u128(
+                            &(BigDecimal::from(quote.amount) * (BigDecimal::from(1) - slippage))
+                                .with_scale_round(0, RoundingMode::Down),
+                        )?;
 
                         let unwrapping_near = request.token_out == TokenId::Near;
                         let ft_transfer_call_swap_action =
@@ -196,15 +196,13 @@ impl Provider for RheaDclProvider {
                         .collect::<Vec<_>>();
                     let best_route = routes.iter().min_by_key(|(_, v)| v.amount);
                     if let Some((pool_id, quote)) = best_route {
-                        let max_amount_in = (quote.amount as f64
-                            / (1.0
-                                - get_slippage_f64(
-                                    request.slippage,
-                                    &request.token_in,
-                                    &request.token_out,
-                                )
-                                .await))
-                            .floor() as Balance;
+                        let slippage =
+                            get_slippage(request.slippage, &request.token_in, &request.token_out)
+                                .await;
+                        let max_amount_in = ToPrimitive::to_u128(
+                            &(BigDecimal::from(quote.amount) / (BigDecimal::from(1) - slippage))
+                                .with_scale_round(0, RoundingMode::Down),
+                        )?;
 
                         let unwrapping_near = request.token_out == TokenId::Near;
                         let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {

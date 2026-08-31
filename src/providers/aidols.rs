@@ -1,14 +1,16 @@
 use std::{future::Future, pin::Pin};
 
+use bigdecimal::{BigDecimal, RoundingMode};
 use near_min_api::{
     types::{AccountId, Action, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128},
     QueryFinality,
 };
+use num_traits::ToPrimitive;
 use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, DEFAULT_REFERRER_ID,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage, DEFAULT_REFERRER_ID,
         RPC_CLIENT, WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
@@ -69,10 +71,12 @@ impl Provider for AidolsProvider {
                     info!("Estimated amount out: {}", estimated_amount_out);
 
                     let slippage =
-                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
-                            .await;
-                    let min_amount_out = estimated_amount_out as f64 * (1.0 - slippage);
-                    let min_amount_out = min_amount_out as u128;
+                        get_slippage(request.slippage, &request.token_in, &request.token_out).await;
+                    let min_amount_out = ToPrimitive::to_u128(
+                        &(BigDecimal::from(estimated_amount_out)
+                            * (BigDecimal::from(1) - slippage))
+                            .with_scale_round(0, RoundingMode::Down),
+                    )?;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "ft_transfer_call".to_string(),
@@ -155,10 +159,11 @@ impl Provider for AidolsProvider {
                     info!("Required amount in: {}", required_amount_in);
 
                     let slippage =
-                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
-                            .await;
-                    let max_amount_in = required_amount_in as f64 / (1.0 - slippage);
-                    let max_amount_in = max_amount_in as u128;
+                        get_slippage(request.slippage, &request.token_in, &request.token_out).await;
+                    let max_amount_in = ToPrimitive::to_u128(
+                        &(BigDecimal::from(required_amount_in) / (BigDecimal::from(1) - slippage))
+                            .with_scale_round(0, RoundingMode::Down),
+                    )?;
 
                     let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "ft_transfer_call".to_string(),
@@ -192,7 +197,9 @@ impl Provider for AidolsProvider {
                             request.trader_account_id.clone(),
                         )
                         .await,
-                        convert_to_nep141(&request.token_in, None, 0).await?.0,
+                        convert_to_nep141(&request.token_in, None, max_amount_in)
+                            .await?
+                            .0,
                         vec![ExecutionInstruction::NearTransaction {
                             receiver_id: nep141_in,
                             actions: vec![swap_action],

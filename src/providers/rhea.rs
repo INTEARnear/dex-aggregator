@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, DEFAULT_REFERRER_ID,
+        convert_to_nep141, deposit_storage_if_needed, get_slippage, DEFAULT_REFERRER_ID,
         REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
@@ -33,7 +33,7 @@ impl Provider for RheaProvider {
             };
 
             let slippage =
-                get_slippage_f64(request.slippage, &request.token_in, &request.token_out).await;
+                get_slippage(request.slippage, &request.token_in, &request.token_out).await;
 
             let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
             let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
@@ -49,7 +49,7 @@ impl Provider for RheaProvider {
                 return None;
             };
 
-            let Ok(response) = dbg!(response.json::<RheaSmartRouterResponse>().await) else {
+            let Ok(response) = response.json::<RheaSmartRouterResponse>().await else {
                 return None;
             };
 

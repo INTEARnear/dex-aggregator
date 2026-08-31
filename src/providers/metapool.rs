@@ -1,17 +1,17 @@
 use std::{future::Future, pin::Pin};
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, RoundingMode};
 use near_min_api::{
     types::{Action, Finality, FunctionCallAction, Gas, NearGas, NearToken},
     QueryFinality,
 };
-use num_traits::{FromPrimitive, ToPrimitive};
+use num_traits::{ToPrimitive, Zero};
 use serde::Deserialize;
 use tracing::error;
 
 use crate::{
     shared_utils::{
-        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, is_near,
+        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage, is_near,
         RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
@@ -180,7 +180,9 @@ impl Provider for MetapoolProvider {
                     )
                     .await
                 {
-                    Ok(discount_basis_points) => discount_basis_points as f64 / 10000.0,
+                    Ok(discount_basis_points) => {
+                        BigDecimal::from(discount_basis_points) / BigDecimal::from(10000)
+                    }
                     Err(_) => {
                         error!(
                             "Failed to get discount basis points for liquid unstake for amount {}",
@@ -191,8 +193,8 @@ impl Provider for MetapoolProvider {
                 };
                 let amount_stnear_in = if let Amount::AmountOut(_) = request.amount {
                     ToPrimitive::to_u128(
-                        &(BigDecimal::from(amount_stnear_in)
-                            / BigDecimal::from_f64(1.0 - fee).unwrap()),
+                        &(BigDecimal::from(amount_stnear_in) / (BigDecimal::from(1) - &fee))
+                            .with_scale_round(0, RoundingMode::Down),
                     )
                     .unwrap()
                 } else {
@@ -200,8 +202,8 @@ impl Provider for MetapoolProvider {
                 };
                 let amount_near_out = if let Amount::AmountIn(_) = request.amount {
                     ToPrimitive::to_u128(
-                        &(BigDecimal::from(amount_near_out)
-                            / BigDecimal::from_f64(1.0 + fee).unwrap()),
+                        &(BigDecimal::from(amount_near_out) / (BigDecimal::from(1) + &fee))
+                            .with_scale_round(0, RoundingMode::Down),
                     )
                     .unwrap()
                 } else {
@@ -209,22 +211,36 @@ impl Provider for MetapoolProvider {
                 };
 
                 let max_amount_stnear_in = if let Amount::AmountOut(_) = request.amount {
-                    let slippage =
-                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
-                            .await;
-                    let worst_case_amount_stnear_in = BigDecimal::from(amount_stnear_in)
-                        / BigDecimal::from_f64(1.0 - slippage).unwrap();
-                    ToPrimitive::to_u128(&worst_case_amount_stnear_in)?
+                    let slippage = get_slippage(
+                        request.slippage.clone(),
+                        &request.token_in,
+                        &request.token_out,
+                    )
+                    .await;
+                    let one_minus_slippage = BigDecimal::from(1) - slippage;
+                    if one_minus_slippage.is_zero() {
+                        return None;
+                    }
+                    let worst_case_amount_stnear_in =
+                        BigDecimal::from(amount_stnear_in) / one_minus_slippage;
+                    ToPrimitive::to_u128(
+                        &worst_case_amount_stnear_in.with_scale_round(0, RoundingMode::Down),
+                    )?
                 } else {
                     amount_stnear_in
                 };
                 let min_amount_near_out = if let Amount::AmountIn(_) = request.amount {
-                    let slippage =
-                        get_slippage_f64(request.slippage, &request.token_in, &request.token_out)
-                            .await;
-                    let worst_case_amount_near_out = BigDecimal::from(amount_near_out)
-                        / BigDecimal::from_f64(1.0 + slippage).unwrap();
-                    ToPrimitive::to_u128(&worst_case_amount_near_out)?
+                    let slippage = get_slippage(
+                        request.slippage.clone(),
+                        &request.token_in,
+                        &request.token_out,
+                    )
+                    .await;
+                    let worst_case_amount_near_out =
+                        BigDecimal::from(amount_near_out) / (BigDecimal::from(1) + slippage);
+                    ToPrimitive::to_u128(
+                        &worst_case_amount_near_out.with_scale_round(0, RoundingMode::Down),
+                    )?
                 } else {
                     amount_near_out
                 };

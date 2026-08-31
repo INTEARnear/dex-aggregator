@@ -11,7 +11,7 @@ use near_min_api::{
     utils::dec_format,
     QueryFinality, RpcClient,
 };
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex;
@@ -195,63 +195,80 @@ lazy_static! {
             .map(|url| url.to_string())
             .collect::<Vec<_>>(),
     );
-    pub static ref TOKEN_PRICES: Mutex<HashMap<AccountId, f64>> = {
+    pub static ref TOKEN_PRICES: Mutex<HashMap<AccountId, BigDecimal>> = {
         let prices = Mutex::new(HashMap::new());
         tokio::spawn(update_token_prices_loop());
         prices
     };
 }
 
-pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out: &TokenId) -> f64 {
+pub async fn get_slippage(
+    slippage: Slippage,
+    token_in: &TokenId,
+    token_out: &TokenId,
+) -> BigDecimal {
     match slippage {
         Slippage::Auto {
             max_slippage,
             min_slippage,
         } => {
             let get_token_volatiltiy = |token_info: TokenInfo| async move {
-                if token_info.created_at > get_current_block_height().await.unwrap() - 100 {
+                let current_block_height = match get_current_block_height().await {
+                    Ok(height) => height,
+                    Err(_) => return BigDecimal::from_f64(0.005).unwrap(),
+                };
+                if token_info.created_at > current_block_height.saturating_sub(100) {
                     // New token
-                    1.0
-                } else if token_info.created_at > get_current_block_height().await.unwrap() - 1000 {
+                    BigDecimal::from(1)
+                } else if token_info.created_at > current_block_height.saturating_sub(1000) {
                     // New token, but not that new
-                    0.6
+                    BigDecimal::from_f64(0.6).unwrap()
                 } else {
-                    let price_change_24h =
-                        (token_info.price_usd_raw_24h_ago - token_info.price_usd_raw.clone()).abs();
-                    let price_change_24h_relative =
-                        price_change_24h / token_info.price_usd_raw.clone();
+                    let mut scale = BigDecimal::from(0);
 
-                    let mut scale = 0f64;
-                    if price_change_24h_relative > BigDecimal::from_f64(0.5).unwrap() {
-                        scale += 0.1;
-                    }
-                    if price_change_24h_relative > BigDecimal::from_f64(0.2).unwrap() {
-                        scale += 0.05;
-                    }
+                    if !token_info.price_usd_raw.is_zero() {
+                        let price_change_24h = (token_info.price_usd_raw_24h_ago
+                            - token_info.price_usd_raw.clone())
+                        .abs();
+                        let price_change_24h_relative =
+                            price_change_24h / token_info.price_usd_raw.clone();
 
-                    let volume_to_mcap_ratio = token_info.volume_usd_24h
-                        / (BigDecimal::from(token_info.circulating_supply)
-                            * token_info.price_usd_raw);
-                    if volume_to_mcap_ratio > BigDecimal::from_f64(1.00).unwrap() {
-                        scale += 0.1
-                    }
-                    if volume_to_mcap_ratio > BigDecimal::from_f64(0.2).unwrap() {
-                        scale += 0.05;
-                    }
+                        if price_change_24h_relative > BigDecimal::from_f64(0.5).unwrap() {
+                            scale += BigDecimal::from_f64(0.1).unwrap();
+                        }
+                        if price_change_24h_relative > BigDecimal::from_f64(0.2).unwrap() {
+                            scale += BigDecimal::from_f64(0.05).unwrap();
+                        }
 
-                    let volume_to_liquidity_ratio =
-                        token_info.volume_usd_24h / token_info.liquidity_usd;
-                    if volume_to_liquidity_ratio > 1.00 {
-                        scale += 0.15;
-                    }
-                    if volume_to_liquidity_ratio > 0.5 {
-                        scale += 0.1;
-                    }
-                    if volume_to_liquidity_ratio > 0.2 {
-                        scale += 0.05;
+                        let market_cap = BigDecimal::from(token_info.circulating_supply)
+                            * token_info.price_usd_raw;
+                        if !market_cap.is_zero() {
+                            let volume_to_mcap_ratio =
+                                token_info.volume_usd_24h.clone() / market_cap;
+                            if volume_to_mcap_ratio > 1 {
+                                scale += BigDecimal::from_f64(0.1).unwrap();
+                            }
+                            if volume_to_mcap_ratio > BigDecimal::from_f64(0.2).unwrap() {
+                                scale += BigDecimal::from_f64(0.05).unwrap();
+                            }
+                        }
                     }
 
-                    scale.clamp(0.0, 1.0)
+                    if !token_info.liquidity_usd.is_zero() {
+                        let volume_to_liquidity_ratio =
+                            token_info.volume_usd_24h / token_info.liquidity_usd;
+                        if volume_to_liquidity_ratio > 1 {
+                            scale += BigDecimal::from_f64(0.15).unwrap();
+                        }
+                        if volume_to_liquidity_ratio > BigDecimal::from_f64(0.5).unwrap() {
+                            scale += BigDecimal::from_f64(0.1).unwrap();
+                        }
+                        if volume_to_liquidity_ratio > BigDecimal::from_f64(0.2).unwrap() {
+                            scale += BigDecimal::from_f64(0.05).unwrap();
+                        }
+                    }
+
+                    scale.clamp(BigDecimal::from(0), BigDecimal::from(1))
                 }
             };
 
@@ -260,32 +277,38 @@ pub async fn get_slippage_f64(slippage: Slippage, token_in: &TokenId, token_out:
                     get_token_volatiltiy(token_info).await
                 } else {
                     // Maybe it's a new token, but not 100% sure
-                    0.8
+                    BigDecimal::from_f64(0.8).unwrap()
                 }
             } else {
                 // An error occurred
-                0.5
+                BigDecimal::from_f64(0.005).unwrap()
             };
             let optimal_slippage_scale_output = if let Ok(mut tokens) = get_all_tokens().await {
                 if let Some(token_info) = tokens.remove(token_out) {
                     get_token_volatiltiy(token_info).await
                 } else {
                     // Maybe it's a new token, but not 100% sure
-                    0.8
+                    BigDecimal::from_f64(0.8).unwrap()
                 }
             } else {
                 // An error occurred
-                0.5
+                BigDecimal::from_f64(0.005).unwrap()
             };
             let optimal_slippage_scale =
                 optimal_slippage_scale_input.max(optimal_slippage_scale_output);
-            let optimal_slippage =
-                min_slippage + (max_slippage - min_slippage) * optimal_slippage_scale;
+            let optimal_slippage = min_slippage.clone()
+                + (max_slippage.clone() - min_slippage.clone()) * optimal_slippage_scale;
             let optimal_slippage = optimal_slippage.clamp(min_slippage, max_slippage);
 
-            optimal_slippage.clamp(0.0001, 0.9999)
+            optimal_slippage.clamp(
+                BigDecimal::from_f64(0.0001).unwrap(),
+                BigDecimal::from_f64(0.9999).unwrap(),
+            )
         }
-        Slippage::Fixed { slippage } => slippage.clamp(0.0001, 0.9999),
+        Slippage::Fixed { slippage } => slippage.clamp(
+            BigDecimal::from_f64(0.0001).unwrap(),
+            BigDecimal::from_f64(0.9999).unwrap(),
+        ),
     }
 }
 
@@ -297,8 +320,10 @@ pub struct TokenInfo {
     pub price_usd_raw_24h_ago: BigDecimal,
     #[serde(with = "dec_format")]
     pub circulating_supply: Balance,
-    pub liquidity_usd: f64,
-    pub volume_usd_24h: f64,
+    #[serde(deserialize_with = "deserialize_bigdecimal")]
+    pub liquidity_usd: BigDecimal,
+    #[serde(deserialize_with = "deserialize_bigdecimal")]
+    pub volume_usd_24h: BigDecimal,
     pub created_at: BlockHeight,
 }
 
@@ -306,8 +331,14 @@ fn deserialize_bigdecimal<'de, D>(deserializer: D) -> Result<BigDecimal, D::Erro
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    BigDecimal::from_str(&s).map_err(serde::de::Error::custom)
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => BigDecimal::from_str(&s).map_err(serde::de::Error::custom),
+        serde_json::Value::Number(n) => {
+            BigDecimal::from_str(&n.to_string()).map_err(serde::de::Error::custom)
+        }
+        _ => Err(serde::de::Error::custom("expected number or string")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,8 +386,8 @@ async fn update_token_prices() {
 
             for (token_id_str, token_data) in tokens {
                 if let Ok(account_id) = token_id_str.parse::<AccountId>() {
-                    if let Ok(price_raw) = token_data.price_usd_raw.parse::<f64>() {
-                        token_prices.insert(account_id, price_raw / 1e6);
+                    if let Ok(price_raw) = token_data.price_usd_raw.parse::<BigDecimal>() {
+                        token_prices.insert(account_id, price_raw / BigDecimal::from(1_000_000));
                     }
                 }
             }
@@ -373,9 +404,9 @@ async fn update_token_prices_loop() {
 }
 
 #[allow(dead_code)]
-pub async fn get_token_price(token_id: &AccountId) -> Option<f64> {
+pub async fn get_token_price(token_id: &AccountId) -> Option<BigDecimal> {
     let token_prices = TOKEN_PRICES.lock().await;
-    token_prices.get(token_id).copied()
+    token_prices.get(token_id).cloned()
 }
 
 /// Merge all neighboring NearTransactions with the same receiver_id
@@ -406,7 +437,6 @@ pub fn optimize_execution_instructions(
                     optimized_execution_instructions.push(next_instruction);
                 }
             }
-            _ => optimized_execution_instructions.push(next_instruction),
         }
     }
     optimized_execution_instructions

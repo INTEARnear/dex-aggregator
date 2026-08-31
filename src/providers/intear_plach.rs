@@ -14,7 +14,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage_f64, is_near,
+        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage, is_near,
         DEFAULT_REFERRER_ID, REQWEST_CLIENT, RPC_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
@@ -223,7 +223,7 @@ impl Provider for IntearPlachProvider {
             };
 
             let slippage =
-                get_slippage_f64(request.slippage, &request.token_in, &request.token_out).await;
+                get_slippage(request.slippage, &request.token_in, &request.token_out).await;
 
             let (_, token_in) = match &request.token_in {
                 t if is_near(t) => (
@@ -264,7 +264,7 @@ impl Provider for IntearPlachProvider {
                 return None;
             };
 
-            let Ok(response) = dbg!(response.json::<ApiResponse>().await) else {
+            let Ok(response) = response.json::<ApiResponse>().await else {
                 return None;
             };
 

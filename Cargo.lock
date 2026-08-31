@@ -1695,11 +1695,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
+ "bigdecimal",
  "borsh",
  "crypto-bigint",
  "dotenvy",
  "lazy_static",
  "near-min-api",
+ "num-traits",
  "rand",
  "serde",
  "serde_json",

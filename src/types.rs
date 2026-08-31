@@ -1,8 +1,9 @@
 use std::{fmt::Display, str::FromStr};
 
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash},
+    types::{near_crypto::PublicKey, AccountId, Action, Balance},
     utils::dec_format,
 };
 use serde::de::Error;
@@ -20,7 +21,6 @@ pub enum TokenId {
     Near,
     Nep141(AccountId),
     Nep141OnRhea(AccountId),
-    // Nep141OnIntents(AccountId),
 }
 
 impl TokenId {
@@ -29,7 +29,6 @@ impl TokenId {
             TokenId::Near => "wrap.near".parse().unwrap(),
             TokenId::Nep141(account_id) => account_id.to_owned(),
             TokenId::Nep141OnRhea(account_id) => account_id.to_owned(),
-            // TokenId::Nep141OnIntents(account_id) => account_id.to_owned(),
         }
     }
 }
@@ -43,7 +42,6 @@ impl Serialize for TokenId {
             TokenId::Near => "near".to_string(),
             TokenId::Nep141(account_id) => format!("nep141:{account_id}"),
             TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
-            // TokenId::Nep141OnIntents(account_id) => format!("intents-nep141:{account_id}"),
         }
         .serialize(serializer)
     }
@@ -69,10 +67,6 @@ impl FromStr for TokenId {
             Ok(TokenId::Nep141OnRhea(
                 account_id.parse().map_err(|_| "Invalid token ID")?,
             ))
-        // } else if let Some(account_id) = s.strip_prefix("intents-nep141:") {
-        //     Ok(TokenId::Nep141OnIntents(
-        //         account_id.parse().map_err(|_| "Invalid token ID")?,
-        //     ))
         } else if let Some(account_id) = s.strip_prefix("nep141:") {
             Ok(TokenId::Nep141(
                 account_id.parse().map_err(|_| "Invalid token ID")?,
@@ -93,27 +87,22 @@ pub struct SwapRequest {
     #[serde(flatten)]
     pub amount: Amount,
     /// The maximum amount of time to wait for the route to be found. Some dexes
-    /// like near intents might show a better quote if you wait a bit longer.
+    /// might show a better quote if you wait a bit longer.
     /// Usually, 2-3 seconds is enough. Maximum is 60 seconds.
     pub max_wait_ms: u64,
     /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%.
     #[serde(flatten)]
     pub slippage: Slippage,
-    /// The dexes to use. You might want to remove Near Intents if you don't want
-    /// to implement its own swap logic, which relies on signing and sending messages
-    /// to a centralized RPC rather than just sending a transaction. If not provided,
-    /// all dexes will be used. Must not be an empty array.
+    /// The dexes to use. If not provided, all dexes will be used. Must not be an empty array.
     #[serde(with = "comma_separated", default)]
     pub dexes: Option<Vec<DexId>>,
     /// The account ID of the trader. If provided, the route will include storage
     /// deposit actions.
     pub trader_account_id: Option<AccountId>,
-    /// The public key to use for signing. Can be used for `add_public_key` method in
-    /// NEAR Intents.
+    /// The public key to use for signing.
     pub signing_public_key: Option<PublicKey>,
     /// The account ID of the referrer. If provided, the route will include referral
-    /// parameter for DEXes that support it (DexId::Rhea, DexId::NearIntents,
-    /// DexId::Aidols, DexId::Plach)
+    /// parameter for DEXes that support it (DexId::Rhea, DexId::Aidols, DexId::Plach)
     pub referrer_id: Option<AccountId>,
 }
 
@@ -168,21 +157,29 @@ where
     S::from_str(s).map_err(|_| D::Error::custom("could not parse string"))
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+fn to_str<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Display,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "slippage_type")]
 pub enum Slippage {
     /// Automatically determine the optimal slippage based on the current market
     /// conditions (liquidity, 24h volume, etc).
     Auto {
-        #[serde(deserialize_with = "from_str")]
-        max_slippage: f64,
-        #[serde(deserialize_with = "from_str")]
-        min_slippage: f64,
+        #[serde(deserialize_with = "from_str", serialize_with = "to_str")]
+        max_slippage: BigDecimal,
+        #[serde(deserialize_with = "from_str", serialize_with = "to_str")]
+        min_slippage: BigDecimal,
     },
     /// Fixed slippage percentage. Must be between 0.00 and 1.00.
     Fixed {
-        #[serde(deserialize_with = "from_str")]
-        slippage: f64,
+        #[serde(deserialize_with = "from_str", serialize_with = "to_str")]
+        slippage: BigDecimal,
     },
 }
 
@@ -193,7 +190,7 @@ pub struct Route {
     /// for network and block production latency.
     pub deadline: Option<DateTime<Utc>>,
     /// Whether the route has slippage. Usually it's true for AMM models like Rhea
-    /// and false for OTC / guaranteed-quote models like Near Intents.
+    /// and false for OTC / guaranteed-quote models.
     pub has_slippage: bool,
     /// The amount of tokens this route will swap. If you provided `Amount::AmountOut`,
     /// this amount will be `Amount::AmountIn` and vice versa.
@@ -201,8 +198,7 @@ pub struct Route {
     /// The amount of tokens this route will swap in the worst case scenario (with
     /// slippage). If you provided `Amount::AmountOut`, this amount will be
     /// `Amount::AmountIn` and vice versa. If you set slippage to `0.01`, this will be
-    /// 1% more / less than `estimated_amount`. If it's a dex like Near Intents,
-    /// this will be the same as `estimated_amount`.
+    /// 1% more / less than `estimated_amount`.
     pub worst_case_amount: Amount,
     /// The id of the dex that provided this route.
     pub dex_id: DexId,
@@ -227,14 +223,6 @@ pub enum ExecutionInstruction {
         receiver_id: AccountId,
         actions: Vec<Action>,
     },
-    /// A quote from Near Intents. You should sign the message and send it to
-    /// POST https://solver-relay-v2.chaindefuser.com/rpc with method
-    /// `publish_intent`. More details on how to publish a signed intent:
-    /// https://docs.near-intents.org/near-intents/market-makers/bus/solver-relay
-    IntentsQuote {
-        message_to_sign: String,
-        quote_hash: CryptoHash,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -244,13 +232,6 @@ pub enum DexId {
     ///
     /// Supports AmountIn, doesn't support AmountOut
     Rhea,
-    /// https://app.near-intents.org/
-    /// (sometimes) guaranteed-quote DEX & Bridge. Known to be unreliable & tricky
-    /// to implement for integrators & extremely slow compared to other DEXes, so
-    /// excluded from default route selection.
-    ///
-    /// Supports both AmountIn and AmountOut
-    NearIntents,
     /// https://aidols.bot/
     /// bonding-curve launchpad
     ///
@@ -293,7 +274,6 @@ pub enum DexId {
 }
 
 const RHEA_STR: &str = "Rhea";
-const NEAR_INTENTS_STR: &str = "NearIntents";
 const AIDOLS_STR: &str = "Aidols";
 const WRAP_STR: &str = "Wrap";
 const RHEA_DCL_STR: &str = "RheaDcl";
@@ -307,7 +287,6 @@ impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DexId::Rhea => f.write_str(RHEA_STR),
-            DexId::NearIntents => f.write_str(NEAR_INTENTS_STR),
             DexId::Aidols => f.write_str(AIDOLS_STR),
             DexId::Wrap => f.write_str(WRAP_STR),
             DexId::RheaDcl => f.write_str(RHEA_DCL_STR),
@@ -326,7 +305,6 @@ impl FromStr for DexId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             RHEA_STR => DexId::Rhea,
-            NEAR_INTENTS_STR => DexId::NearIntents,
             AIDOLS_STR => DexId::Aidols,
             WRAP_STR => DexId::Wrap,
             RHEA_DCL_STR => DexId::RheaDcl,

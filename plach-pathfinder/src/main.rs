@@ -1,10 +1,14 @@
+#![deny(clippy::float_arithmetic)]
+
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use bigdecimal::{BigDecimal, RoundingMode};
 use borsh::{BorshDeserialize, BorshSerialize};
 use crypto_bigint::U256;
 use lazy_static::lazy_static;
 use near_min_api::types::{AccountId, Balance, U128};
 use near_min_api::utils::dec_format;
+use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1767,8 +1771,16 @@ struct FindPathQuery {
     token_in: AssetId,
     token_out: AssetId,
     max_hops: MaxHops,
-    #[serde(default)]
-    slippage: Option<f64>, // e.g., 0.005 for 0.5 %
+    #[serde(deserialize_with = "deserialize_bigdecimal")]
+    slippage: BigDecimal,
+}
+
+fn deserialize_bigdecimal<'de, D>(deserializer: D) -> Result<BigDecimal, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <String as Deserialize>::deserialize(deserializer)?;
+    value.parse().map_err(serde::de::Error::custom)
 }
 
 async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
@@ -1797,7 +1809,7 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         }
     };
 
-    if query.slippage.is_some_and(|s| !(0.0..=1.0).contains(&s)) {
+    if query.slippage < 0 || query.slippage > 1 {
         let resp: ApiResponse<()> = ApiResponse {
             result_code: RC_INVALID_SLIPPAGE,
             result_message: "Invalid slippage".into(),
@@ -1805,7 +1817,10 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         };
         return Ok(warp::reply::json(&resp));
     }
-    let slippage_bp: u128 = query.slippage.map(|v| (v * 10_000.0) as u128).unwrap_or(50);
+    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
+        .with_scale_round(0, RoundingMode::Down)
+        .to_u128()
+        .unwrap();
 
     match get_pools().await {
         Ok(pools) => match route(
@@ -1841,12 +1856,12 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
                     }
                 }
 
-                match dbg!(split_route.to_api_response(
+                match split_route.to_api_response(
                     &query.token_in,
                     &query.token_out,
                     amount,
                     slippage_bp,
-                )) {
+                ) {
                     Ok(data) => {
                         let resp = ApiResponse {
                             result_code: RC_SUCCESS,

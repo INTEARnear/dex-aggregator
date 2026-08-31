@@ -1,3 +1,5 @@
+#![deny(clippy::float_arithmetic)]
+
 use axum::{
     extract::{Json, Query},
     http::StatusCode,
@@ -29,18 +31,18 @@ async fn route_handler(
 ) -> Result<Json<Vec<Route>>, (StatusCode, String)> {
     info!("Received route request: {:?}", request);
 
-    match request.slippage {
+    match &request.slippage {
         Slippage::Auto {
             max_slippage,
             min_slippage,
         } => {
-            if !(0.00..=1.0).contains(&max_slippage) {
+            if *max_slippage < 0 || *max_slippage > 1 {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Max slippage must be between 0.00 and 1.00".to_string(),
                 ));
             }
-            if !(0.00..=1.0).contains(&min_slippage) {
+            if *min_slippage < 0 || *min_slippage > 1 {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Min slippage must be between 0.00 and 1.00".to_string(),
@@ -54,7 +56,7 @@ async fn route_handler(
             }
         }
         Slippage::Fixed { slippage } => {
-            if !(0.00..=1.0).contains(&slippage) {
+            if *slippage < 0 || *slippage > 1 {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Slippage must be between 0.00 and 1.00".to_string(),
@@ -87,7 +89,6 @@ async fn route_handler(
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
-        &providers::near_intents::NearIntentsProvider,
         &providers::wrap::WrapProvider,
         &providers::rhea_dcl::RheaDclProvider,
         &providers::metapool::MetapoolProvider,
@@ -99,7 +100,6 @@ async fn route_handler(
 
     let dexes = request.dexes.clone().unwrap_or(vec![
         DexId::Rhea,
-        // omitting NearIntents
         DexId::Aidols,
         DexId::Wrap,
         DexId::RheaDcl,

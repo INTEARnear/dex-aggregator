@@ -20,7 +20,7 @@ pub struct XRheaProvider;
 
 impl Provider for XRheaProvider {
     fn dex_id(&self) -> DexId {
-        DexId::MetaPool
+        DexId::XRhea
     }
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {

@@ -50,7 +50,7 @@ impl StableSwap {
     /// Compute stable swap invariant (D)
     /// Equation:
     /// A * sum(x_i) * n**n + D = A * D * n**n + D**(n+1) / (n**n * prod(x_i))
-    pub fn compute_d(&self, c_amounts: &Vec<Balance>) -> Option<U256> {
+    pub fn compute_d(&self, c_amounts: &[Balance]) -> Option<U256> {
         let n_coins = c_amounts.len() as u128;
         let sum_x = c_amounts.iter().sum::<u128>();
         if sum_x == 0 {
@@ -97,7 +97,7 @@ impl StableSwap {
     pub fn compute_y(
         &self,
         x_c_amount: Balance, // new x_token amount in comparable precision,
-        current_c_amounts: &Vec<Balance>, // in-pool tokens amount in comparable precision,
+        current_c_amounts: &[Balance], // in-pool tokens amount in comparable precision,
         index_x: usize,      // x token's index
         index_y: usize,      // y token's index
     ) -> Option<U256> {
@@ -145,10 +145,10 @@ impl StableSwap {
     /// all tokens in and out with comparable precision
     pub fn swap_to(
         &self,
-        token_in_idx: usize,              // token_in index in token vector,
-        token_in_amount: Balance,         // token_in amount in comparable precision (1e18),
-        token_out_idx: usize,             // token_out index in token vector,
-        current_c_amounts: &Vec<Balance>, // in-pool tokens comparable amounts vector,
+        token_in_idx: usize,           // token_in index in token vector,
+        token_in_amount: Balance,      // token_in amount in comparable precision (1e18),
+        token_out_idx: usize,          // token_out index in token vector,
+        current_c_amounts: &[Balance], // in-pool tokens comparable amounts vector,
         fees: &Fees,
     ) -> Option<SwapResult> {
         let y = self

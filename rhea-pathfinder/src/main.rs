@@ -1,3 +1,6 @@
+#![deny(clippy::float_arithmetic)]
+#![allow(clippy::manual_div_ceil)]
+
 mod degen;
 mod rated;
 mod stable;
@@ -104,7 +107,7 @@ mod dec_format_vec {
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-    pub fn serialize<S, T>(value: &Vec<T>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S, T>(value: &[T], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
         T: ToString,
@@ -148,6 +151,7 @@ struct PoolInfo {
     total_fee: u64,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 enum PoolDetailInfo {
     SimplePoolInfo(SimplePoolInfo),
@@ -398,7 +402,7 @@ impl RatedPoolInfo {
         token_in: usize,
         amount_in: Balance,
         token_out: usize,
-        rates: &Vec<Balance>,
+        rates: &[Balance],
     ) -> Result<rated::SwapResult, anyhow::Error> {
         // make amounts into comparable-amounts
         let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
@@ -428,7 +432,7 @@ impl RatedPoolInfo {
         c_amount.checked_div(factor).unwrap()
     }
 
-    fn get_invariant_with_rates(&self, rates: &Vec<Balance>) -> RatedSwap {
+    fn get_invariant_with_rates(&self, rates: &[Balance]) -> RatedSwap {
         RatedSwap::new(self.amp, rates)
     }
 }
@@ -502,7 +506,7 @@ impl DegenPoolInfo {
         token_in: usize,
         amount_in: Balance,
         token_out: usize,
-        degens: &Vec<Balance>,
+        degens: &[Balance],
     ) -> Result<degen::SwapResult, anyhow::Error> {
         // make amounts into comparable-amounts
         let c_amount_in = self.amount_to_c_amount(amount_in, token_in);
@@ -516,7 +520,7 @@ impl DegenPoolInfo {
         )
     }
 
-    fn get_invariant_with_degens(&self, degens: &Vec<Balance>) -> DegenSwap {
+    fn get_invariant_with_degens(&self, degens: &[Balance]) -> DegenSwap {
         DegenSwap::new(self.amp, degens)
     }
 }
@@ -1393,6 +1397,7 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         };
         return Ok(warp::reply::json(&resp));
     }
+    #[allow(clippy::float_arithmetic)]
     let slippage_bp: u128 = query.slippage.map(|v| (v * 10_000.0) as u128).unwrap_or(50);
 
     match get_pools().await {
@@ -1419,12 +1424,12 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
                     request_id, estimated_out
                 );
 
-                match dbg!(split_route.to_api_response(
+                match split_route.to_api_response(
                     &query.token_in,
                     &query.token_out,
                     query.amount_in,
                     slippage_bp,
-                )) {
+                ) {
                     Ok(data) => {
                         let resp = ApiResponse {
                             result_code: RC_SUCCESS,
