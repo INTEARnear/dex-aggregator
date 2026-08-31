@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, future::Future, str::FromStr, time::Duration};
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
@@ -108,20 +108,272 @@ pub fn create_intear_nep141_deposit_action(contract_id: &AccountId, amount: Bala
     }))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageDeposit {
+    available: NearToken,
+    total: NearToken,
+}
+
+pub trait NetworkView: Send + Sync {
+    fn storage_balance(
+        &self,
+        contract_id: AccountId,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<StorageDeposit, String>> + Send;
+
+    fn is_rhea_token_registered(
+        &self,
+        account_id: &AccountId,
+        token_id: &AccountId,
+    ) -> impl Future<Output = bool> + Send;
+
+    fn is_intear_asset_registered(
+        &self,
+        account_id: &AccountId,
+        asset_id: &AssetId,
+    ) -> impl Future<Output = bool> + Send;
+
+    fn token_infos(
+        &self,
+    ) -> impl Future<Output = Result<HashMap<TokenId, TokenInfo>, String>> + Send;
+
+    fn current_block_height(&self) -> impl Future<Output = Result<BlockHeight, String>> + Send;
+
+    fn native_balance(
+        &self,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<NearToken, String>> + Send;
+}
+
+pub struct Mainnet;
+
+impl NetworkView for Mainnet {
+    async fn storage_balance(
+        &self,
+        contract_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<StorageDeposit, String> {
+        RPC_CLIENT
+            .call::<StorageDeposit>(
+                contract_id,
+                "storage_balance_of",
+                serde_json::json!({
+                    "account_id": account_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .inspect_err(|err| println!("Error checking storage balance: {err:?}"))
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
+        RPC_CLIENT
+            .call::<bool>(
+                "v2.ref-finance.near".parse().unwrap(),
+                "token_register_of",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "token_id": token_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .inspect_err(|err| println!("Error checking rhea token registration: {err:?}"))
+            .unwrap_or_default()
+    }
+
+    async fn is_intear_asset_registered(&self, account_id: &AccountId, asset_id: &AssetId) -> bool {
+        RPC_CLIENT
+            .call::<bool>(
+                "dex.intear.near".parse().unwrap(),
+                "are_assets_registered",
+                serde_json::json!({
+                    "asset_ids": [asset_id],
+                    "for": {
+                        "Account": account_id,
+                    }
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .inspect_err(|err| println!("Error checking intear asset registration: {err:?}"))
+            .unwrap_or_default()
+    }
+
+    async fn token_infos(&self) -> Result<HashMap<TokenId, TokenInfo>, String> {
+        get_all_tokens()
+            .await
+            .inspect_err(|err| println!("Error getting token infos: {err:?}"))
+    }
+
+    async fn current_block_height(&self) -> Result<BlockHeight, String> {
+        get_current_block_height()
+            .await
+            .inspect_err(|err| println!("Error getting current block height: {err:?}"))
+    }
+
+    async fn native_balance(&self, account_id: &AccountId) -> Result<NearToken, String> {
+        RPC_CLIENT
+            .view_account(account_id.clone(), QueryFinality::Finality(Finality::None))
+            .await
+            .map(|account| account.amount)
+            .inspect_err(|err| println!("Error getting native balance: {err:?}"))
+            .map_err(|err| format!("{err:?}"))
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestNetworkView {
+    storage_balances: HashMap<(AccountId, AccountId), StorageDeposit>,
+    rhea_token_registers: HashMap<(AccountId, AccountId), bool>,
+    intear_asset_registers: HashMap<(AccountId, AssetId), bool>,
+    tokens: Result<HashMap<TokenId, TokenInfo>, String>,
+    block_height: Result<BlockHeight, String>,
+    native_balances: HashMap<AccountId, NearToken>,
+}
+
+#[cfg(test)]
+impl Default for TestNetworkView {
+    fn default() -> Self {
+        Self {
+            storage_balances: HashMap::new(),
+            rhea_token_registers: HashMap::new(),
+            intear_asset_registers: HashMap::new(),
+            tokens: Ok(HashMap::new()),
+            block_height: Ok(1_000_000),
+            native_balances: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestNetworkView {
+    pub(crate) fn with_storage(
+        mut self,
+        contract_id: &str,
+        account_id: &str,
+        total: NearToken,
+        available: NearToken,
+    ) -> Self {
+        self.storage_balances.insert(
+            (contract_id.parse().unwrap(), account_id.parse().unwrap()),
+            StorageDeposit { total, available },
+        );
+        self
+    }
+
+    pub(crate) fn with_rhea_registered(
+        mut self,
+        account_id: &str,
+        token_id: &str,
+        registered: bool,
+    ) -> Self {
+        self.rhea_token_registers.insert(
+            (account_id.parse().unwrap(), token_id.parse().unwrap()),
+            registered,
+        );
+        self
+    }
+
+    pub(crate) fn with_intear_registered(
+        mut self,
+        account_id: &str,
+        asset_id: &AssetId,
+        registered: bool,
+    ) -> Self {
+        self.intear_asset_registers
+            .insert((account_id.parse().unwrap(), asset_id.clone()), registered);
+        self
+    }
+
+    pub(crate) fn with_tokens(mut self, tokens: HashMap<TokenId, TokenInfo>) -> Self {
+        self.tokens = Ok(tokens);
+        self
+    }
+
+    pub(crate) fn with_tokens_error(mut self) -> Self {
+        self.tokens = Err("Failed to get all tokens".to_string());
+        self
+    }
+
+    pub(crate) fn with_block_height(mut self, height: u64) -> Self {
+        self.block_height = Ok(height);
+        self
+    }
+
+    pub(crate) fn with_block_height_error(mut self) -> Self {
+        self.block_height = Err("Failed to get current block".to_string());
+        self
+    }
+
+    pub(crate) fn with_native_balance(mut self, account_id: &str, amount: NearToken) -> Self {
+        self.native_balances
+            .insert(account_id.parse().unwrap(), amount);
+        self
+    }
+}
+
+#[cfg(test)]
+impl NetworkView for TestNetworkView {
+    async fn storage_balance(
+        &self,
+        contract_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<StorageDeposit, String> {
+        self.storage_balances
+            .get(&(contract_id, account_id.clone()))
+            .cloned()
+            .ok_or_else(|| "storage_balance not configured".to_string())
+    }
+
+    async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
+        self.rhea_token_registers
+            .get(&(account_id.clone(), token_id.clone()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    async fn is_intear_asset_registered(&self, account_id: &AccountId, asset_id: &AssetId) -> bool {
+        self.intear_asset_registers
+            .get(&(account_id.clone(), asset_id.clone()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    async fn token_infos(&self) -> Result<HashMap<TokenId, TokenInfo>, String> {
+        self.tokens.clone()
+    }
+
+    async fn current_block_height(&self) -> Result<BlockHeight, String> {
+        self.block_height.clone()
+    }
+
+    async fn native_balance(&self, account_id: &AccountId) -> Result<NearToken, String> {
+        Ok(self
+            .native_balances
+            .get(account_id)
+            .copied()
+            .unwrap_or(NearToken::from_near(10)))
+    }
+}
+
 async fn create_ft_deposit_registrations(
+    network: &impl NetworkView,
     contract_id: &AccountId,
     token_id: &AccountId,
     trader_account_id: Option<AccountId>,
 ) -> Vec<ExecutionInstruction> {
     let mut actions = vec![];
     if let Some(trader_account_id) = trader_account_id {
-        if needs_storage_deposit_for_contract(&trader_account_id, token_id).await {
+        if needs_storage_deposit_for_contract(network, &trader_account_id, token_id).await {
             actions.push(create_storage_deposit_action_for_contract(
                 "0.00125 NEAR".parse().unwrap(),
             ));
         }
     }
-    if needs_storage_deposit_for_contract(contract_id, token_id).await {
+    if needs_storage_deposit_for_contract(network, contract_id, token_id).await {
         actions.push(create_storage_deposit_action_for_someone(
             "0.00125 NEAR".parse().unwrap(),
             contract_id,
@@ -137,61 +389,31 @@ async fn create_ft_deposit_registrations(
     }
 }
 
-pub async fn needs_storage_deposit(account_id: &AccountId, token_id: &TokenId) -> bool {
+pub async fn needs_storage_deposit(
+    network: &impl NetworkView,
+    account_id: &AccountId,
+    token_id: &TokenId,
+) -> bool {
     match token_id {
         TokenId::Near => false,
-        TokenId::Nep141(token_id) => needs_storage_deposit_for_contract(account_id, token_id).await,
+        TokenId::Nep141(token_id) => {
+            needs_storage_deposit_for_contract(network, account_id, token_id).await
+        }
         TokenId::Nep141OnRhea(token_id) => {
-            let is_registered = RPC_CLIENT
-                .call::<bool>(
-                    "v2.ref-finance.near".parse().unwrap(),
-                    "token_register_of",
-                    serde_json::json!({
-                        "account_id": account_id,
-                        "token_id": token_id,
-                    }),
-                    QueryFinality::Finality(Finality::DoomSlug),
-                )
-                .await
-                .unwrap_or_default();
-            let has_storage_deposit = RPC_CLIENT
-                .call::<StorageDeposit>(
-                    "v2.ref-finance.near".parse().unwrap(),
-                    "storage_balance_of",
-                    serde_json::json!({
-                        "account_id": account_id,
-                    }),
-                    QueryFinality::Finality(Finality::DoomSlug),
-                )
+            let is_registered = network.is_rhea_token_registered(account_id, token_id).await;
+            let has_storage_deposit = network
+                .storage_balance("v2.ref-finance.near".parse().unwrap(), account_id)
                 .await
                 .map(|s| s.available > NearToken::from_millinear(10))
                 .unwrap_or_default();
             !has_storage_deposit || !is_registered
         }
         TokenId::TokenOnIntearDex(asset_id) => {
-            let is_registered = RPC_CLIENT
-                .call::<bool>(
-                    "dex.intear.near".parse().unwrap(),
-                    "are_assets_registered",
-                    serde_json::json!({
-                        "asset_ids": [asset_id],
-                        "for": {
-                            "Account": account_id,
-                        }
-                    }),
-                    QueryFinality::Finality(Finality::DoomSlug),
-                )
-                .await
-                .unwrap_or_default();
-            let has_storage_deposit = RPC_CLIENT
-                .call::<StorageDeposit>(
-                    "dex.intear.near".parse().unwrap(),
-                    "storage_balance_of",
-                    serde_json::json!({
-                        "account_id": account_id,
-                    }),
-                    QueryFinality::Finality(Finality::DoomSlug),
-                )
+            let is_registered = network
+                .is_intear_asset_registered(account_id, asset_id)
+                .await;
+            let has_storage_deposit = network
+                .storage_balance("dex.intear.near".parse().unwrap(), account_id)
                 .await
                 .map(|s| s.available > NearToken::from_millinear(1))
                 .unwrap_or_default();
@@ -201,30 +423,17 @@ pub async fn needs_storage_deposit(account_id: &AccountId, token_id: &TokenId) -
 }
 
 pub async fn needs_storage_deposit_for_contract(
+    network: &impl NetworkView,
     account_id: &AccountId,
     contract_id: &AccountIdRef,
 ) -> bool {
-    let Ok(storage_deposit) = RPC_CLIENT
-        .call::<StorageDeposit>(
-            contract_id.to_owned(),
-            "storage_balance_of",
-            serde_json::json!({
-                "account_id": account_id,
-            }),
-            QueryFinality::Finality(Finality::DoomSlug),
-        )
+    let Ok(storage_deposit) = network
+        .storage_balance(contract_id.to_owned(), account_id)
         .await
     else {
         return true;
     };
     storage_deposit.total.is_zero()
-}
-
-#[derive(Debug, Deserialize)]
-struct StorageDeposit {
-    #[allow(dead_code)]
-    available: NearToken,
-    total: NearToken,
 }
 
 pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionInstruction> {
@@ -330,6 +539,7 @@ lazy_static! {
 }
 
 pub async fn get_slippage(
+    network: &impl NetworkView,
     slippage: Slippage,
     token_in: &TokenId,
     token_out: &TokenId,
@@ -339,88 +549,11 @@ pub async fn get_slippage(
             max_slippage,
             min_slippage,
         } => {
-            let get_token_volatiltiy = |token_info: TokenInfo| async move {
-                let current_block_height = match get_current_block_height().await {
-                    Ok(height) => height,
-                    Err(_) => return BigDecimal::from_f64(0.005).unwrap(),
-                };
-                if token_info.created_at > current_block_height.saturating_sub(100) {
-                    // New token
-                    BigDecimal::from(1)
-                } else if token_info.created_at > current_block_height.saturating_sub(1000) {
-                    // New token, but not that new
-                    BigDecimal::from_f64(0.6).unwrap()
-                } else {
-                    let mut scale = BigDecimal::from(0);
-
-                    if !token_info.price_usd_raw.is_zero() {
-                        let price_change_24h = (token_info.price_usd_raw_24h_ago
-                            - token_info.price_usd_raw.clone())
-                        .abs();
-                        let price_change_24h_relative =
-                            price_change_24h / token_info.price_usd_raw.clone();
-
-                        if price_change_24h_relative > BigDecimal::from_f64(0.5).unwrap() {
-                            scale += BigDecimal::from_f64(0.1).unwrap();
-                        }
-                        if price_change_24h_relative > BigDecimal::from_f64(0.2).unwrap() {
-                            scale += BigDecimal::from_f64(0.05).unwrap();
-                        }
-
-                        let market_cap = BigDecimal::from(token_info.circulating_supply)
-                            * token_info.price_usd_raw;
-                        if !market_cap.is_zero() {
-                            let volume_to_mcap_ratio =
-                                token_info.volume_usd_24h.clone() / market_cap;
-                            if volume_to_mcap_ratio > 1 {
-                                scale += BigDecimal::from_f64(0.1).unwrap();
-                            }
-                            if volume_to_mcap_ratio > BigDecimal::from_f64(0.2).unwrap() {
-                                scale += BigDecimal::from_f64(0.05).unwrap();
-                            }
-                        }
-                    }
-
-                    if !token_info.liquidity_usd.is_zero() {
-                        let volume_to_liquidity_ratio =
-                            token_info.volume_usd_24h / token_info.liquidity_usd;
-                        if volume_to_liquidity_ratio > 1 {
-                            scale += BigDecimal::from_f64(0.15).unwrap();
-                        }
-                        if volume_to_liquidity_ratio > BigDecimal::from_f64(0.5).unwrap() {
-                            scale += BigDecimal::from_f64(0.1).unwrap();
-                        }
-                        if volume_to_liquidity_ratio > BigDecimal::from_f64(0.2).unwrap() {
-                            scale += BigDecimal::from_f64(0.05).unwrap();
-                        }
-                    }
-
-                    scale.clamp(BigDecimal::from(0), BigDecimal::from(1))
-                }
-            };
-
-            let optimal_slippage_scale_input = if let Ok(mut tokens) = get_all_tokens().await {
-                if let Some(token_info) = tokens.remove(token_in) {
-                    get_token_volatiltiy(token_info).await
-                } else {
-                    // Maybe it's a new token, but not 100% sure
-                    BigDecimal::from_f64(0.8).unwrap()
-                }
-            } else {
-                // An error occurred
-                BigDecimal::from_f64(0.005).unwrap()
-            };
-            let optimal_slippage_scale_output = if let Ok(mut tokens) = get_all_tokens().await {
-                if let Some(token_info) = tokens.remove(token_out) {
-                    get_token_volatiltiy(token_info).await
-                } else {
-                    // Maybe it's a new token, but not 100% sure
-                    BigDecimal::from_f64(0.8).unwrap()
-                }
-            } else {
-                // An error occurred
-                BigDecimal::from_f64(0.005).unwrap()
-            };
+            let tokens_result = network.token_infos().await;
+            let optimal_slippage_scale_input =
+                slippage_scale_for_token(network, &tokens_result, token_in).await;
+            let optimal_slippage_scale_output =
+                slippage_scale_for_token(network, &tokens_result, token_out).await;
             let optimal_slippage_scale =
                 optimal_slippage_scale_input.max(optimal_slippage_scale_output);
             let optimal_slippage = min_slippage.clone()
@@ -436,6 +569,77 @@ pub async fn get_slippage(
             BigDecimal::from_f64(0.0001).unwrap(),
             BigDecimal::from_f64(0.9999).unwrap(),
         ),
+    }
+}
+
+fn token_volatility_scale(token_info: &TokenInfo, current_block_height: u64) -> BigDecimal {
+    if token_info.created_at > current_block_height.saturating_sub(100) {
+        BigDecimal::from(1)
+    } else if token_info.created_at > current_block_height.saturating_sub(1000) {
+        BigDecimal::from_f64(0.6).unwrap()
+    } else {
+        let mut scale = BigDecimal::from(0);
+
+        if !token_info.price_usd_raw.is_zero() {
+            let price_change_24h =
+                (token_info.price_usd_raw_24h_ago.clone() - token_info.price_usd_raw.clone()).abs();
+            let price_change_24h_relative = price_change_24h / token_info.price_usd_raw.clone();
+
+            if price_change_24h_relative > BigDecimal::from_f64(0.5).unwrap() {
+                scale += BigDecimal::from_f64(0.1).unwrap();
+            }
+            if price_change_24h_relative > BigDecimal::from_f64(0.2).unwrap() {
+                scale += BigDecimal::from_f64(0.05).unwrap();
+            }
+
+            let market_cap =
+                BigDecimal::from(token_info.circulating_supply) * token_info.price_usd_raw.clone();
+            if !market_cap.is_zero() {
+                let volume_to_mcap_ratio = token_info.volume_usd_24h.clone() / market_cap;
+                if volume_to_mcap_ratio > 1 {
+                    scale += BigDecimal::from_f64(0.1).unwrap();
+                }
+                if volume_to_mcap_ratio > BigDecimal::from_f64(0.2).unwrap() {
+                    scale += BigDecimal::from_f64(0.05).unwrap();
+                }
+            }
+        }
+
+        if !token_info.liquidity_usd.is_zero() {
+            let volume_to_liquidity_ratio =
+                token_info.volume_usd_24h.clone() / token_info.liquidity_usd.clone();
+            if volume_to_liquidity_ratio > 1 {
+                scale += BigDecimal::from_f64(0.15).unwrap();
+            }
+            if volume_to_liquidity_ratio > BigDecimal::from_f64(0.5).unwrap() {
+                scale += BigDecimal::from_f64(0.1).unwrap();
+            }
+            if volume_to_liquidity_ratio > BigDecimal::from_f64(0.2).unwrap() {
+                scale += BigDecimal::from_f64(0.05).unwrap();
+            }
+        }
+
+        scale.clamp(BigDecimal::from(0), BigDecimal::from(1))
+    }
+}
+
+async fn slippage_scale_for_token(
+    network: &impl NetworkView,
+    tokens_result: &Result<HashMap<TokenId, TokenInfo>, String>,
+    token_id: &TokenId,
+) -> BigDecimal {
+    match tokens_result {
+        Ok(tokens) => {
+            if let Some(token_info) = tokens.get(token_id) {
+                match network.current_block_height().await {
+                    Ok(height) => token_volatility_scale(token_info, height),
+                    Err(_) => BigDecimal::from_f64(0.005).unwrap(),
+                }
+            } else {
+                BigDecimal::from_f64(0.8).unwrap()
+            }
+        }
+        Err(_) => BigDecimal::from_f64(0.005).unwrap(),
     }
 }
 
@@ -491,7 +695,7 @@ pub async fn get_all_tokens() -> Result<HashMap<TokenId, TokenInfo>, String> {
 }
 
 #[cached(time = 1, result = true)]
-pub async fn get_current_block_height() -> Result<u64, String> {
+pub async fn get_current_block_height() -> Result<BlockHeight, String> {
     let Ok(response) = RPC_CLIENT
         .block(BlockReference::Finality(Finality::None))
         .await
@@ -683,12 +887,13 @@ pub async fn convert_to_native(
 }
 
 pub async fn deposit_storage_on_contract_if_needed(
+    network: &impl NetworkView,
     contract_id: &AccountIdRef,
     trader_account_id: impl Into<Option<AccountId>>,
     amount: NearToken,
 ) -> Vec<ExecutionInstruction> {
     if let Some(trader_account_id) = trader_account_id.into() {
-        if needs_storage_deposit_for_contract(&trader_account_id, contract_id).await {
+        if needs_storage_deposit_for_contract(network, &trader_account_id, contract_id).await {
             return vec![ExecutionInstruction::NearTransaction {
                 receiver_id: contract_id.to_owned(),
                 actions: vec![create_storage_deposit_action_for_contract(amount)],
@@ -699,12 +904,12 @@ pub async fn deposit_storage_on_contract_if_needed(
 }
 
 pub async fn deposit_storage_if_needed(
+    network: &impl NetworkView,
     token_id: &TokenId,
     trader_account_id: impl Into<Option<AccountId>>,
 ) -> Vec<ExecutionInstruction> {
-    let trader_account_id = trader_account_id.into();
-    if let Some(trader_account_id) = trader_account_id {
-        if needs_storage_deposit(&trader_account_id, token_id).await {
+    if let Some(trader_account_id) = trader_account_id.into() {
+        if needs_storage_deposit(network, &trader_account_id, token_id).await {
             create_storage_deposit_action(token_id).await
         } else {
             vec![]
@@ -747,6 +952,7 @@ fn base_token(token_id: &TokenId) -> Option<BaseTokenId> {
 }
 
 pub async fn convert_to(
+    network: &impl NetworkView,
     from: &TokenId,
     to: &TokenId,
     amount: Balance,
@@ -790,8 +996,9 @@ pub async fn convert_to(
     let (register, deposit) = match to {
         TokenId::Nep141OnRhea(token_id) => (
             [
-                deposit_storage_if_needed(to, trader_account_id.clone()).await,
+                deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
                 create_ft_deposit_registrations(
+                    network,
                     &"v2.ref-finance.near".parse().unwrap(),
                     token_id,
                     trader_account_id.clone(),
@@ -809,8 +1016,9 @@ pub async fn convert_to(
         ),
         TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) => (
             [
-                deposit_storage_if_needed(to, trader_account_id.clone()).await,
+                deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
                 create_ft_deposit_registrations(
+                    network,
                     &"dex.intear.near".parse().unwrap(),
                     token_id,
                     trader_account_id.clone(),
@@ -827,7 +1035,7 @@ pub async fn convert_to(
             }],
         ),
         TokenId::TokenOnIntearDex(AssetId::Near) => (
-            deposit_storage_if_needed(to, trader_account_id.clone()).await,
+            deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: "dex.intear.near".parse().unwrap(),
                 actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -873,3 +1081,7 @@ pub async fn convert_to(
 
     [register, withdraw, convert, deposit].concat()
 }
+
+#[cfg(test)]
+#[path = "shared_utils_tests.rs"]
+mod tests;

@@ -12,7 +12,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::{
-    shared_utils::{convert_to, optimize_execution_instructions, TOKEN_PRICES},
+    shared_utils::{convert_to, optimize_execution_instructions, Mainnet, TOKEN_PRICES},
     types::{Amount, DexId, Route, Slippage, SwapRequest},
 };
 
@@ -164,6 +164,7 @@ async fn route_handler(
                 );
                 route.execution_instructions.extend(
                     convert_to(
+                        &Mainnet,
                         &route.token_output,
                         &request.token_out,
                         amount_out,

@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use crate::{
-    shared_utils::{convert_to_nep141, deposit_storage_if_needed},
+    shared_utils::{convert_to_nep141, deposit_storage_if_needed, Mainnet},
     Amount, DexId, Provider, Route, SwapRequest,
 };
 
@@ -32,6 +32,7 @@ impl Provider for WrapProvider {
                     },
                     dex_id: DexId::Wrap,
                     execution_instructions: deposit_storage_if_needed(
+                        &Mainnet,
                         &request.token_out,
                         request.trader_account_id,
                     )

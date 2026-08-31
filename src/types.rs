@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::providers::intear_plach::AssetId;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Amount {
     AmountIn(#[serde(with = "dec_format")] Balance),
@@ -181,7 +181,7 @@ pub enum Slippage {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Route {
     /// The deadline for the route. If provided, you should refresh the route by
     /// calling the /route endpoint again 2-3 seconds before the deadline to account
@@ -214,7 +214,7 @@ pub struct Route {
     pub token_output: TokenId,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum ExecutionInstruction {
     /// Sign a transaction with the given actions and send it to the RPC.
     NearTransaction {
