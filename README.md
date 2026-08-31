@@ -35,13 +35,11 @@ Tokens can be passed as input parameters in this format:
 - `nep141:wrap.near`
 - `wrap.near` (if does not equal to `near`, it's an alias to `nep141:<string>`)
 - `rhea-nep141:wrap.near`
+- `intear-dex:<asset id>`, where the asset id is the one Intear DEX itself uses: `intear-dex:near`, `intear-dex:nep141:wrap.near`, `intear-dex:nep245:token.near:token-id`, `intear-dex:nep171:token.near:token-id`
 
 Upcoming variants (no timeline, just to show the vision):
-- `intear-nep141:wrap.near`
 - `nep245:token.near:token-id`
-- `intear-nep245:token.near:token-id`
 - `nep171:token.near:token-id`
-- `intear-nep171:token.near:token-id`
 
 Certain steps can be omitted to optimize transaction count & speed. For example, [Bettear Bot](https://t.me/bettearbot) stores all user tokens in `rhea-nep141:` inner balances, so swaps could be just a single `swap` transaction and 1 receipt instead of `ft_transfer_call` the input token + `ft_on_transfer` on rhea + `ft_transfer` the output token.
 

@@ -9,6 +9,8 @@ use near_min_api::{
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
+use crate::providers::intear_plach::AssetId;
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum Amount {
@@ -21,16 +23,7 @@ pub enum TokenId {
     Near,
     Nep141(AccountId),
     Nep141OnRhea(AccountId),
-}
-
-impl TokenId {
-    pub fn get_account_id(&self) -> AccountId {
-        match self {
-            TokenId::Near => "wrap.near".parse().unwrap(),
-            TokenId::Nep141(account_id) => account_id.to_owned(),
-            TokenId::Nep141OnRhea(account_id) => account_id.to_owned(),
-        }
-    }
+    TokenOnIntearDex(AssetId),
 }
 
 impl Serialize for TokenId {
@@ -42,6 +35,7 @@ impl Serialize for TokenId {
             TokenId::Near => "near".to_string(),
             TokenId::Nep141(account_id) => format!("nep141:{account_id}"),
             TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
+            TokenId::TokenOnIntearDex(asset_id) => format!("intear-dex:{asset_id}"),
         }
         .serialize(serializer)
     }
@@ -67,6 +61,10 @@ impl FromStr for TokenId {
             Ok(TokenId::Nep141OnRhea(
                 account_id.parse().map_err(|_| "Invalid token ID")?,
             ))
+        } else if let Some(asset_id) = s.strip_prefix("intear-dex:") {
+            Ok(TokenId::TokenOnIntearDex(asset_id.parse().map_err(
+                |e| format!("Failed to parse intear-dex asset: {e}"),
+            )?))
         } else if let Some(account_id) = s.strip_prefix("nep141:") {
             Ok(TokenId::Nep141(
                 account_id.parse().map_err(|_| "Invalid token ID")?,

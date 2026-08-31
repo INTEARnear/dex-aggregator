@@ -108,7 +108,6 @@ impl<'de> Deserialize<'de> for AssetId {
 #[derive(BorshSerialize, Serialize, Clone, Debug)]
 enum SwapRequestAmount {
     ExactIn(U128),
-    #[allow(dead_code)]
     ExactOut(U128),
 }
 
@@ -226,6 +225,7 @@ impl Provider for IntearPlachProvider {
                 get_slippage(request.slippage, &request.token_in, &request.token_out).await;
 
             let (_, token_in) = match &request.token_in {
+                TokenId::TokenOnIntearDex(asset_id) => (Vec::new(), asset_id.clone()),
                 t if is_near(t) => (
                     convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
                     AssetId::Near,
@@ -235,6 +235,7 @@ impl Provider for IntearPlachProvider {
                     .map(|(v, t)| (v, AssetId::Nep141(t)))?,
             };
             let (_, token_out) = match &request.token_out {
+                TokenId::TokenOnIntearDex(asset_id) => (Vec::new(), asset_id.clone()),
                 t if is_near(t) => (
                     convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
                     AssetId::Near,
@@ -354,26 +355,55 @@ impl Provider for IntearPlachProvider {
                 }
             };
 
+            let use_fast_path = matches!(request.token_in, TokenId::TokenOnIntearDex(_));
+
             let mut operations = swaps;
-            operations.push(Operation::Withdraw {
-                asset_id: token_out.clone(),
-                amount: WithdrawAmount::Full {
-                    at_least: Some(match request.amount {
-                        Amount::AmountIn(_) => U128::from(total_min_amount_out),
-                        Amount::AmountOut(amount_out) => U128::from(amount_out),
-                    }),
-                },
-                to: None,
-                rescue_address: None,
-            });
-            if matches!(request.amount, Amount::AmountOut(_)) {
+            let output_withdrawn = if use_fast_path {
+                // Unlike the deposit paths, `execute_operations` reads `Full` from the
+                // trader's whole inner balance, which would also sweep tokens they held
+                // before the swap. So the output is only withdrawn when its amount can
+                // be named exactly, and otherwise left on the DEX for the caller to
+                // convert once the received amount is known.
+                let exact_output = match request.amount {
+                    Amount::AmountOut(amount_out) => {
+                        Some(WithdrawAmount::Exact(U128::from(amount_out)))
+                    }
+                    Amount::AmountIn(_) => None,
+                };
+                match exact_output {
+                    Some(amount) if !matches!(request.token_out, TokenId::TokenOnIntearDex(_)) => {
+                        operations.push(Operation::Withdraw {
+                            asset_id: token_out.clone(),
+                            amount,
+                            to: None,
+                            rescue_address: None,
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
                 operations.push(Operation::Withdraw {
-                    asset_id: token_in.clone(),
-                    amount: WithdrawAmount::Full { at_least: None },
+                    asset_id: token_out.clone(),
+                    amount: WithdrawAmount::Full {
+                        at_least: Some(match request.amount {
+                            Amount::AmountIn(_) => U128::from(total_min_amount_out),
+                            Amount::AmountOut(amount_out) => U128::from(amount_out),
+                        }),
+                    },
                     to: None,
                     rescue_address: None,
                 });
-            }
+                if matches!(request.amount, Amount::AmountOut(_)) {
+                    operations.push(Operation::Withdraw {
+                        asset_id: token_in.clone(),
+                        amount: WithdrawAmount::Full { at_least: None },
+                        to: None,
+                        rescue_address: None,
+                    });
+                }
+                true
+            };
 
             let both_registered =
                 if let Some(trader_account_id) = request.trader_account_id.as_ref() {
@@ -424,105 +454,123 @@ impl Provider for IntearPlachProvider {
                 Amount::AmountOut(_) => total_max_amount_in,
             };
 
-            let transactions = match token_in {
-                AssetId::Near => {
-                    let input_to_native = convert_to_native(
-                        &request.token_in,
-                        request.trader_account_id.clone(),
-                        NearToken::from_yoctonear(input_amount),
-                    )
-                    .await?;
-                    let deposit_near_action = Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "deposit_near".to_string(),
+            let transactions = if use_fast_path {
+                let execute_operations_action =
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "execute_operations".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({
-                            "operations": {
-                                "operations": operations,
-                                "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
-                            },
+                            "operations": operations,
+                            "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                         }))
                         .unwrap(),
                         gas: Gas(NearGas::from_tgas(280)),
-                        deposit: NearToken::from_yoctonear(input_amount),
+                        deposit: NearToken::from_yoctonear(1),
                     }));
-                    let swap_transactions = vec![ExecutionInstruction::NearTransaction {
-                        receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![deposit_near_action],
-                    }];
-                    [
-                        deposit_storage_if_needed(
-                            &match &token_out {
-                                AssetId::Near => TokenId::Near,
-                                AssetId::Nep141(token_out_id) => {
-                                    TokenId::Nep141(token_out_id.clone())
-                                }
-                                AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
-                            },
+                vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+                    actions: vec![execute_operations_action],
+                }]
+            } else {
+                match token_in {
+                    AssetId::Near => {
+                        let input_to_native = convert_to_native(
+                            &request.token_in,
                             request.trader_account_id.clone(),
+                            NearToken::from_yoctonear(input_amount),
                         )
-                        .await,
-                        deposit_storage_if_needed(
-                            &TokenId::Near,
-                            request.trader_account_id.clone(),
-                        )
-                        .await,
-                        input_to_native,
-                        swap_transactions,
-                    ]
-                    .concat()
-                }
-                AssetId::Nep141(token_in_id) => {
-                    let ft_transfer_call_swap_action =
-                        Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
+                        .await?;
+                        let deposit_near_action = Action::FunctionCall(Box::new(FunctionCallAction {
+                            method_name: "deposit_near".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": INTEAR_DEX_CONTRACT_ID,
-                                "amount": input_amount.to_string(),
-                                "msg": serde_json::to_string(&serde_json::json!({
+                                "operations": {
                                     "operations": operations,
                                     "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
-                                })).unwrap(),
+                                },
                             }))
                             .unwrap(),
                             gas: Gas(NearGas::from_tgas(280)),
-                            deposit: NearToken::from_yoctonear(1),
+                            deposit: NearToken::from_yoctonear(input_amount),
                         }));
-                    let swap_transactions = vec![ExecutionInstruction::NearTransaction {
-                        receiver_id: token_in_id.clone(),
-                        actions: vec![ft_transfer_call_swap_action],
-                    }];
+                        let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+                            actions: vec![deposit_near_action],
+                        }];
+                        [
+                            deposit_storage_if_needed(
+                                &match &token_out {
+                                    AssetId::Near => TokenId::Near,
+                                    AssetId::Nep141(token_out_id) => {
+                                        TokenId::Nep141(token_out_id.clone())
+                                    }
+                                    AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
+                                },
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            deposit_storage_if_needed(
+                                &TokenId::Near,
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            input_to_native,
+                            swap_transactions,
+                        ]
+                        .concat()
+                    }
+                    AssetId::Nep141(token_in_id) => {
+                        let ft_transfer_call_swap_action =
+                            Action::FunctionCall(Box::new(FunctionCallAction {
+                                method_name: "ft_transfer_call".to_string(),
+                                args: serde_json::to_vec(&serde_json::json!({
+                                    "receiver_id": INTEAR_DEX_CONTRACT_ID,
+                                    "amount": input_amount.to_string(),
+                                    "msg": serde_json::to_string(&serde_json::json!({
+                                        "operations": operations,
+                                        "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                                    })).unwrap(),
+                                }))
+                                .unwrap(),
+                                gas: Gas(NearGas::from_tgas(280)),
+                                deposit: NearToken::from_yoctonear(1),
+                            }));
+                        let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+                            receiver_id: token_in_id.clone(),
+                            actions: vec![ft_transfer_call_swap_action],
+                        }];
 
-                    let (input_to_nep141, input_nep141) = convert_to_nep141(
-                        &request.token_in,
-                        request.trader_account_id.clone(),
-                        input_amount,
-                    )
-                    .await?;
-                    assert_eq!(token_in_id, input_nep141);
+                        let (input_to_nep141, input_nep141) = convert_to_nep141(
+                            &request.token_in,
+                            request.trader_account_id.clone(),
+                            input_amount,
+                        )
+                        .await?;
+                        assert_eq!(token_in_id, input_nep141);
 
-                    [
-                        deposit_storage_if_needed(
-                            &match &token_out {
-                                AssetId::Near => TokenId::Near,
-                                AssetId::Nep141(token_out_id) => {
-                                    TokenId::Nep141(token_out_id.clone())
-                                }
-                                AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
-                            },
-                            request.trader_account_id.clone(),
-                        )
-                        .await,
-                        deposit_storage_if_needed(
-                            &TokenId::Nep141(input_nep141),
-                            request.trader_account_id.clone(),
-                        )
-                        .await,
-                        input_to_nep141,
-                        swap_transactions,
-                    ]
-                    .concat()
-                }
-                AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => {
-                    unreachable!()
+                        [
+                            deposit_storage_if_needed(
+                                &match &token_out {
+                                    AssetId::Near => TokenId::Near,
+                                    AssetId::Nep141(token_out_id) => {
+                                        TokenId::Nep141(token_out_id.clone())
+                                    }
+                                    AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
+                                },
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            deposit_storage_if_needed(
+                                &TokenId::Nep141(input_nep141),
+                                request.trader_account_id.clone(),
+                            )
+                            .await,
+                            input_to_nep141,
+                            swap_transactions,
+                        ]
+                        .concat()
+                    }
+                    AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => {
+                        unreachable!()
+                    }
                 }
             };
 
@@ -534,10 +582,14 @@ impl Provider for IntearPlachProvider {
                 worst_case_amount,
                 execution_instructions: [registration_transactions, transactions].concat(),
                 deprecated_needs_unwrap_always_false: false,
-                token_output: match token_out {
-                    AssetId::Near => TokenId::Near,
-                    AssetId::Nep141(token_out_id) => TokenId::Nep141(token_out_id.clone()),
-                    AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
+                token_output: if output_withdrawn {
+                    match token_out {
+                        AssetId::Near => TokenId::Near,
+                        AssetId::Nep141(token_out_id) => TokenId::Nep141(token_out_id.clone()),
+                        AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
+                    }
+                } else {
+                    TokenId::TokenOnIntearDex(token_out)
                 },
             })
         })

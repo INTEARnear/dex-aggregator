@@ -165,7 +165,7 @@ async fn route_handler(
                 route.execution_instructions.extend(
                     convert_to(
                         &route.token_output,
-                        request.token_out.location(),
+                        &request.token_out,
                         amount_out,
                         request.trader_account_id.clone(),
                     )
