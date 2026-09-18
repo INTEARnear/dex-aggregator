@@ -963,7 +963,7 @@ impl<'a> SplitRoute<'a> {
                     );
                 }
 
-                for (step, amount_part) in self.steps.iter().zip(amount_parts.into_iter()) {
+                for (step, amount_part) in self.steps.iter().zip(amount_parts) {
                     let estimated_out = step.route.emulate_swap_exact_in(
                         token_in,
                         token_out,

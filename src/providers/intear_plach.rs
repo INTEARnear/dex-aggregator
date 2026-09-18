@@ -363,7 +363,6 @@ async fn route(
                 routes,
                 amount_in,
                 max_amount_in,
-                amount_out: _,
                 ..
             } => {
                 if routes.is_empty() {

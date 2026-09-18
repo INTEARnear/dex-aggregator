@@ -119,7 +119,7 @@ pub trait NetworkView: Send + Sync {
         &self,
         contract_id: AccountId,
         account_id: &AccountId,
-    ) -> impl Future<Output = Result<StorageDeposit, String>> + Send;
+    ) -> impl Future<Output = Result<Option<StorageDeposit>, String>> + Send;
 
     fn is_rhea_token_registered(
         &self,
@@ -152,9 +152,9 @@ impl NetworkView for Mainnet {
         &self,
         contract_id: AccountId,
         account_id: &AccountId,
-    ) -> Result<StorageDeposit, String> {
+    ) -> Result<Option<StorageDeposit>, String> {
         RPC_CLIENT
-            .call::<StorageDeposit>(
+            .call::<Option<StorageDeposit>>(
                 contract_id,
                 "storage_balance_of",
                 serde_json::json!({
@@ -321,11 +321,11 @@ impl NetworkView for TestNetworkView {
         &self,
         contract_id: AccountId,
         account_id: &AccountId,
-    ) -> Result<StorageDeposit, String> {
-        self.storage_balances
+    ) -> Result<Option<StorageDeposit>, String> {
+        Ok(self
+            .storage_balances
             .get(&(contract_id, account_id.clone()))
-            .cloned()
-            .ok_or_else(|| "storage_balance not configured".to_string())
+            .cloned())
     }
 
     async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
@@ -404,8 +404,10 @@ pub async fn needs_storage_deposit(
             let has_storage_deposit = network
                 .storage_balance("v2.ref-finance.near".parse().unwrap(), account_id)
                 .await
+                .ok()
+                .flatten()
                 .map(|s| s.available > NearToken::from_millinear(10))
-                .unwrap_or_default();
+                .unwrap_or(false);
             !has_storage_deposit || !is_registered
         }
         TokenId::TokenOnIntearDex(asset_id) => {
@@ -415,8 +417,10 @@ pub async fn needs_storage_deposit(
             let has_storage_deposit = network
                 .storage_balance("dex.intear.near".parse().unwrap(), account_id)
                 .await
+                .ok()
+                .flatten()
                 .map(|s| s.available > NearToken::from_millinear(1))
-                .unwrap_or_default();
+                .unwrap_or(false);
             !has_storage_deposit || !is_registered
         }
     }
@@ -427,7 +431,7 @@ pub async fn needs_storage_deposit_for_contract(
     account_id: &AccountId,
     contract_id: &AccountIdRef,
 ) -> bool {
-    let Ok(storage_deposit) = network
+    let Ok(Some(storage_deposit)) = network
         .storage_balance(contract_id.to_owned(), account_id)
         .await
     else {

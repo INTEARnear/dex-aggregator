@@ -12,7 +12,7 @@ use near_min_api::utils::dec_format;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
-use std::panic::AssertUnwindSafe;
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -172,30 +172,34 @@ impl PoolDetailInfo {
         token_out: &AccountIdRef,
         amount_in: Balance,
     ) -> Result<Balance, anyhow::Error> {
-        let self_before_modifications = self.clone();
-        let unwind_safe_self = AssertUnwindSafe(&mut *self);
-        let result = std::panic::catch_unwind(move || match unwind_safe_self {
-            AssertUnwindSafe(PoolDetailInfo::SimplePoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
-            AssertUnwindSafe(PoolDetailInfo::StablePoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
-            AssertUnwindSafe(PoolDetailInfo::RatedPoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
-            AssertUnwindSafe(PoolDetailInfo::DegenPoolInfo(info)) => {
-                info.emulate_swap(token_in, token_out, amount_in)
-            }
+        let mut updated = self.clone();
+        let result = std::panic::catch_unwind(move || {
+            let swap_result = match &mut updated {
+                PoolDetailInfo::SimplePoolInfo(info) => {
+                    info.emulate_swap(token_in, token_out, amount_in)
+                }
+                PoolDetailInfo::StablePoolInfo(info) => {
+                    info.emulate_swap(token_in, token_out, amount_in)
+                }
+                PoolDetailInfo::RatedPoolInfo(info) => {
+                    info.emulate_swap(token_in, token_out, amount_in)
+                }
+                PoolDetailInfo::DegenPoolInfo(info) => {
+                    info.emulate_swap(token_in, token_out, amount_in)
+                }
+            };
+            (swap_result, updated)
         });
         match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => {
+            Ok((Ok(result), updated)) => {
+                *self = updated;
+                Ok(result)
+            }
+            Ok((Err(e), _)) => {
                 // println!("Error emulating swap {amount_in} {token_in} -> {token_out}: {e:?}");
                 Err(e)
             }
             Err(e) => {
-                *self = self_before_modifications;
                 warn!(
                     "Panicked while emulating swap {} -> {}",
                     token_in, token_out
@@ -648,7 +652,7 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
 
     let pools_vec: Vec<Pool> = pools
         .into_iter()
-        .zip(detail_infos.into_iter())
+        .zip(detail_infos)
         .enumerate()
         .map(|(i, (info, detail))| Pool {
             id: i as u64,
