@@ -869,7 +869,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -964,7 +964,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1063,7 +1063,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1243,7 +1243,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1341,7 +1341,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1447,7 +1447,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
+                            "0.00125 NEAR".parse().unwrap(),true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {

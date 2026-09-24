@@ -370,6 +370,7 @@ async fn create_ft_deposit_registrations(
         if needs_storage_deposit_for_contract(network, &trader_account_id, token_id).await {
             actions.push(create_storage_deposit_action_for_contract(
                 "0.00125 NEAR".parse().unwrap(),
+                true,
             ));
         }
     }
@@ -377,6 +378,7 @@ async fn create_ft_deposit_registrations(
         actions.push(create_storage_deposit_action_for_someone(
             "0.00125 NEAR".parse().unwrap(),
             contract_id,
+            true,
         ));
     }
     if actions.is_empty() {
@@ -446,6 +448,7 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionI
             receiver_id: token_account_id.clone(),
             actions: vec![create_storage_deposit_action_for_contract(
                 "0.00125 NEAR".parse().unwrap(),
+                true,
             )],
         }],
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
@@ -453,7 +456,10 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionI
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: "v2.ref-finance.near".parse().unwrap(),
                 actions: vec![
-                    create_storage_deposit_action_for_contract(NearToken::from_millinear(10)),
+                    create_storage_deposit_action_for_contract(
+                        NearToken::from_millinear(10),
+                        false,
+                    ),
                     Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "register_tokens".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({
@@ -491,11 +497,14 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionI
     }
 }
 
-pub fn create_storage_deposit_action_for_contract(amount: NearToken) -> Action {
+pub fn create_storage_deposit_action_for_contract(
+    amount: NearToken,
+    registration_only: bool,
+) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "storage_deposit".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
-            "registration_only": true,
+            "registration_only": registration_only,
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(10)),
@@ -506,11 +515,12 @@ pub fn create_storage_deposit_action_for_contract(amount: NearToken) -> Action {
 pub fn create_storage_deposit_action_for_someone(
     amount: NearToken,
     account_id: &AccountId,
+    registration_only: bool,
 ) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "storage_deposit".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
-            "registration_only": true,
+            "registration_only": registration_only,
             "account_id": account_id,
         }))
         .unwrap(),
@@ -900,7 +910,7 @@ pub async fn deposit_storage_on_contract_if_needed(
         if needs_storage_deposit_for_contract(network, &trader_account_id, contract_id).await {
             return vec![ExecutionInstruction::NearTransaction {
                 receiver_id: contract_id.to_owned(),
-                actions: vec![create_storage_deposit_action_for_contract(amount)],
+                actions: vec![create_storage_deposit_action_for_contract(amount, true)],
             }];
         }
     }

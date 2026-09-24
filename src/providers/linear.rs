@@ -210,6 +210,7 @@ mod tests {
                         receiver_id: LINEAR_CONTRACT.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -264,6 +265,7 @@ mod tests {
                         receiver_id: LINEAR_CONTRACT.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -322,6 +324,7 @@ mod tests {
                         receiver_id: LINEAR_CONTRACT.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -376,6 +379,7 @@ mod tests {
                         receiver_id: LINEAR_CONTRACT.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -426,6 +430,7 @@ mod tests {
                         receiver_id: LINEAR_CONTRACT.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {

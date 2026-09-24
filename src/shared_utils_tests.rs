@@ -204,8 +204,8 @@ fn create_rhea_and_intear_nep141_deposit_actions_match_ft_transfer_call_shape() 
 #[test]
 fn create_storage_deposit_action_for_contract_and_someone() {
     let amount = NearToken::from_millinear(1250);
-    let for_self = create_storage_deposit_action_for_contract(amount);
-    let for_someone = create_storage_deposit_action_for_someone(amount, &account("bob.near"));
+    let for_self = create_storage_deposit_action_for_contract(amount, true);
+    let for_someone = create_storage_deposit_action_for_someone(amount, &account("bob.near"), true);
 
     let self_call = function_call_from_action(&for_self);
     assert_eq!(self_call.method_name, "storage_deposit");
@@ -237,6 +237,7 @@ async fn create_storage_deposit_action_nep141() {
         "ft",
         &[create_storage_deposit_action_for_contract(
             "0.00125 NEAR".parse().unwrap(),
+            true,
         )],
     );
 }
@@ -250,7 +251,7 @@ async fn create_storage_deposit_action_rhea() {
     assert_eq!(actions.len(), 2);
     assert_eq!(
         actions[0],
-        create_storage_deposit_action_for_contract(NearToken::from_millinear(10))
+        create_storage_deposit_action_for_contract(NearToken::from_millinear(10), false)
     );
     let register = function_call_from_action(&actions[1]);
     assert_eq!(register.method_name, "register_tokens");
@@ -819,6 +820,7 @@ async fn create_ft_deposit_registrations_covers_trader_contract_both_and_neither
         "ft",
         &[create_storage_deposit_action_for_contract(
             "0.00125 NEAR".parse().unwrap(),
+            true,
         )],
     );
 
@@ -838,6 +840,7 @@ async fn create_ft_deposit_registrations_covers_trader_contract_both_and_neither
         &[create_storage_deposit_action_for_someone(
             "0.00125 NEAR".parse().unwrap(),
             &contract_id,
+            true,
         )],
     );
 
@@ -849,10 +852,11 @@ async fn create_ft_deposit_registrations_covers_trader_contract_both_and_neither
         &instructions[0],
         "ft",
         &[
-            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap()),
+            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap(), true),
             create_storage_deposit_action_for_someone(
                 "0.00125 NEAR".parse().unwrap(),
                 &contract_id,
+                true,
             ),
         ],
     );
@@ -868,6 +872,7 @@ async fn create_ft_deposit_registrations_covers_trader_contract_both_and_neither
         &[create_storage_deposit_action_for_someone(
             "0.00125 NEAR".parse().unwrap(),
             &contract_id,
+            true,
         )],
     );
 }
@@ -901,6 +906,7 @@ async fn deposit_storage_if_needed_with_trader_depends_on_existing_deposit() {
         "ft",
         &[create_storage_deposit_action_for_contract(
             "0.00125 NEAR".parse().unwrap(),
+            true,
         )],
     );
 }
@@ -943,7 +949,7 @@ async fn deposit_storage_on_contract_if_needed_with_trader() {
     assert_near_tx(
         &instructions[0],
         "ft",
-        &[create_storage_deposit_action_for_contract(amount)],
+        &[create_storage_deposit_action_for_contract(amount, true)],
     );
 }
 
@@ -1047,6 +1053,7 @@ async fn convert_to_rhea_destination_without_trader_registers_contract_then_depo
         &[create_storage_deposit_action_for_someone(
             "0.00125 NEAR".parse().unwrap(),
             &account("v2.ref-finance.near"),
+            true,
         )],
     );
     assert_near_tx(
@@ -1100,7 +1107,7 @@ async fn convert_to_rhea_destination_with_trader_includes_rhea_and_ft_storage() 
     assert_eq!(rhea_actions.len(), 2);
     assert_eq!(
         rhea_actions[0],
-        create_storage_deposit_action_for_contract(NearToken::from_millinear(10))
+        create_storage_deposit_action_for_contract(NearToken::from_millinear(10), false)
     );
     assert_eq!(
         function_call_from_action(&rhea_actions[1]).method_name,
@@ -1111,10 +1118,11 @@ async fn convert_to_rhea_destination_with_trader_includes_rhea_and_ft_storage() 
         &instructions[1],
         "ft",
         &[
-            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap()),
+            create_storage_deposit_action_for_contract("0.00125 NEAR".parse().unwrap(), true),
             create_storage_deposit_action_for_someone(
                 "0.00125 NEAR".parse().unwrap(),
                 &account("v2.ref-finance.near"),
+                true,
             ),
         ],
     );

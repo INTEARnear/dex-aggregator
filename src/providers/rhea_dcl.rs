@@ -474,18 +474,21 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -553,18 +556,21 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -628,18 +634,21 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -711,18 +720,21 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -794,14 +806,16 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "v2.ref-finance.near".parse().unwrap(),
                         actions: vec![
-                            create_storage_deposit_action_for_contract(NearToken::from_millinear(
-                                10
-                            )),
+                            create_storage_deposit_action_for_contract(
+                                NearToken::from_millinear(10),
+                                false,
+                            ),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_tokens".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
@@ -817,6 +831,7 @@ mod tests {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -888,12 +903,14 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -957,12 +974,14 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1034,14 +1053,16 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "v2.ref-finance.near".parse().unwrap(),
                         actions: vec![
-                            create_storage_deposit_action_for_contract(NearToken::from_millinear(
-                                10
-                            )),
+                            create_storage_deposit_action_for_contract(
+                                NearToken::from_millinear(10),
+                                false
+                            ),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_tokens".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
@@ -1057,6 +1078,7 @@ mod tests {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1120,18 +1142,21 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1199,12 +1224,14 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
+                            true
                         )],
                     },
                     ExecutionInstruction::NearTransaction {
