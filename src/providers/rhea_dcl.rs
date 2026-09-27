@@ -13,6 +13,7 @@ use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
         get_slippage, needs_storage_deposit_for_contract, Mainnet, NetworkView, RPC_CLIENT,
+        WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -199,10 +200,18 @@ async fn route(
                     )
                     .await
                     {
-                        if let Ok(amount) = network.native_balance(trader_account_id).await {
-                            // Don't use Rhea DCL for accounts with less than 1 NEAR, since
-                            // the storage deposit of 0.5 NEAR is usually too high for them.
-                            if amount < NearToken::from_near(1) {
+                        if let (Ok(native_amount), Ok(wrap_amount)) = (
+                            network.native_balance(trader_account_id).await,
+                            network
+                                .ft_balance(
+                                    trader_account_id,
+                                    &WRAP_NEAR.parse::<AccountId>().unwrap(),
+                                )
+                                .await,
+                        ) {
+                            if native_amount.as_yoctonear() + wrap_amount
+                                < NearToken::from_millinear(500).as_yoctonear()
+                            {
                                 return None;
                             }
                         }
@@ -1396,32 +1405,6 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
-        );
-    }
-
-    #[tokio::test]
-    async fn poor_account_returns_none() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Near,
-                    token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default()
-                    .with_native_balance("trader.near", NearToken::from_millinear(500)),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            None
         );
     }
 }

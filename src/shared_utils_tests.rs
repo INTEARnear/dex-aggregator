@@ -230,7 +230,7 @@ fn create_storage_deposit_action_for_contract_and_someone() {
 
 #[tokio::test]
 async fn create_storage_deposit_action_nep141() {
-    let instructions = create_storage_deposit_action(&ft()).await;
+    let instructions = create_storage_deposit_action(&TestNetworkView::default(), &ft()).await;
     assert_eq!(instructions.len(), 1);
     assert_near_tx(
         &instructions[0],
@@ -244,7 +244,7 @@ async fn create_storage_deposit_action_nep141() {
 
 #[tokio::test]
 async fn create_storage_deposit_action_rhea() {
-    let instructions = create_storage_deposit_action(&rhea_ft()).await;
+    let instructions = create_storage_deposit_action(&TestNetworkView::default(), &rhea_ft()).await;
     assert_eq!(instructions.len(), 1);
     let (receiver_id, actions) = near_tx(&instructions[0]);
     assert_eq!(receiver_id.as_str(), "v2.ref-finance.near");
@@ -265,7 +265,8 @@ async fn create_storage_deposit_action_rhea() {
 
 #[tokio::test]
 async fn create_storage_deposit_action_intear() {
-    let instructions = create_storage_deposit_action(&intear_ft()).await;
+    let instructions =
+        create_storage_deposit_action(&TestNetworkView::default(), &intear_ft()).await;
     assert_eq!(instructions.len(), 1);
     let (receiver_id, actions) = near_tx(&instructions[0]);
     assert_eq!(receiver_id.as_str(), "dex.intear.near");
@@ -290,7 +291,68 @@ async fn create_storage_deposit_action_intear() {
 #[tokio::test]
 #[should_panic(expected = "NEAR doesn't need a storage deposit")]
 async fn create_storage_deposit_action_panics_for_near() {
-    create_storage_deposit_action(&TokenId::Near).await;
+    create_storage_deposit_action(&TestNetworkView::default(), &TokenId::Near).await;
+}
+
+#[tokio::test]
+async fn token_storage_deposit_amount_uses_token_min_below_limit() {
+    let network = TestNetworkView::default()
+        .with_storage_balance_bounds("ft", "0.0025 NEAR".parse().unwrap());
+    assert_eq!(
+        token_storage_deposit_amount(&network, &account("ft")).await,
+        "0.0025 NEAR".parse().unwrap()
+    );
+
+    let instructions = create_storage_deposit_action(&network, &ft()).await;
+    assert_eq!(instructions.len(), 1);
+    assert_near_tx(
+        &instructions[0],
+        "ft",
+        &[create_storage_deposit_action_for_contract(
+            "0.0025 NEAR".parse().unwrap(),
+            true,
+        )],
+    );
+}
+
+#[tokio::test]
+async fn token_storage_deposit_amount_falls_back_at_or_above_limit() {
+    let at_limit =
+        TestNetworkView::default().with_storage_balance_bounds("ft", NearToken::from_millinear(10));
+    assert_eq!(
+        token_storage_deposit_amount(&at_limit, &account("ft")).await,
+        "0.00125 NEAR".parse().unwrap()
+    );
+
+    let above_limit =
+        TestNetworkView::default().with_storage_balance_bounds("ft", NearToken::from_near(1));
+    assert_eq!(
+        token_storage_deposit_amount(&above_limit, &account("ft")).await,
+        "0.00125 NEAR".parse().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn token_storage_deposit_amount_falls_back_on_query_error() {
+    assert_eq!(
+        token_storage_deposit_amount(&TestNetworkView::default(), &account("ft")).await,
+        "0.00125 NEAR".parse().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn create_token_storage_deposit_action_for_someone_uses_token_min() {
+    let network = TestNetworkView::default()
+        .with_storage_balance_bounds("ft", "0.0025 NEAR".parse().unwrap());
+    let contract_id = account("v2.ref-finance.near");
+    assert_eq!(
+        create_nep141_storage_deposit_action(&network, &account("ft"), Some(&contract_id)).await,
+        create_storage_deposit_action_for_someone(
+            "0.0025 NEAR".parse().unwrap(),
+            &contract_id,
+            true
+        )
+    );
 }
 
 #[test]
@@ -899,7 +961,7 @@ async fn deposit_storage_if_needed_with_trader_depends_on_existing_deposit() {
 
     let needs = TestNetworkView::default();
     let instructions = deposit_storage_if_needed(&needs, &ft(), Some(trader())).await;
-    let expected = create_storage_deposit_action(&ft()).await;
+    let expected = create_storage_deposit_action(&needs, &ft()).await;
     assert_eq!(instructions.len(), expected.len());
     assert_near_tx(
         &instructions[0],

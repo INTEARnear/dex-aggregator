@@ -6,7 +6,7 @@ use lazy_static::lazy_static;
 use near_min_api::{
     types::{
         AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, Finality,
-        FunctionCallAction, Gas, NearGas, NearToken,
+        FunctionCallAction, Gas, NearGas, NearToken, U128,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -114,12 +114,22 @@ pub struct StorageDeposit {
     total: NearToken,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageBalanceBounds {
+    min: NearToken,
+}
+
 pub trait NetworkView: Send + Sync {
     fn storage_balance(
         &self,
         contract_id: AccountId,
         account_id: &AccountId,
     ) -> impl Future<Output = Result<Option<StorageDeposit>, String>> + Send;
+
+    fn storage_balance_bounds(
+        &self,
+        contract_id: AccountId,
+    ) -> impl Future<Output = Result<StorageBalanceBounds, String>> + Send;
 
     fn is_rhea_token_registered(
         &self,
@@ -143,6 +153,12 @@ pub trait NetworkView: Send + Sync {
         &self,
         account_id: &AccountId,
     ) -> impl Future<Output = Result<NearToken, String>> + Send;
+
+    fn ft_balance(
+        &self,
+        account_id: &AccountId,
+        token_id: &AccountId,
+    ) -> impl Future<Output = Result<Balance, String>> + Send;
 }
 
 pub struct Mainnet;
@@ -165,6 +181,15 @@ impl NetworkView for Mainnet {
             .await
             .inspect_err(|err| println!("Error checking storage balance: {err:?}"))
             .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn storage_balance_bounds(
+        &self,
+        contract_id: AccountId,
+    ) -> Result<StorageBalanceBounds, String> {
+        get_storage_balance_bounds(contract_id)
+            .await
+            .inspect_err(|err| println!("Error checking storage balance bounds: {err:?}"))
     }
 
     async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
@@ -221,17 +246,39 @@ impl NetworkView for Mainnet {
             .inspect_err(|err| println!("Error getting native balance: {err:?}"))
             .map_err(|err| format!("{err:?}"))
     }
+
+    async fn ft_balance(
+        &self,
+        account_id: &AccountId,
+        token_id: &AccountId,
+    ) -> Result<Balance, String> {
+        RPC_CLIENT
+            .call::<U128>(
+                token_id.clone(),
+                "ft_balance_of",
+                serde_json::json!({
+                    "account_id": account_id,
+                }),
+                QueryFinality::Finality(Finality::None),
+            )
+            .await
+            .map(|balance| balance.0)
+            .inspect_err(|err| println!("Error getting ft balance: {err:?}"))
+            .map_err(|err| format!("{err:?}"))
+    }
 }
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestNetworkView {
     storage_balances: HashMap<(AccountId, AccountId), StorageDeposit>,
+    storage_balance_bounds: HashMap<AccountId, StorageBalanceBounds>,
     rhea_token_registers: HashMap<(AccountId, AccountId), bool>,
     intear_asset_registers: HashMap<(AccountId, AssetId), bool>,
     tokens: Result<HashMap<TokenId, TokenInfo>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
+    ft_balances: HashMap<(AccountId, AccountId), Balance>,
 }
 
 #[cfg(test)]
@@ -239,11 +286,13 @@ impl Default for TestNetworkView {
     fn default() -> Self {
         Self {
             storage_balances: HashMap::new(),
+            storage_balance_bounds: HashMap::new(),
             rhea_token_registers: HashMap::new(),
             intear_asset_registers: HashMap::new(),
             tokens: Ok(HashMap::new()),
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
+            ft_balances: HashMap::new(),
         }
     }
 }
@@ -261,6 +310,12 @@ impl TestNetworkView {
             (contract_id.parse().unwrap(), account_id.parse().unwrap()),
             StorageDeposit { total, available },
         );
+        self
+    }
+
+    pub(crate) fn with_storage_balance_bounds(mut self, contract_id: &str, min: NearToken) -> Self {
+        self.storage_balance_bounds
+            .insert(contract_id.parse().unwrap(), StorageBalanceBounds { min });
         self
     }
 
@@ -328,6 +383,16 @@ impl NetworkView for TestNetworkView {
             .cloned())
     }
 
+    async fn storage_balance_bounds(
+        &self,
+        contract_id: AccountId,
+    ) -> Result<StorageBalanceBounds, String> {
+        self.storage_balance_bounds
+            .get(&contract_id)
+            .cloned()
+            .ok_or_else(|| "Failed to get storage balance bounds".to_string())
+    }
+
     async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
         self.rhea_token_registers
             .get(&(account_id.clone(), token_id.clone()))
@@ -357,6 +422,18 @@ impl NetworkView for TestNetworkView {
             .copied()
             .unwrap_or(NearToken::from_near(10)))
     }
+
+    async fn ft_balance(
+        &self,
+        account_id: &AccountId,
+        token_id: &AccountId,
+    ) -> Result<Balance, String> {
+        Ok(self
+            .ft_balances
+            .get(&(account_id.clone(), token_id.clone()))
+            .copied()
+            .unwrap_or(Balance::zero()))
+    }
 }
 
 async fn create_ft_deposit_registrations(
@@ -368,18 +445,12 @@ async fn create_ft_deposit_registrations(
     let mut actions = vec![];
     if let Some(trader_account_id) = trader_account_id {
         if needs_storage_deposit_for_contract(network, &trader_account_id, token_id).await {
-            actions.push(create_storage_deposit_action_for_contract(
-                "0.00125 NEAR".parse().unwrap(),
-                true,
-            ));
+            actions.push(create_nep141_storage_deposit_action(network, token_id, None).await);
         }
     }
     if needs_storage_deposit_for_contract(network, contract_id, token_id).await {
-        actions.push(create_storage_deposit_action_for_someone(
-            "0.00125 NEAR".parse().unwrap(),
-            contract_id,
-            true,
-        ));
+        actions
+            .push(create_nep141_storage_deposit_action(network, token_id, Some(contract_id)).await);
     }
     if actions.is_empty() {
         vec![]
@@ -442,14 +513,16 @@ pub async fn needs_storage_deposit_for_contract(
     storage_deposit.total.is_zero()
 }
 
-pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionInstruction> {
+pub async fn create_storage_deposit_action(
+    network: &impl NetworkView,
+    token_id: &TokenId,
+) -> Vec<ExecutionInstruction> {
     match token_id {
         TokenId::Nep141(token_account_id) => vec![ExecutionInstruction::NearTransaction {
             receiver_id: token_account_id.clone(),
-            actions: vec![create_storage_deposit_action_for_contract(
-                "0.00125 NEAR".parse().unwrap(),
-                true,
-            )],
+            actions: vec![
+                create_nep141_storage_deposit_action(network, token_account_id, None).await,
+            ],
         }],
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
         TokenId::Nep141OnRhea(token_id) => {
@@ -494,6 +567,31 @@ pub async fn create_storage_deposit_action(token_id: &TokenId) -> Vec<ExecutionI
                 ],
             }]
         }
+    }
+}
+
+const DEFAULT_TOKEN_STORAGE_DEPOSIT: NearToken = NearToken::from_micronear(1250); // 0.00125 NEAR
+const MAX_TOKEN_STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10); // 0.01 NEAR
+
+pub async fn token_storage_deposit_amount(
+    network: &impl NetworkView,
+    token_id: &AccountIdRef,
+) -> NearToken {
+    match network.storage_balance_bounds(token_id.to_owned()).await {
+        Ok(bounds) if bounds.min < MAX_TOKEN_STORAGE_DEPOSIT => bounds.min,
+        _ => DEFAULT_TOKEN_STORAGE_DEPOSIT,
+    }
+}
+
+pub async fn create_nep141_storage_deposit_action(
+    network: &impl NetworkView,
+    token_id: &AccountIdRef,
+    account_id: Option<&AccountId>,
+) -> Action {
+    let amount = token_storage_deposit_amount(network, token_id).await;
+    match account_id {
+        Some(account_id) => create_storage_deposit_action_for_someone(amount, account_id, true),
+        None => create_storage_deposit_action_for_contract(amount, true),
     }
 }
 
@@ -706,6 +804,21 @@ pub async fn get_all_tokens() -> Result<HashMap<TokenId, TokenInfo>, String> {
         tokens.insert(TokenId::Near, wnear_info.clone());
     }
     Ok(tokens)
+}
+
+#[cached(time = 3600, result = true)]
+pub async fn get_storage_balance_bounds(
+    contract_id: AccountId,
+) -> Result<StorageBalanceBounds, String> {
+    RPC_CLIENT
+        .call::<StorageBalanceBounds>(
+            contract_id,
+            "storage_balance_bounds",
+            serde_json::json!({}),
+            QueryFinality::Finality(Finality::DoomSlug),
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))
 }
 
 #[cached(time = 1, result = true)]
@@ -924,7 +1037,7 @@ pub async fn deposit_storage_if_needed(
 ) -> Vec<ExecutionInstruction> {
     if let Some(trader_account_id) = trader_account_id.into() {
         if needs_storage_deposit(network, &trader_account_id, token_id).await {
-            create_storage_deposit_action(token_id).await
+            create_storage_deposit_action(network, token_id).await
         } else {
             vec![]
         }
