@@ -116,7 +116,7 @@ fn create_wrap_action_fields() {
     let function_call = function_call_from_action(&action);
     assert_eq!(function_call.method_name, "near_deposit");
     assert_eq!(args_from_action(&action), serde_json::json!({}));
-    assert_eq!(function_call.gas, Gas(NearGas::from_tgas(2)));
+    assert_eq!(function_call.gas, Gas(NearGas::from_tgas(5)));
     assert_eq!(function_call.deposit, amount);
 }
 
@@ -130,7 +130,7 @@ fn create_unwrap_action_fields() {
         args_from_action(&action),
         serde_json::json!({ "amount": amount })
     );
-    assert_eq!(function_call.gas, Gas(NearGas::from_tgas(5)));
+    assert_eq!(function_call.gas, Gas(NearGas::from_tgas(30)));
     assert_eq!(function_call.deposit, NearToken::from_yoctonear(1));
 }
 

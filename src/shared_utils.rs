@@ -28,7 +28,7 @@ pub fn create_wrap_action(amount: NearToken) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "near_deposit".to_string(),
         args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-        gas: Gas(NearGas::from_tgas(2)),
+        gas: Gas(NearGas::from_tgas(5)),
         deposit: amount,
     }))
 }
@@ -42,7 +42,7 @@ pub fn create_unwrap_action(amount: NearToken) -> Action {
         .unwrap()
         .as_bytes()
         .to_vec(),
-        gas: Gas(NearGas::from_tgas(5)),
+        gas: Gas(NearGas::from_tgas(30)),
         deposit: NearToken::from_yoctonear(1),
     }))
 }
