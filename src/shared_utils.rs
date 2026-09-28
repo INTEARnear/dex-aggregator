@@ -363,6 +363,7 @@ impl TestNetworkView {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_native_balance(mut self, account_id: &str, amount: NearToken) -> Self {
         self.native_balances
             .insert(account_id.parse().unwrap(), amount);

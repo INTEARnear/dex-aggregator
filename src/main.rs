@@ -3,20 +3,23 @@
 use axum::{
     extract::{Json, Query},
     http::StatusCode,
+    middleware,
     routing::get,
     Router,
 };
-use std::{env, future::Future, pin::Pin, time::Duration};
+use std::{env, future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::{
+    rate_limit::RateLimiter,
     shared_utils::{convert_to, optimize_execution_instructions, Mainnet, TOKEN_PRICES},
     types::{Amount, DexId, Route, Slippage, SwapRequest},
 };
 
 mod providers;
+mod rate_limit;
 mod shared_utils;
 mod types;
 
@@ -195,6 +198,8 @@ async fn main() {
 
     info!("Starting swap-router HTTP server...");
 
+    let rate_limiter = RateLimiter::from_env().await;
+
     // Initialize the token prices cache (this starts the background update task)
     let _ = &*TOKEN_PRICES;
     info!("Token prices cache initialized");
@@ -206,7 +211,15 @@ async fn main() {
 
     let app = Router::new()
         .route("/route", get(route_handler))
-        .layer(cors);
+        .layer(middleware::from_fn_with_state(
+            rate_limiter.clone(),
+            rate_limit::limit_unauthorized,
+        ))
+        .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit::validate_source,
+        ));
 
     let bind_address = env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
@@ -214,5 +227,10 @@ async fn main() {
 
     info!("Server running on http://{}", bind_address);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

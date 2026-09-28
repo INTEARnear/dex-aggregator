@@ -46,3 +46,21 @@ Certain steps can be omitted to optimize transaction count & speed. For example,
 Some DEXes (such as Rhea) only support NEP-141 tokens, but the user might want to use a native NEAR coin, so at the beginning of the swap the aggregator does `near_deposit` to mint `wrap.near` and then use the wrapped NEAR. Similarly, at the end of the swap, if the output amount is known (e.g. a DEX has no slippage, or request is exact-output), the aggregator tries to add a conversion to the desired token location. If it's not possible (e.g. output is not exactly known due to possible slippage), the route response includes `token_output` which can be different from the specified token output in your request. If it's different, you have to track how many tokens were received from the swap (recommended way is to parse logs from execution outcome) and request a second quote, from `token_output` to your desired token, with only `Wrap` as DEXes, and execute that route as a second step. It's guaranteed to have no slippage and be a 1-to-1 conversion. Reference implementation of this behavior: https://github.com/INTEARnear/dex-frontend/blob/a4d724e78cce026f5530e1ef845c2dadad689f3c/src/lib/SwapForm.svelte
 
 As a post-processing step, chained transactions to the same contract are merged into one (e.g. `storage_deposit` + `near_deposit` + `ft_transfer_call` for `wrap.near`) to optimize transaction count. When ordering of transactions doesn't matter (e.g. storage deposit needed for output token & location conversion needed for input token), DEX Aggregator tries to arrange them in a way that is more likely to be optimizable this way.
+
+## Rate limiting
+
+Requests without an API key are rate limited per client IP. Configured with environment variables (`.env` works too):
+
+- `RATE_LIMIT_SOURCE` (required): where the client IP comes from. Requests that didn't arrive this way are rejected with 403, so the IP can't be spoofed by reaching the server some other way.
+  - `IP`: clients connect directly, the connection's IP is used.
+  - `NGINX_IP`: behind nginx on the same host. Only loopback connections are accepted, the IP is taken from `X-Forwarded-For`.
+  - `CLOUDFLARE_IP`: behind Cloudflare. Only connections from [Cloudflare IPs](https://www.cloudflare.com/ips/) are accepted, the IP is taken from `CF-Connecting-IP`.
+  - `CLOUDFLARE_NGINX_IP`: behind Cloudflare, then nginx on the same host. Only loopback connections with a Cloudflare IP in `X-Forwarded-For` are accepted, the IP is taken from `CF-Connecting-IP`.
+- `UNAUTHORIZED_RATE_LIMIT` (required): `<requests>/<seconds>`, e.g. `5/2` allows at most 5 requests in any 2 seconds. IPv6 clients are limited per /64. Requests over the limit get 429 with a `Retry-After` header.
+- `API_KEYS` (optional): comma-separated keys for unlimited usage, passed as `&key=<key>`. Keys can only contain `A-Z a-z 0-9 - . _ ~`. Requests with an unknown key get 401.
+
+With `NGINX_IP` and `CLOUDFLARE_NGINX_IP`, nginx has to pass the IP that connected to it (`CF-Connecting-IP` is passed through by default):
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;
+```
