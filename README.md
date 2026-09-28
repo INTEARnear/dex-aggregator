@@ -25,6 +25,7 @@ It's separated into 3 crates:
 - `XRhea`: staking RHEA into xRHEA & unstaking. There's no staking lock or fee.
 - `RNear`: liquid staking provider based on LiNEAR, so behavior copies `Linear`
 - `Plach`: uses `plach-pathfinder`
+- `RheaDclV2`: uses `rhea-dcl-pathfinder`. Finds the best route through up to 3 DCL pools.
 
 ## Different output token locations
 

@@ -4,6 +4,7 @@ pub mod linear;
 pub mod metapool;
 pub mod rhea;
 pub mod rhea_dcl;
+pub mod rhea_dcl_v2;
 pub mod rnear;
 pub mod wrap;
 pub mod xrhea;

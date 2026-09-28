@@ -99,6 +99,7 @@ async fn route_handler(
         &providers::xrhea::XRheaProvider,
         &providers::rnear::RNearProvider,
         &providers::intear_plach::IntearPlachProvider,
+        &providers::rhea_dcl_v2::RheaDclV2Provider,
     ];
 
     let dexes = request.dexes.clone().unwrap_or(vec![

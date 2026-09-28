@@ -29,4 +29,4 @@ ipnet = { version = "2.12.2", features = ["serde"] }
 overflow-checks = true
 
 [workspace]
-members = ["rhea-pathfinder", "plach-pathfinder"]
+members = ["rhea-pathfinder", "plach-pathfinder", "rhea-dcl-pathfinder"]
