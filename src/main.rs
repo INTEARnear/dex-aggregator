@@ -93,13 +93,13 @@ async fn route_handler(
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
         &providers::wrap::WrapProvider,
-        &providers::rhea_dcl::RheaDclProvider,
+        // &providers::rhea_dcl::RheaDclProvider,
+        &providers::rhea_dcl_v2::RheaDclProvider,
         &providers::metapool::MetapoolProvider,
         &providers::linear::LinearProvider,
         &providers::xrhea::XRheaProvider,
         &providers::rnear::RNearProvider,
         &providers::intear_plach::IntearPlachProvider,
-        &providers::rhea_dcl_v2::RheaDclV2Provider,
     ];
 
     let dexes = request.dexes.clone().unwrap_or(vec![

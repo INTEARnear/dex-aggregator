@@ -9,22 +9,22 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::{
-    Amount, DexId, Provider, Route, SwapRequest,
     shared_utils::{
-        Mainnet, NetworkView, REQWEST_CLIENT, WRAP_NEAR, convert_to_nep141,
-        deposit_storage_if_needed, deposit_storage_on_contract_if_needed, get_slippage,
-        needs_storage_deposit_for_contract,
+        convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
+        get_slippage, needs_storage_deposit_for_contract, Mainnet, NetworkView, REQWEST_CLIENT,
+        WRAP_NEAR,
     },
     types::{ExecutionInstruction, TokenId},
+    Amount, DexId, Provider, Route, SwapRequest,
 };
 
-pub struct RheaDclV2Provider;
+pub struct RheaDclProvider;
 
 const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 const SWAP_BASE_GAS_TGAS: u64 = 50;
 const SWAP_GAS_PER_HOP_TGAS: u64 = 50;
 
-trait RheaDclV2Quotes: Send + Sync {
+trait RheaDclQuotes: Send + Sync {
     fn find_path(
         &self,
         token_in: &AccountId,
@@ -34,9 +34,9 @@ trait RheaDclV2Quotes: Send + Sync {
     ) -> impl Future<Output = Option<RouteApiResponse>> + Send;
 }
 
-struct MainnetRheaDclV2Quotes;
+struct MainnetRheaDclQuotes;
 
-impl RheaDclV2Quotes for MainnetRheaDclV2Quotes {
+impl RheaDclQuotes for MainnetRheaDclQuotes {
     async fn find_path(
         &self,
         token_in: &AccountId,
@@ -59,20 +59,20 @@ impl RheaDclV2Quotes for MainnetRheaDclV2Quotes {
     }
 }
 
-impl Provider for RheaDclV2Provider {
+impl Provider for RheaDclProvider {
     fn dex_id(&self) -> DexId {
-        DexId::RheaDclV2
+        DexId::RheaDcl
     }
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
-        Box::pin(async move { route(request, &Mainnet, &MainnetRheaDclV2Quotes).await })
+        Box::pin(async move { route(request, &Mainnet, &MainnetRheaDclQuotes).await })
     }
 }
 
 async fn route(
     request: SwapRequest,
     network: &impl NetworkView,
-    quotes: &impl RheaDclV2Quotes,
+    quotes: &impl RheaDclQuotes,
 ) -> Option<Route> {
     let slippage = get_slippage(
         network,
@@ -214,7 +214,7 @@ async fn route(
     ]
     .concat();
     Some(Route {
-        dex_id: DexId::RheaDclV2,
+        dex_id: DexId::RheaDcl,
         estimated_amount,
         deadline: None,
         has_slippage: true,
@@ -297,22 +297,22 @@ mod tests {
 
     use super::*;
     use crate::shared_utils::{
-        TestNetworkView, WRAP_NEAR, create_storage_deposit_action_for_contract, create_wrap_action,
+        create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
 
     #[derive(Clone)]
-    struct TestRheaDclV2Quotes {
+    struct TestRheaDclQuotes {
         enabled: bool,
     }
 
-    impl Default for TestRheaDclV2Quotes {
+    impl Default for TestRheaDclQuotes {
         fn default() -> Self {
             Self { enabled: true }
         }
     }
 
-    impl TestRheaDclV2Quotes {
+    impl TestRheaDclQuotes {
         fn none() -> Self {
             Self { enabled: false }
         }
@@ -326,7 +326,7 @@ mod tests {
         }
     }
 
-    impl RheaDclV2Quotes for TestRheaDclV2Quotes {
+    impl RheaDclQuotes for TestRheaDclQuotes {
         async fn find_path(
             &self,
             token_in: &AccountId,
@@ -392,7 +392,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             Some(Route {
@@ -400,7 +400,7 @@ mod tests {
                 has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDclV2,
+                dex_id: DexId::RheaDcl,
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
@@ -474,7 +474,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             Some(Route {
@@ -482,7 +482,7 @@ mod tests {
                 has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDclV2,
+                dex_id: DexId::RheaDcl,
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
@@ -545,7 +545,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             Some(Route {
@@ -553,7 +553,7 @@ mod tests {
                 has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::RheaDclV2,
+                dex_id: DexId::RheaDcl,
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
@@ -627,7 +627,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             None
@@ -652,7 +652,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::none(),
+                &TestRheaDclQuotes::none(),
             )
             .await,
             None
@@ -678,7 +678,7 @@ mod tests {
                 },
                 &TestNetworkView::default()
                     .with_native_balance("trader.near", NearToken::from_millinear(100)),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             None
@@ -703,7 +703,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default(),
-                &TestRheaDclV2Quotes::default(),
+                &TestRheaDclQuotes::default(),
             )
             .await,
             Some(Route {
@@ -711,7 +711,7 @@ mod tests {
                 has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::RheaDclV2,
+                dex_id: DexId::RheaDcl,
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),

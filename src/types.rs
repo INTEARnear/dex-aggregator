@@ -269,8 +269,6 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     Plach,
-    /// Will replace RheaDcl after shadow testing
-    RheaDclV2,
 }
 
 const RHEA_STR: &str = "Rhea";
@@ -282,7 +280,6 @@ const LINEAR_STR: &str = "Linear";
 const XRHEA_STR: &str = "XRhea";
 const RNEAR_STR: &str = "RNear";
 const PLACH_STR: &str = "Plach";
-const RHEA_DCL_V2_STR: &str = "RheaDclV2";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -296,7 +293,6 @@ impl Display for DexId {
             DexId::XRhea => f.write_str(XRHEA_STR),
             DexId::RNear => f.write_str(RNEAR_STR),
             DexId::Plach => f.write_str(PLACH_STR),
-            DexId::RheaDclV2 => f.write_str(RHEA_DCL_V2_STR),
         }
     }
 }
@@ -315,7 +311,6 @@ impl FromStr for DexId {
             XRHEA_STR => DexId::XRhea,
             RNEAR_STR => DexId::RNear,
             PLACH_STR => DexId::Plach,
-            RHEA_DCL_V2_STR => DexId::RheaDclV2,
             _ => return Err(format!("Invalid dex id: {s}")),
         })
     }
