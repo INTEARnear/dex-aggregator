@@ -166,28 +166,6 @@ async fn route(
         amount_in,
     )
     .await?;
-    if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-        if needs_storage_deposit_for_contract(
-            network,
-            trader_account_id,
-            &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
-        )
-        .await
-        {
-            if let (Ok(native_amount), Ok(wrap_amount)) = (
-                network.native_balance(trader_account_id).await,
-                network
-                    .ft_balance(trader_account_id, &WRAP_NEAR.parse::<AccountId>().unwrap())
-                    .await,
-            ) {
-                if native_amount.as_yoctonear() + wrap_amount
-                    < NearToken::from_millinear(500).as_yoctonear()
-                {
-                    return None;
-                }
-            }
-        }
-    }
     let token_output = if unwrapping_near {
         TokenId::Near
     } else {
