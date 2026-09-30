@@ -283,8 +283,7 @@ async fn route(
         request.slippage,
         &request.token_in,
         &request.token_out,
-    )
-    .await;
+    );
 
     let (_, token_in) = match &request.token_in {
         TokenId::TokenOnIntearDex(asset_id) => (Vec::new(), asset_id.clone()),

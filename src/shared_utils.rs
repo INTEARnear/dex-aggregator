@@ -1,4 +1,10 @@
-use std::{collections::HashMap, future::Future, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    str::FromStr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
@@ -14,7 +20,7 @@ use near_min_api::{
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
-use tokio::sync::Mutex;
+use tracing::error;
 
 use crate::{
     providers::intear_plach::AssetId,
@@ -143,11 +149,9 @@ pub trait NetworkView: Send + Sync {
         asset_id: &AssetId,
     ) -> impl Future<Output = bool> + Send;
 
-    fn token_infos(
-        &self,
-    ) -> impl Future<Output = Result<HashMap<TokenId, TokenInfo>, String>> + Send;
+    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
 
-    fn current_block_height(&self) -> impl Future<Output = Result<BlockHeight, String>> + Send;
+    fn current_block_height(&self) -> Result<BlockHeight, String>;
 
     fn native_balance(
         &self,
@@ -226,16 +230,12 @@ impl NetworkView for Mainnet {
             .unwrap_or_default()
     }
 
-    async fn token_infos(&self) -> Result<HashMap<TokenId, TokenInfo>, String> {
-        get_all_tokens()
-            .await
-            .inspect_err(|err| println!("Error getting token infos: {err:?}"))
+    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
+        TOKEN_INFOS.read().unwrap().clone()
     }
 
-    async fn current_block_height(&self) -> Result<BlockHeight, String> {
-        get_current_block_height()
-            .await
-            .inspect_err(|err| println!("Error getting current block height: {err:?}"))
+    fn current_block_height(&self) -> Result<BlockHeight, String> {
+        BLOCK_HEIGHT.read().unwrap().clone()
     }
 
     async fn native_balance(&self, account_id: &AccountId) -> Result<NearToken, String> {
@@ -275,7 +275,7 @@ pub(crate) struct TestNetworkView {
     storage_balance_bounds: HashMap<AccountId, StorageBalanceBounds>,
     rhea_token_registers: HashMap<(AccountId, AccountId), bool>,
     intear_asset_registers: HashMap<(AccountId, AssetId), bool>,
-    tokens: Result<HashMap<TokenId, TokenInfo>, String>,
+    tokens: Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
     ft_balances: HashMap<(AccountId, AccountId), Balance>,
@@ -289,7 +289,7 @@ impl Default for TestNetworkView {
             storage_balance_bounds: HashMap::new(),
             rhea_token_registers: HashMap::new(),
             intear_asset_registers: HashMap::new(),
-            tokens: Ok(HashMap::new()),
+            tokens: Ok(Arc::default()),
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
             ft_balances: HashMap::new(),
@@ -344,7 +344,7 @@ impl TestNetworkView {
     }
 
     pub(crate) fn with_tokens(mut self, tokens: HashMap<TokenId, TokenInfo>) -> Self {
-        self.tokens = Ok(tokens);
+        self.tokens = Ok(Arc::new(tokens));
         self
     }
 
@@ -408,11 +408,11 @@ impl NetworkView for TestNetworkView {
             .unwrap_or(false)
     }
 
-    async fn token_infos(&self) -> Result<HashMap<TokenId, TokenInfo>, String> {
+    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
         self.tokens.clone()
     }
 
-    async fn current_block_height(&self) -> Result<BlockHeight, String> {
+    fn current_block_height(&self) -> Result<BlockHeight, String> {
         self.block_height.clone()
     }
 
@@ -644,14 +644,60 @@ lazy_static! {
             .map(|url| url.to_string())
             .collect::<Vec<_>>(),
     );
-    pub static ref TOKEN_PRICES: Mutex<HashMap<AccountId, BigDecimal>> = {
-        let prices = Mutex::new(HashMap::new());
-        tokio::spawn(update_token_prices_loop());
-        prices
-    };
+
+    static ref TOKEN_INFOS: RwLock<Result<Arc<HashMap<TokenId, TokenInfo>>, String>> =
+        RwLock::new(Err("Token infos are not loaded yet".to_string()));
+    static ref BLOCK_HEIGHT: RwLock<Result<BlockHeight, String>> =
+        RwLock::new(Err("Block height is not loaded yet".to_string()));
 }
 
-pub async fn get_slippage(
+const TOKEN_INFOS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const BLOCK_HEIGHT_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Loads token infos and the current block height, then keeps refreshing them in
+/// the background, so requests never wait for them.
+pub async fn start_background_refresh() {
+    tokio::join!(
+        refresh(&TOKEN_INFOS, fetch_token_infos),
+        refresh(&BLOCK_HEIGHT, fetch_current_block_height),
+    );
+    tokio::spawn(refresh_loop(
+        &TOKEN_INFOS,
+        fetch_token_infos,
+        TOKEN_INFOS_REFRESH_INTERVAL,
+    ));
+    tokio::spawn(refresh_loop(
+        &BLOCK_HEIGHT,
+        fetch_current_block_height,
+        BLOCK_HEIGHT_REFRESH_INTERVAL,
+    ));
+}
+
+async fn refresh_loop<T, Fut>(
+    value: &RwLock<Result<T, String>>,
+    fetch: impl Fn() -> Fut,
+    interval: Duration,
+) where
+    Fut: Future<Output = Result<T, String>>,
+{
+    loop {
+        tokio::time::sleep(interval).await;
+        refresh(value, &fetch).await;
+    }
+}
+
+/// A failed refresh keeps the previous value, so a short outage doesn't affect requests.
+async fn refresh<T, Fut>(value: &RwLock<Result<T, String>>, fetch: impl Fn() -> Fut)
+where
+    Fut: Future<Output = Result<T, String>>,
+{
+    match fetch().await {
+        Ok(fresh) => *value.write().unwrap() = Ok(fresh),
+        Err(err) => error!("{err}, keeping the previous value"),
+    }
+}
+
+pub fn get_slippage(
     network: &impl NetworkView,
     slippage: Slippage,
     token_in: &TokenId,
@@ -662,11 +708,11 @@ pub async fn get_slippage(
             max_slippage,
             min_slippage,
         } => {
-            let tokens_result = network.token_infos().await;
+            let tokens_result = network.token_infos();
             let optimal_slippage_scale_input =
-                slippage_scale_for_token(network, &tokens_result, token_in).await;
+                slippage_scale_for_token(network, &tokens_result, token_in);
             let optimal_slippage_scale_output =
-                slippage_scale_for_token(network, &tokens_result, token_out).await;
+                slippage_scale_for_token(network, &tokens_result, token_out);
             let optimal_slippage_scale =
                 optimal_slippage_scale_input.max(optimal_slippage_scale_output);
             let optimal_slippage = min_slippage.clone()
@@ -736,15 +782,15 @@ fn token_volatility_scale(token_info: &TokenInfo, current_block_height: u64) -> 
     }
 }
 
-async fn slippage_scale_for_token(
+fn slippage_scale_for_token(
     network: &impl NetworkView,
-    tokens_result: &Result<HashMap<TokenId, TokenInfo>, String>,
+    tokens_result: &Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
     token_id: &TokenId,
 ) -> BigDecimal {
     match tokens_result {
         Ok(tokens) => {
             if let Some(token_info) = tokens.get(token_id) {
-                match network.current_block_height().await {
+                match network.current_block_height() {
                     Ok(height) => token_volatility_scale(token_info, height),
                     Err(_) => BigDecimal::from_f64(0.005).unwrap(),
                 }
@@ -785,26 +831,23 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenData {
-    price_usd_raw: String,
-}
-
-#[cached(time = 5, result = true)]
-pub async fn get_all_tokens() -> Result<HashMap<TokenId, TokenInfo>, String> {
+async fn fetch_token_infos() -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
     let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
         .unwrap_or_else(|_| "https://prices.intear.tech".to_string());
     let url = format!("{endpoint}/tokens");
-    let Ok(response) = REQWEST_CLIENT.get(url).send().await else {
-        return Err("Failed to get all tokens".to_string());
-    };
-    let Ok(mut tokens) = response.json::<HashMap<TokenId, TokenInfo>>().await else {
-        return Err("Failed to parse all tokens".to_string());
-    };
+    let mut tokens = REQWEST_CLIENT
+        .get(url)
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|err| format!("Failed to get all tokens: {err}"))?
+        .json::<HashMap<TokenId, TokenInfo>>()
+        .await
+        .map_err(|err| format!("Failed to parse all tokens: {err}"))?;
     if let Some(wnear_info) = tokens.get(&TokenId::Nep141(WRAP_NEAR.parse().unwrap())) {
         tokens.insert(TokenId::Near, wnear_info.clone());
     }
-    Ok(tokens)
+    Ok(Arc::new(tokens))
 }
 
 #[cached(time = 3600, result = true)]
@@ -822,50 +865,12 @@ pub async fn get_storage_balance_bounds(
         .map_err(|err| format!("{err:?}"))
 }
 
-#[cached(time = 1, result = true)]
-pub async fn get_current_block_height() -> Result<BlockHeight, String> {
-    let Ok(response) = RPC_CLIENT
+async fn fetch_current_block_height() -> Result<BlockHeight, String> {
+    RPC_CLIENT
         .block(BlockReference::Finality(Finality::None))
         .await
-    else {
-        return Err("Failed to get current block".to_string());
-    };
-    Ok(response.header.height)
-}
-
-async fn update_token_prices() {
-    let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
-        .unwrap_or_else(|_| "https://prices.intear.tech".to_string());
-    let url = format!("{endpoint}/tokens");
-
-    if let Ok(response) = REQWEST_CLIENT.get(url).send().await {
-        if let Ok(tokens) = response.json::<HashMap<String, TokenData>>().await {
-            let mut token_prices = TOKEN_PRICES.lock().await;
-            token_prices.clear();
-
-            for (token_id_str, token_data) in tokens {
-                if let Ok(account_id) = token_id_str.parse::<AccountId>() {
-                    if let Ok(price_raw) = token_data.price_usd_raw.parse::<BigDecimal>() {
-                        token_prices.insert(account_id, price_raw / BigDecimal::from(1_000_000));
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn update_token_prices_loop() {
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    loop {
-        interval.tick().await;
-        update_token_prices().await;
-    }
-}
-
-#[allow(dead_code)]
-pub async fn get_token_price(token_id: &AccountId) -> Option<BigDecimal> {
-    let token_prices = TOKEN_PRICES.lock().await;
-    token_prices.get(token_id).cloned()
+        .map(|block| block.header.height)
+        .map_err(|err| format!("Failed to get current block: {err:?}"))
 }
 
 /// Merge all neighboring NearTransactions with the same receiver_id

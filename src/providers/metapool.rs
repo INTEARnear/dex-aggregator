@@ -230,8 +230,7 @@ async fn route(
                 request.slippage.clone(),
                 &request.token_in,
                 &request.token_out,
-            )
-            .await;
+            );
             let one_minus_slippage = BigDecimal::from(1) - slippage;
             if one_minus_slippage.is_zero() {
                 return None;
@@ -250,8 +249,7 @@ async fn route(
                 request.slippage.clone(),
                 &request.token_in,
                 &request.token_out,
-            )
-            .await;
+            );
             let worst_case_amount_near_out =
                 BigDecimal::from(amount_near_out) / (BigDecimal::from(1) + slippage);
             ToPrimitive::to_u128(

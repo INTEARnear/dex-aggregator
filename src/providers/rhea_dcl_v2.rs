@@ -79,8 +79,7 @@ async fn route(
         request.slippage,
         &request.token_in,
         &request.token_out,
-    )
-    .await;
+    );
 
     let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
     let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;

@@ -1289,8 +1289,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         },
         &TokenId::Near,
         &wnear(),
-    )
-    .await;
+    );
     assert_eq!(passthrough, bd("0.01"));
 
     let too_small = get_slippage(
@@ -1298,8 +1297,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         Slippage::Fixed { slippage: bd("0") },
         &TokenId::Near,
         &wnear(),
-    )
-    .await;
+    );
     assert_eq!(too_small, BigDecimal::from_f64(0.0001).unwrap());
 
     let too_large = get_slippage(
@@ -1307,8 +1305,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         Slippage::Fixed { slippage: bd("2") },
         &TokenId::Near,
         &wnear(),
-    )
-    .await;
+    );
     assert_eq!(too_large, BigDecimal::from_f64(0.9999).unwrap());
 }
 
@@ -1323,8 +1320,7 @@ async fn get_slippage_auto_missing_token_uses_scale_0_8() {
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(
         slippage,
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.8).unwrap())
@@ -1342,8 +1338,7 @@ async fn get_slippage_auto_token_fetch_error_uses_scale_0_005() {
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(
         slippage,
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.005).unwrap())
@@ -1386,8 +1381,7 @@ async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token()
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(
         slippage,
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.005).unwrap())
@@ -1430,8 +1424,7 @@ async fn get_slippage_auto_new_token_uses_max_slippage() {
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(slippage, bd("0.51"));
 }
 
@@ -1471,8 +1464,7 @@ async fn get_slippage_auto_somewhat_new_token_uses_scale_0_6() {
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(
         slippage,
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.6).unwrap())
@@ -1714,8 +1706,7 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
         },
         &TokenId::Near,
         &ft(),
-    )
-    .await;
+    );
     assert_eq!(
         slippage,
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.05).unwrap())

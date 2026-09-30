@@ -23,7 +23,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
-    shared_utils::{convert_to, optimize_execution_instructions, Mainnet, TOKEN_PRICES},
+    shared_utils::{convert_to, optimize_execution_instructions, Mainnet},
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{Amount, DexId, Route, Slippage, SwapRequest},
 };
@@ -244,9 +244,7 @@ async fn main() {
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;
 
-    // Initialize the token prices cache (this starts the background update task)
-    let _ = &*TOKEN_PRICES;
-    info!("Token prices cache initialized");
+    shared_utils::start_background_refresh().await;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

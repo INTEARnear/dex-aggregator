@@ -153,8 +153,7 @@ async fn route(
                 request.slippage,
                 &request.token_in,
                 &request.token_out,
-            )
-            .await;
+            );
             let min_amount_out = ToPrimitive::to_u128(
                 &(BigDecimal::from(estimated_amount_out) * (BigDecimal::from(1) - slippage))
                     .with_scale_round(0, RoundingMode::Down),
@@ -231,8 +230,7 @@ async fn route(
                 request.slippage,
                 &request.token_in,
                 &request.token_out,
-            )
-            .await;
+            );
             let max_amount_in = ToPrimitive::to_u128(
                 &(BigDecimal::from(required_amount_in) / (BigDecimal::from(1) - slippage))
                     .with_scale_round(0, RoundingMode::Down),
