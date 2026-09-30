@@ -26,18 +26,23 @@ pub enum TokenId {
     TokenOnIntearDex(AssetId),
 }
 
+impl Display for TokenId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenId::Near => f.write_str("near"),
+            TokenId::Nep141(account_id) => write!(f, "nep141:{account_id}"),
+            TokenId::Nep141OnRhea(account_id) => write!(f, "rhea-nep141:{account_id}"),
+            TokenId::TokenOnIntearDex(asset_id) => write!(f, "intear-dex:{asset_id}"),
+        }
+    }
+}
+
 impl Serialize for TokenId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        match self {
-            TokenId::Near => "near".to_string(),
-            TokenId::Nep141(account_id) => format!("nep141:{account_id}"),
-            TokenId::Nep141OnRhea(account_id) => format!("rhea-nep141:{account_id}"),
-            TokenId::TokenOnIntearDex(asset_id) => format!("intear-dex:{asset_id}"),
-        }
-        .serialize(serializer)
+        self.to_string().serialize(serializer)
     }
 }
 

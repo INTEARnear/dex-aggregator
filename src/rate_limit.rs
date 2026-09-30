@@ -339,7 +339,7 @@ impl RateLimiter {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ClientIp(IpAddr);
+pub struct ClientIp(pub IpAddr);
 
 /// Rejects requests that didn't arrive through `RATE_LIMIT_SOURCE`, and passes
 /// the client IP to [`limit_unauthorized`].

@@ -1,26 +1,37 @@
 #![deny(clippy::float_arithmetic)]
 
 use axum::{
-    extract::{Json, Query},
+    extract::{Json, Query, State},
     http::StatusCode,
     middleware,
     routing::get,
-    Router,
+    Extension, Router,
 };
-use std::{env, future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use chrono::Utc;
+use futures_util::FutureExt;
+use std::{
+    env,
+    future::Future,
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::{
-    rate_limit::RateLimiter,
+    rate_limit::{ClientIp, RateLimiter},
     shared_utils::{convert_to, optimize_execution_instructions, Mainnet, TOKEN_PRICES},
+    stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{Amount, DexId, Route, Slippage, SwapRequest},
 };
 
 mod providers;
 mod rate_limit;
 mod shared_utils;
+mod stats;
 mod types;
 
 pub trait Provider: Sync {
@@ -30,8 +41,12 @@ pub trait Provider: Sync {
 }
 
 async fn route_handler(
+    State(stats): State<Stats>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     Query(request): Query<SwapRequest>,
 ) -> Result<Json<Vec<Route>>, (StatusCode, String)> {
+    let started_at = Instant::now();
+    let timestamp = Utc::now();
     info!("Received route request: {:?}", request);
 
     match &request.slippage {
@@ -122,15 +137,30 @@ async fn route_handler(
 
         let request_cloned = request.clone();
         routes.push(tokio::spawn(async move {
-            tokio::select! {
-                route = provider.route(request_cloned) => route,
-                _ = tokio::time::sleep(Duration::from_millis(request.max_wait_ms)) => None,
-            }
+            let started_at = Instant::now();
+            let (outcome, route) = tokio::select! {
+                route = AssertUnwindSafe(provider.route(request_cloned)).catch_unwind() => match route {
+                    Ok(Some(route)) => (RouteOutcome::Found, Some(route)),
+                    Ok(None) => (RouteOutcome::NotFound, None),
+                    Err(_) => (RouteOutcome::Panicked, None),
+                },
+                _ = tokio::time::sleep(Duration::from_millis(60_000)) => (RouteOutcome::TimedOut, None),
+            };
+            let route_stats = RouteStats {
+                dex_id: provider.dex_id(),
+                duration: started_at.elapsed(),
+                outcome,
+            };
+            (route_stats, route)
         }));
     }
 
-    let routes = futures_util::future::join_all(routes).await;
-    let mut routes = routes.into_iter().flatten().flatten().collect::<Vec<_>>();
+    let (route_stats, routes): (Vec<_>, Vec<_>) = futures_util::future::join_all(routes)
+        .await
+        .into_iter()
+        .map(|result| result.expect("Route tasks catch panics and are never aborted"))
+        .unzip();
+    let mut routes = routes.into_iter().flatten().collect::<Vec<_>>();
 
     routes.sort_by_key(|route| {
         match route.estimated_amount {
@@ -185,6 +215,18 @@ async fn route_handler(
 
     tracing::info!("Found {} routes: {:?}", routes.len(), routes);
 
+    stats.record(QueryStats {
+        timestamp,
+        ip,
+        token_in: request.token_in,
+        token_out: request.token_out,
+        amount: request.amount,
+        referrer_id: request.referrer_id,
+        trader_account_id: request.trader_account_id,
+        duration: started_at.elapsed(),
+        routes: route_stats,
+    });
+
     Ok(Json(routes))
 }
 
@@ -200,6 +242,7 @@ async fn main() {
     info!("Starting swap-router HTTP server...");
 
     let rate_limiter = RateLimiter::from_env().await;
+    let stats = Stats::from_env().await;
 
     // Initialize the token prices cache (this starts the background update task)
     let _ = &*TOKEN_PRICES;
@@ -212,6 +255,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/route", get(route_handler))
+        .with_state(stats)
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),
             rate_limit::limit_unauthorized,
