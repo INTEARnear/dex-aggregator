@@ -80,8 +80,6 @@ struct ApiPoolStep {
 }
 
 const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
-// The swap math was verified against this build (2.3.13), quoting stops if the code changes
-const VERIFIED_CODE_HASH: &str = "7jHmiuDCFiCr6VDPszptYNPHWaYvg7aQoeLSGzqqtNNn";
 const LIST_POOLS_PAGE_SIZE: u64 = 300;
 const POINT_DATA_BATCH_SIZE: usize = 50;
 const POINT_DATA_CONCURRENCY: usize = 4;
@@ -203,21 +201,6 @@ impl Pools {
     }
 }
 
-#[derive(Debug)]
-struct CodeHashChanged(String);
-
-impl Display for CodeHashChanged {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{RHEA_DCL_CONTRACT_ID} code hash is {}, but the swap math was verified for {VERIFIED_CODE_HASH}",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for CodeHashChanged {}
-
 #[derive(Default)]
 struct SyncedPools {
     pools: HashMap<String, (serde_json::Value, Option<Pool>)>,
@@ -235,10 +218,7 @@ async fn get_all_pools(
         .height;
     let at = QueryFinality::BlockId(BlockId::Height(block_height));
 
-    let (account, metadata, frozen_tokens) = tokio::try_join!(
-        async {
-            Ok::<_, anyhow::Error>(client.view_account(contract_id.clone(), at.clone()).await?)
-        },
+    let (metadata, frozen_tokens) = tokio::try_join!(
         async {
             Ok::<_, anyhow::Error>(
                 client
@@ -259,10 +239,6 @@ async fn get_all_pools(
             )
         },
     )?;
-    let code_hash = account.code_hash.to_string();
-    if code_hash != VERIFIED_CODE_HASH {
-        return Err(CodeHashChanged(code_hash).into());
-    }
 
     let page_requests = (0..metadata.pool_count)
         .step_by(LIST_POOLS_PAGE_SIZE as usize)
@@ -443,10 +419,6 @@ async fn start_pools_update_task(client: Arc<RpcClient>) {
                     *cache = Some(Arc::new(pools));
                 }
                 Err(e) => {
-                    if e.downcast_ref::<CodeHashChanged>().is_some() {
-                        let mut cache = POOLS_CACHE.write().await;
-                        *cache = None;
-                    }
                     error!("Failed to update pools: {e}");
                 }
             }
