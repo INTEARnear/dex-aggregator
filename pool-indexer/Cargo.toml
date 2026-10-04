@@ -1,0 +1,11 @@
+[package]
+name = "pool-indexer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+inindexer = { git = "https://github.com/INTEARnear/inindexer", features = ["teardata"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1.41"

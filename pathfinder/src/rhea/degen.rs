@@ -1,6 +1,6 @@
 use near_min_api::types::Balance;
 
-use crate::{FEE_DIVISOR, U384, u128_ratio};
+use super::{FEE_DIVISOR, U384, u128_ratio};
 
 pub const TARGET_DECIMAL: u8 = 24;
 pub const PRECISION: u128 = 10u128.pow(TARGET_DECIMAL as u32);

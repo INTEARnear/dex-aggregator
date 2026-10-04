@@ -1,29 +1,28 @@
-#![deny(clippy::float_arithmetic)]
+mod storage;
 
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+pub use self::storage::watch;
+
 use bigdecimal::{BigDecimal, RoundingMode};
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use crypto_bigint::U256;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, U128};
+use near_min_api::types::{AccountId, Balance, BlockHeight, U128};
 use near_min_api::utils::dec_format;
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
-use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use warp::Filter;
 
-use near_min_api::{QueryFinality, RpcClient, types::Finality};
+use pool_indexer::PoolIndexer;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, error, info, warn};
+use tracing::{Level, info, warn};
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -94,8 +93,8 @@ const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
 const SMALL_AMOUNT_ROUTE_STEP_SIZE: u32 = 25; // %
 const MAX_SPLITS_COUNT: usize = 2;
-const FETCH_POOLS_BATCH_SIZE: u32 = 20;
 const TOP_ROUTES_COUNT: usize = 2;
+const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
 const RC_SUCCESS: i32 = 0;
 const RC_POOL_FETCH_ERROR: i32 = 1;
@@ -109,7 +108,7 @@ pub struct Pool {
     data: PoolData,
 }
 
-#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
 pub enum PoolData {
     Private {
         assets: (AssetWithBalance, AssetWithBalance),
@@ -133,21 +132,21 @@ pub enum PoolData {
     },
 }
 
-#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
 // #[serde(untagged)]
 pub enum FeeConfiguration {
     V1(CurrentFees),
     V2(V1FeeConfiguration),
 }
 
-#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
 pub struct V1FeeConfiguration {
     receivers: Vec<(FeeReceiver, FeeAmount)>,
 }
 
 type Timestamp = u64;
 
-#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
 pub enum FeeAmount {
     Fixed(FeeFraction),
     Scheduled {
@@ -161,22 +160,18 @@ pub enum FeeAmount {
     },
 }
 
-#[derive(Debug, BorshDeserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
 pub enum ScheduledFeeCurve {
     Linear,
 }
 
 impl FeeAmount {
-    pub fn get_fee_fraction(&self) -> FeeFraction {
+    pub fn get_fee_fraction(&self, current_timestamp: Timestamp) -> FeeFraction {
         match self {
             FeeAmount::Fixed(fee_fraction) => *fee_fraction,
             FeeAmount::Scheduled { start, end, curve } => {
                 let (start_time, start_fee_fraction) = *start;
                 let (end_time, end_fee_fraction) = *end;
-                let current_timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as Timestamp;
                 let Some(time_elapsed) = current_timestamp.checked_sub(start_time) else {
                     return start_fee_fraction;
                 };
@@ -398,8 +393,9 @@ impl Pool {
             } else {
                 (&mut asset1_balance.0, &mut asset0_balance.0)
             };
-            println!("in_balance: {in_balance}");
-            println!("out_balance: {out_balance}");
+            if *in_balance == 0 {
+                return Err(anyhow::anyhow!("In balance is zero"));
+            }
             let amount_in_after_fees = collect_fees(amount_in, fees);
             // u128 * u128 or u128 + u128 can't overflow u256; in_balance was checked to be positive
             #[allow(clippy::arithmetic_side_effects)]
@@ -407,7 +403,6 @@ impl Pool {
                 u128_to_u256(amount_in_after_fees) * u128_to_u256(*out_balance)
                     / (u128_to_u256(*in_balance) + u128_to_u256(amount_in_after_fees)),
             );
-            println!("amount_out: {amount_out}");
             *in_balance = in_balance
                 .checked_add(amount_in_after_fees)
                 .expect("Overflow");
@@ -531,6 +526,8 @@ lazy_static! {
 }
 
 struct Pools {
+    block_height: BlockHeight,
+    updated_at: Instant,
     pools: Vec<Pool>,
     pools_existing: HashSet<BTreeSet<AssetId>>,
     token_to_pools: HashMap<AssetId, Vec<usize>>,
@@ -567,55 +564,18 @@ impl Pools {
     }
 }
 
-async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
-    let number_of_pools: String = client
-        .call(
-            INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-            "dex_view",
-            json!({
-                "dex_id": PLACH_DEX_ID,
-                "method": "get_pool_count",
-                "args": BASE64_STANDARD.encode(borsh::to_vec(&()).unwrap()),
-            }),
-            QueryFinality::Finality(Finality::None),
-        )
-        .await?;
-    let number_of_pools = BASE64_STANDARD.decode(number_of_pools)?;
-    let number_of_pools = borsh::from_slice(&number_of_pools)?;
+/// Everything a pools snapshot is built from, as returned by RPC at one block
+#[derive(Serialize, Deserialize)]
+struct PoolsSource {
+    block_height: BlockHeight,
+    pools: Vec<PoolData>,
+}
 
-    let mut pools_batch_requests = Vec::new();
-
-    for i in (0..number_of_pools).step_by(FETCH_POOLS_BATCH_SIZE as usize) {
-        #[derive(BorshSerialize)]
-        struct RequestArgs {
-            start_index: u32,
-            limit: u32,
-        }
-        let request_args = RequestArgs {
-            start_index: i,
-            limit: FETCH_POOLS_BATCH_SIZE,
-        };
-
-        pools_batch_requests.push((
-            INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-            "dex_view",
-            json!({
-                "dex_id": PLACH_DEX_ID,
-                "method": "get_pools",
-                "args": BASE64_STANDARD.encode(borsh::to_vec(&request_args).unwrap()),
-            }),
-            QueryFinality::Finality(Finality::None),
-        ));
-    }
-
-    let batches: Vec<Result<String, _>> = client.batch_call(pools_batch_requests).await?;
-    let mut pools = Vec::new();
-    for result in batches {
-        let pool_batch = result?;
-        let pool_batch = BASE64_STANDARD.decode(pool_batch)?;
-        let pool_batch: Vec<PoolData> = borsh::from_slice(&pool_batch)?;
-        pools.extend(pool_batch);
-    }
+fn build_pools(source: PoolsSource) -> Pools {
+    let PoolsSource {
+        block_height,
+        pools,
+    } = source;
     let pools = pools
         .into_iter()
         .enumerate()
@@ -665,75 +625,68 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
         let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
         pair_to_pools.entry(key).or_default().push(idx);
     }
-    info!("Updated {number_of_pools} pools");
-
-    Ok(Pools {
+    Pools {
+        block_height,
+        updated_at: Instant::now(),
         pools,
         pools_existing,
         token_to_pools,
         pair_to_pools,
-    })
-}
-
-async fn start_pools_update_task(client: Arc<RpcClient>) {
-    tokio::spawn(async move {
-        loop {
-            match get_all_pools(&client).await {
-                Ok(pools) => {
-                    let mut cache = POOLS_CACHE.write().await;
-                    *cache = Some(Arc::new(pools));
-                }
-                Err(e) => {
-                    error!("Failed to update pools: {}", e);
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-    });
-}
-
-async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
-    loop {
-        if let Some(pools) = POOLS_CACHE.read().await.as_ref() {
-            return Ok(Arc::clone(pools));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    dotenvy::dotenv().ok();
+/// Builds pools from indexed storage after every block, returns why it stopped
+async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
+    let account_id: AccountId = INTEAR_DEX_CONTRACT_ID.parse().unwrap();
+    let mut blocks = indexer.blocks();
+    loop {
+        if blocks.changed().await.is_err() {
+            return anyhow::anyhow!("Pool indexer stopped");
+        }
+        let Some(state) = indexer.account_state(&account_id) else {
+            continue;
+        };
+        let height = state.block.height;
+        let pools =
+            tokio::task::spawn_blocking(move || storage::pools_source(&state).map(build_pools))
+                .await;
+        match pools {
+            Ok(Ok(pools)) => *POOLS_CACHE.write().await = Some(Arc::new(pools)),
+            Ok(Err(e)) => {
+                return e.context(format!("Failed to build Plach pools at block {height}"));
+            }
+            Err(e) => {
+                return anyhow::anyhow!("Building Plach pools at block {height} panicked: {e}");
+            }
+        }
+    }
+}
 
-    tracing_subscriber::fmt()
-        .pretty()
-        .with_file(true)
-        .with_line_number(true)
-        .with_max_level(Level::INFO)
-        .init();
+async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
+    let Some(pools) = POOLS_CACHE.read().await.clone() else {
+        return Err(anyhow::anyhow!("Pools are not loaded"));
+    };
+    let age = pools.updated_at.elapsed();
+    if age > MAX_SNAPSHOT_AGE {
+        return Err(anyhow::anyhow!(
+            "Pools were last updated {age:?} ago, at block {}",
+            pools.block_height
+        ));
+    }
+    Ok(pools)
+}
 
-    let client = Arc::new(RpcClient::new(
-        std::env::var("RPC_URLS")
-            .unwrap_or_else(|_| {
-                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
-                    .to_string()
-            })
-            .split(',')
-            .map(|url| url.to_string())
-            .collect::<Vec<_>>(),
-    ));
-
-    start_pools_update_task(client.clone()).await;
-
+/// Serves findPath, returns why it stopped
+pub async fn run(indexer: PoolIndexer) -> anyhow::Error {
     let api = warp::path("findPath")
         .and(warp::query::<FindPathQuery>())
         .and_then(handle_find_path);
 
     info!("Server listening on http://localhost:12346/findPath ...");
-    warp::serve(api).run(([127, 0, 0, 1], 12346)).await;
-
-    Ok(())
+    tokio::select! {
+        () = warp::serve(api).run(([127, 0, 0, 1], 12346)) => anyhow::anyhow!("Server stopped"),
+        error = update_pools(indexer) => error,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -750,7 +703,7 @@ impl QuoteAmount {
     }
 }
 
-async fn route<'a>(
+fn route<'a>(
     token_in: &'a AssetId,
     token_out: &'a AssetId,
     amount: QuoteAmount,
@@ -1419,7 +1372,7 @@ fn find_best_routes<'a>(
                 vec![&AssetId::Near, &launched_asset.asset_id]
             }
         })
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let ending_pool_tokens = ending_pool_candidates
         .flat_map(|pool| match &pool.data {
             PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
@@ -1429,7 +1382,7 @@ fn find_best_routes<'a>(
                 vec![&AssetId::Near, &launched_asset.asset_id]
             }
         })
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let possible_intermediate_tokens = starting_pool_tokens
         .intersection(&ending_pool_tokens)
         .filter(|&&token| token != token_in && token != token_out)
@@ -1783,6 +1736,104 @@ where
     value.parse().map_err(serde::de::Error::custom)
 }
 
+struct Request {
+    token_in: AssetId,
+    token_out: AssetId,
+    amount: QuoteAmount,
+    max_hops: MaxHops,
+    slippage_bp: u128,
+}
+
+fn parse_request(query: FindPathQuery) -> Result<Request, (i32, String)> {
+    let amount = match (query.amount_in, query.amount_out) {
+        (Some(amount_in), None) => QuoteAmount::ExactIn(amount_in),
+        (None, Some(amount_out)) => QuoteAmount::ExactOut(amount_out),
+        _ => {
+            return Err((
+                RC_ROUTE_ERROR,
+                "Provide either amountIn or amountOut".into(),
+            ));
+        }
+    };
+
+    if query.slippage < 0 || query.slippage > 1 {
+        return Err((RC_INVALID_SLIPPAGE, "Invalid slippage".into()));
+    }
+    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
+        .with_scale_round(0, RoundingMode::Down)
+        .to_u128()
+        .unwrap();
+    Ok(Request {
+        token_in: query.token_in,
+        token_out: query.token_out,
+        amount,
+        max_hops: query.max_hops,
+        slippage_bp,
+    })
+}
+
+/// CPU-bound, emulates swaps
+fn find_path(
+    pools: &Pools,
+    request: Request,
+    request_id: u32,
+) -> Result<SplitRouteApiResponse, (i32, String)> {
+    let split_route = route(
+        &request.token_in,
+        &request.token_out,
+        request.amount,
+        pools,
+        request.max_hops,
+    )
+    .map_err(|e| (RC_ROUTE_ERROR, e.to_string()))?;
+    let estimated_amount = split_route
+        .emulate_swap(
+            &request.token_in,
+            &request.token_out,
+            request.amount,
+            &mut PoolsDelta::default(),
+        )
+        .unwrap_or(0);
+    match request.amount {
+        QuoteAmount::ExactIn(_) => {
+            info!(
+                "Request id: {:06}, Estimated amount out: {}, block: {}",
+                request_id, estimated_amount, pools.block_height
+            );
+        }
+        QuoteAmount::ExactOut(_) => {
+            info!(
+                "Request id: {:06}, Estimated amount in: {}, block: {}",
+                request_id, estimated_amount, pools.block_height
+            );
+        }
+    }
+
+    split_route
+        .to_api_response(
+            &request.token_in,
+            &request.token_out,
+            request.amount,
+            request.slippage_bp,
+        )
+        .map_err(|e| (RC_RESPONSE_BUILD_ERROR, e.to_string()))
+}
+
+fn api_response<T>(result: Result<T, (i32, String)>) -> ApiResponse<T> {
+    match result {
+        Ok(data) => ApiResponse {
+            result_code: RC_SUCCESS,
+            result_message: "".into(),
+            result_data: Some(data),
+        },
+        Err((result_code, result_message)) => ApiResponse {
+            result_code,
+            result_message,
+            result_data: None,
+        },
+    }
+}
+
 async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
     let request_id = rand::thread_rng().gen_range(1..1000000);
     info!(
@@ -1796,106 +1847,16 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         query.slippage
     );
 
-    let amount = match (query.amount_in, query.amount_out) {
-        (Some(amount_in), None) => QuoteAmount::ExactIn(amount_in),
-        (None, Some(amount_out)) => QuoteAmount::ExactOut(amount_out),
-        _ => {
-            let resp: ApiResponse<()> = ApiResponse {
-                result_code: RC_ROUTE_ERROR,
-                result_message: "Provide either amountIn or amountOut".into(),
-                result_data: None,
-            };
-            return Ok(warp::reply::json(&resp));
-        }
-    };
-
-    if query.slippage < 0 || query.slippage > 1 {
-        let resp: ApiResponse<()> = ApiResponse {
-            result_code: RC_INVALID_SLIPPAGE,
-            result_message: "Invalid slippage".into(),
-            result_data: None,
-        };
-        return Ok(warp::reply::json(&resp));
-    }
-    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
-        .with_scale_round(0, RoundingMode::Down)
-        .to_u128()
-        .unwrap();
-
-    match get_pools().await {
-        Ok(pools) => match route(
-            &query.token_in,
-            &query.token_out,
-            amount,
-            &pools,
-            query.max_hops,
-        )
-        .await
-        {
-            Ok(split_route) => {
-                let estimated_amount = split_route
-                    .emulate_swap(
-                        &query.token_in,
-                        &query.token_out,
-                        amount,
-                        &mut PoolsDelta::default(),
-                    )
-                    .unwrap_or(0);
-                match amount {
-                    QuoteAmount::ExactIn(_) => {
-                        info!(
-                            "Request id: {:06}, Estimated amount out: {}",
-                            request_id, estimated_amount
-                        );
-                    }
-                    QuoteAmount::ExactOut(_) => {
-                        info!(
-                            "Request id: {:06}, Estimated amount in: {}",
-                            request_id, estimated_amount
-                        );
-                    }
-                }
-
-                match split_route.to_api_response(
-                    &query.token_in,
-                    &query.token_out,
-                    amount,
-                    slippage_bp,
-                ) {
-                    Ok(data) => {
-                        let resp = ApiResponse {
-                            result_code: RC_SUCCESS,
-                            result_message: "".into(),
-                            result_data: Some(data),
-                        };
-                        Ok(warp::reply::json(&resp))
-                    }
-                    Err(e) => {
-                        let resp: ApiResponse<()> = ApiResponse {
-                            result_code: RC_RESPONSE_BUILD_ERROR,
-                            result_message: e.to_string(),
-                            result_data: None,
-                        };
-                        Ok(warp::reply::json(&resp))
-                    }
-                }
+    let result = match parse_request(query) {
+        Ok(request) => match get_pools().await {
+            Ok(pools) => {
+                tokio::task::spawn_blocking(move || find_path(&pools, request, request_id))
+                    .await
+                    .unwrap_or_else(|e| Err((RC_ROUTE_ERROR, e.to_string())))
             }
-            Err(e) => {
-                let resp: ApiResponse<()> = ApiResponse {
-                    result_code: RC_ROUTE_ERROR,
-                    result_message: e.to_string(),
-                    result_data: None,
-                };
-                Ok(warp::reply::json(&resp))
-            }
+            Err(e) => Err((RC_POOL_FETCH_ERROR, e.to_string())),
         },
-        Err(e) => {
-            let resp: ApiResponse<()> = ApiResponse {
-                result_code: RC_POOL_FETCH_ERROR,
-                result_message: e.to_string(),
-                result_data: None,
-            };
-            Ok(warp::reply::json(&resp))
-        }
-    }
+        Err(e) => Err(e),
+    };
+    Ok(warp::reply::json(&api_response(result)))
 }

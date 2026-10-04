@@ -1,18 +1,15 @@
-#![deny(clippy::float_arithmetic)]
 #![allow(clippy::manual_div_ceil)]
 
-mod math;
-mod pool;
+mod storage;
+
+pub use self::storage::watch;
 
 use bigdecimal::{BigDecimal, RoundingMode};
-use futures_util::StreamExt;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, BlockId, BlockReference, U128};
+use near_min_api::types::{AccountId, Balance, BlockHeight, U128};
 use near_min_api::utils::dec_format;
 use num_traits::{FromPrimitive, ToPrimitive};
 use rand::Rng;
-use serde::de::DeserializeOwned;
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
@@ -21,12 +18,12 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use warp::Filter;
 
-use near_min_api::{QueryFinality, RpcClient, types::Finality};
+use pool_indexer::{AccountState, PoolIndexer};
 use serde::{Deserialize, Serialize};
-use tracing::{Level, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT, SwapResult, U512, as_u128, mul_div_floor};
-use crate::pool::{Pool, PoolInit};
+use rhea_dcl_math::math::{SwapResult, U512, as_u128, mul_div_floor};
+use rhea_dcl_math::pool::{Pool, PoolInit};
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -80,10 +77,6 @@ struct ApiPoolStep {
 }
 
 const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
-const LIST_POOLS_PAGE_SIZE: u64 = 300;
-const POINT_DATA_BATCH_SIZE: usize = 50;
-const POINT_DATA_CONCURRENCY: usize = 4;
-const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 const SLIPPAGE_DENOMINATOR: u128 = 10_000;
 
@@ -93,7 +86,7 @@ const RC_ROUTE_ERROR: i32 = 2;
 const RC_RESPONSE_BUILD_ERROR: i32 = 3;
 const RC_INVALID_SLIPPAGE: i32 = 4;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Metadata {
     state: String,
     #[serde(with = "dec_format")]
@@ -101,7 +94,7 @@ struct Metadata {
     protocol_fee_rate: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PoolInfo {
     pool_id: String,
     token_x: AccountId,
@@ -123,23 +116,6 @@ struct PoolInfo {
     state: String,
 }
 
-#[derive(Deserialize)]
-struct LiquiditySegment {
-    left_point: i32,
-    right_point: i32,
-    #[serde(with = "dec_format")]
-    amount_l: Balance,
-}
-
-#[derive(Deserialize)]
-struct PointOrder {
-    point: i32,
-    #[serde(with = "dec_format")]
-    amount_x: Balance,
-    #[serde(with = "dec_format")]
-    amount_y: Balance,
-}
-
 lazy_static! {
     static ref POOLS_CACHE: Arc<RwLock<Option<Arc<Pools>>>> = Arc::new(RwLock::new(None));
 }
@@ -155,7 +131,9 @@ struct Pools {
 }
 
 impl Pools {
-    fn new(pools: Vec<Pool>, block_height: BlockHeight) -> Self {
+    fn new(mut pools: Vec<Pool>, block_height: BlockHeight) -> Self {
+        // Fixed order, so that routes with equal output are always picked the same way
+        pools.sort_by(|a, b| a.data.id.cmp(&b.data.id));
         let mut tokens = Vec::new();
         let mut token_ids = HashMap::new();
         let mut pair_pools: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
@@ -177,6 +155,9 @@ impl Pools {
         for &(a, b) in pair_pools.keys() {
             neighbors[a].push(b);
             neighbors[b].push(a);
+        }
+        for token_neighbors in &mut neighbors {
+            token_neighbors.sort_unstable();
         }
         Self {
             pools,
@@ -201,164 +182,60 @@ impl Pools {
     }
 }
 
-#[derive(Default)]
-struct SyncedPools {
-    pools: HashMap<String, (serde_json::Value, Option<Pool>)>,
+/// Pools that are not running or have nothing to trade are not loaded
+fn is_tradable(info: &PoolInfo) -> bool {
+    let has_liquidity_or_orders = [
+        &info.total_liquidity,
+        &info.total_order_x,
+        &info.total_order_y,
+    ]
+    .iter()
+    .any(|amount| *amount != "0");
+    info.state == "Running" && has_liquidity_or_orders
 }
 
-async fn get_all_pools(
-    client: &RpcClient,
-    synced: &mut SyncedPools,
-) -> Result<Pools, anyhow::Error> {
-    let contract_id: AccountId = RHEA_DCL_CONTRACT_ID.parse().unwrap();
-    let block_height = client
-        .block(BlockReference::Finality(Finality::None))
-        .await?
-        .header
-        .height;
-    let at = QueryFinality::BlockId(BlockId::Height(block_height));
-
-    let (metadata, frozen_tokens) = tokio::try_join!(
-        async {
-            Ok::<_, anyhow::Error>(
-                client
-                    .call::<Metadata>(contract_id.clone(), "get_metadata", json!({}), at.clone())
-                    .await?,
-            )
+/// Builds a pool from liquidity segments (left, right, liquidity) and orders (point, selling x,
+/// selling y), as `get_liquidity_range` and `get_pointorder_range` return them
+fn build_pool(
+    info: PoolInfo,
+    segments: impl IntoIterator<Item = (i32, i32, Balance)>,
+    orders: impl IntoIterator<Item = (i32, Balance, Balance)>,
+    protocol_fee_rate: u32,
+) -> Result<Pool, anyhow::Error> {
+    Pool::new(
+        PoolInit {
+            id: info.pool_id,
+            token_x: info.token_x,
+            token_y: info.token_y,
+            fee: info.fee,
+            point_delta: info.point_delta,
+            current_point: info.current_point,
+            liquidity: info.liquidity,
+            liquidity_x: info.liquidity_x,
+            fee_charged_x: info.total_fee_x_charged,
+            fee_charged_y: info.total_fee_y_charged,
+            protocol_fee_rate,
         },
-        async {
-            Ok::<_, anyhow::Error>(
-                client
-                    .call::<Vec<AccountId>>(
-                        contract_id.clone(),
-                        "get_frozenlist_tokens",
-                        json!({}),
-                        at.clone(),
-                    )
-                    .await?,
-            )
-        },
-    )?;
+        segments,
+        orders,
+    )
+}
 
-    let page_requests = (0..metadata.pool_count)
-        .step_by(LIST_POOLS_PAGE_SIZE as usize)
-        .map(|from_index| {
-            (
-                contract_id.clone(),
-                "list_pools",
-                json!({ "from_index": from_index, "limit": LIST_POOLS_PAGE_SIZE }),
-                at.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut entries = Vec::new();
-    for page in client
-        .batch_call::<Vec<serde_json::Value>>(page_requests)
-        .await?
-    {
-        entries.extend(page?);
-    }
-
-    let mut changed = Vec::new();
-    for entry in entries {
-        let info: PoolInfo = serde_json::from_value(entry.clone())?;
-        if synced
-            .pools
-            .get(&info.pool_id)
-            .is_some_and(|(last_entry, _)| *last_entry == entry)
-        {
-            continue;
-        }
-        let has_liquidity_or_orders = [
-            &info.total_liquidity,
-            &info.total_order_x,
-            &info.total_order_y,
-        ]
-        .iter()
-        .any(|amount| *amount != "0");
-        if info.state == "Running" && has_liquidity_or_orders {
-            changed.push((info, entry));
-        } else {
-            synced.pools.insert(info.pool_id.clone(), (entry, None));
-        }
-    }
-
-    if !changed.is_empty() {
-        let pool_ids = changed
-            .iter()
-            .map(|(info, _)| info.pool_id.clone())
-            .collect::<Vec<_>>();
-        let (segments, orders) = tokio::try_join!(
-            fetch_point_data::<HashMap<String, LiquiditySegment>>(
-                client,
-                &contract_id,
-                "get_liquidity_range",
-                &pool_ids,
-                &at,
-            ),
-            fetch_point_data::<HashMap<String, PointOrder>>(
-                client,
-                &contract_id,
-                "get_pointorder_range",
-                &pool_ids,
-                &at,
-            ),
-        )?;
-        for (((info, entry), segments), orders) in changed.into_iter().zip(segments).zip(orders) {
-            let pool_id = info.pool_id.clone();
-            let pool = segments.and_then(|segments| {
-                let orders = orders?;
-                Pool::new(
-                    PoolInit {
-                        id: info.pool_id,
-                        token_x: info.token_x,
-                        token_y: info.token_y,
-                        fee: info.fee,
-                        point_delta: info.point_delta,
-                        current_point: info.current_point,
-                        liquidity: info.liquidity,
-                        liquidity_x: info.liquidity_x,
-                        fee_charged_x: info.total_fee_x_charged,
-                        fee_charged_y: info.total_fee_y_charged,
-                        protocol_fee_rate: metadata.protocol_fee_rate,
-                    },
-                    segments
-                        .into_values()
-                        .map(|segment| (segment.left_point, segment.right_point, segment.amount_l)),
-                    orders
-                        .into_values()
-                        .map(|order| (order.point, order.amount_x, order.amount_y)),
-                )
-            });
-            match pool {
-                Ok(pool) => {
-                    synced.pools.insert(pool_id, (entry, Some(pool)));
-                }
-                Err(e) => {
-                    // Not remembered, so it's fetched again on the next refresh
-                    error!("Failed to load pool {pool_id} at block {block_height}: {e}");
-                    synced.pools.remove(&pool_id);
-                }
-            }
-        }
-        info!(
-            "Loaded {} changed pools at block {block_height}",
-            pool_ids.len()
-        );
-    }
-
-    let pools = if metadata.state == "Running" {
+/// Pools that can be routed through, given the contract state
+fn active_pools(
+    pools: impl IntoIterator<Item = Pool>,
+    metadata: &Metadata,
+    frozen_tokens: Vec<AccountId>,
+) -> Vec<Pool> {
+    if metadata.state == "Running" {
         let frozen_tokens = frozen_tokens.into_iter().collect::<HashSet<_>>();
-        synced
-            .pools
-            .values()
-            .filter_map(|(_, pool)| pool.as_ref())
+        pools
+            .into_iter()
             .filter(|pool| {
                 !frozen_tokens.contains(&pool.data.token_x)
                     && !frozen_tokens.contains(&pool.data.token_y)
             })
-            .map(|pool| {
-                let mut pool = pool.clone();
+            .map(|mut pool| {
                 pool.set_protocol_fee_rate(metadata.protocol_fee_rate);
                 pool
             })
@@ -366,66 +243,59 @@ async fn get_all_pools(
     } else {
         warn!("{RHEA_DCL_CONTRACT_ID} is {}", metadata.state);
         Vec::new()
-    };
-    Ok(Pools::new(pools, block_height))
+    }
 }
 
-async fn fetch_point_data<R: DeserializeOwned>(
-    client: &RpcClient,
-    contract_id: &AccountId,
-    method: &'static str,
-    pool_ids: &[String],
-    at: &QueryFinality,
-) -> Result<Vec<Result<R, anyhow::Error>>, anyhow::Error> {
-    let requests = pool_ids
-        .iter()
-        .map(|pool_id| {
-            (
-                contract_id.clone(),
-                method,
-                json!({
-                    "pool_id": pool_id,
-                    "left_point": LEFT_MOST_POINT,
-                    "right_point": RIGHT_MOST_POINT,
-                }),
-                at.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    // A plain loop instead of a closure: a closure here makes the spawned update task fail
-    // the `Send` check ("implementation of `FnOnce` is not general enough")
-    let mut batch_futures = Vec::new();
-    for chunk in requests.chunks(POINT_DATA_BATCH_SIZE) {
-        batch_futures.push(client.batch_call::<R>(chunk.to_vec()));
-    }
-    let batches = futures_util::stream::iter(batch_futures)
-        .buffered(POINT_DATA_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    let mut results = Vec::with_capacity(pool_ids.len());
-    for batch in batches {
-        results.extend(batch?.into_iter().map(|result| result.map_err(Into::into)));
-    }
-    Ok(results)
-}
-
-async fn start_pools_update_task(client: Arc<RpcClient>) {
-    tokio::spawn(async move {
-        let mut synced = SyncedPools::default();
-        loop {
-            match get_all_pools(&client, &mut synced).await {
-                Ok(pools) => {
-                    let mut cache = POOLS_CACHE.write().await;
-                    *cache = Some(Arc::new(pools));
-                }
-                Err(e) => {
-                    error!("Failed to update pools: {e}");
-                }
-            }
-
-            tokio::time::sleep(REFRESH_INTERVAL).await;
+/// Builds pools from indexed storage
+fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error> {
+    let block_height = state.block.height;
+    let (metadata, frozen_tokens) = storage::contract(state)?;
+    let mut built = Vec::new();
+    for info in storage::pools(state, metadata.pool_count)? {
+        if !is_tradable(&info) {
+            continue;
         }
-    });
+        let pool_id = info.pool_id.clone();
+        let point_data = storage::point_data(state, &pool_id, info.current_point)?;
+        match build_pool(
+            info,
+            point_data.segments,
+            point_data.orders,
+            metadata.protocol_fee_rate,
+        ) {
+            Ok(pool) => built.push(pool),
+            // Pool::new checks that liquidity at the current point matches the pool
+            Err(e) => error!("Failed to load pool {pool_id} at block {block_height}: {e}"),
+        }
+    }
+    Ok(Pools::new(
+        active_pools(built, &metadata, frozen_tokens),
+        block_height,
+    ))
+}
+
+/// Builds pools from indexed storage after every block, returns why it stopped
+async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
+    let account_id: AccountId = RHEA_DCL_CONTRACT_ID.parse().unwrap();
+    let mut blocks = indexer.blocks();
+    loop {
+        if blocks.changed().await.is_err() {
+            return anyhow::anyhow!("Pool indexer stopped");
+        }
+        let Some(state) = indexer.account_state(&account_id) else {
+            continue;
+        };
+        let height = state.block.height;
+        match tokio::task::spawn_blocking(move || build_indexed_pools(&state)).await {
+            Ok(Ok(pools)) => *POOLS_CACHE.write().await = Some(Arc::new(pools)),
+            Ok(Err(e)) => {
+                return e.context(format!("Failed to build Rhea DCL pools at block {height}"));
+            }
+            Err(e) => {
+                return anyhow::anyhow!("Building Rhea DCL pools at block {height} panicked: {e}");
+            }
+        }
+    }
 }
 
 async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
@@ -442,38 +312,17 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    dotenvy::dotenv().ok();
-
-    tracing_subscriber::fmt()
-        .pretty()
-        .with_file(true)
-        .with_line_number(true)
-        .with_max_level(Level::INFO)
-        .init();
-
-    let client = Arc::new(RpcClient::new(
-        std::env::var("RPC_URLS")
-            .unwrap_or_else(|_| {
-                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
-                    .to_string()
-            })
-            .split(',')
-            .map(|url| url.to_string())
-            .collect::<Vec<_>>(),
-    ));
-
-    start_pools_update_task(client.clone()).await;
-
+/// Serves findPath, returns why it stopped
+pub async fn run(indexer: PoolIndexer) -> anyhow::Error {
     let api = warp::path("findPath")
         .and(warp::query::<FindPathQuery>())
         .and_then(handle_find_path);
 
     info!("Server listening on http://localhost:12347/findPath ...");
-    warp::serve(api).run(([127, 0, 0, 1], 12347)).await;
-
-    Ok(())
+    tokio::select! {
+        () = warp::serve(api).run(([127, 0, 0, 1], 12347)) => anyhow::anyhow!("Server stopped"),
+        error = update_pools(indexer) => error,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -827,13 +676,99 @@ where
     value.parse().map_err(serde::de::Error::custom)
 }
 
-fn error_reply(result_code: i32, result_message: String) -> warp::reply::Json {
-    let resp: ApiResponse<()> = ApiResponse {
-        result_code,
-        result_message,
-        result_data: None,
+struct Request {
+    token_in: AccountId,
+    token_out: AccountId,
+    amount: QuoteAmount,
+    max_hops: MaxHops,
+    slippage_bp: u128,
+}
+
+fn parse_request(query: FindPathQuery) -> Result<Request, (i32, String)> {
+    let amount = match (query.amount_in, query.amount_out) {
+        (Some(amount_in), None) => QuoteAmount::ExactIn(amount_in),
+        (None, Some(amount_out)) => QuoteAmount::ExactOut(amount_out),
+        _ => {
+            return Err((
+                RC_ROUTE_ERROR,
+                "Provide either amountIn or amountOut".into(),
+            ));
+        }
     };
-    warp::reply::json(&resp)
+    if amount.value() == 0 || query.token_in == query.token_out {
+        return Err((
+            RC_ROUTE_ERROR,
+            "Amount must be positive and tokens must be different".into(),
+        ));
+    }
+
+    if query.slippage < 0 || query.slippage > 1 {
+        return Err((RC_INVALID_SLIPPAGE, "Invalid slippage".into()));
+    }
+    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
+        .with_scale_round(0, RoundingMode::Down)
+        .to_u128()
+        .unwrap();
+    Ok(Request {
+        token_in: query.token_in,
+        token_out: query.token_out,
+        amount,
+        max_hops: query.max_hops,
+        slippage_bp,
+    })
+}
+
+/// CPU-bound, emulates swaps
+fn find_path(
+    pools: &Pools,
+    request: &Request,
+    request_id: u32,
+) -> Result<RouteApiResponse, (i32, String)> {
+    let (Some(&token_in), Some(&token_out)) = (
+        pools.token_ids.get(&request.token_in),
+        pools.token_ids.get(&request.token_out),
+    ) else {
+        return Err((RC_ROUTE_ERROR, "No routes found".into()));
+    };
+
+    let best_route = route(pools, token_in, token_out, request.amount, request.max_hops)
+        .map_err(|e| (RC_ROUTE_ERROR, e.to_string()))?;
+    let data = to_api_response(
+        &best_route,
+        pools,
+        token_in,
+        token_out,
+        request.amount,
+        request.slippage_bp,
+    )
+    .map_err(|e| (RC_RESPONSE_BUILD_ERROR, e.to_string()))?;
+
+    match &data {
+        RouteApiResponse::ExactIn { amount_out, .. } => info!(
+            "Request id: {:06}, Estimated amount out: {}, block: {}",
+            request_id, amount_out.0, pools.block_height
+        ),
+        RouteApiResponse::ExactOut { amount_in, .. } => info!(
+            "Request id: {:06}, Estimated amount in: {}, block: {}",
+            request_id, amount_in.0, pools.block_height
+        ),
+    }
+    Ok(data)
+}
+
+fn api_response<T>(result: Result<T, (i32, String)>) -> ApiResponse<T> {
+    match result {
+        Ok(data) => ApiResponse {
+            result_code: RC_SUCCESS,
+            result_message: "".into(),
+            result_data: Some(data),
+        },
+        Err((result_code, result_message)) => ApiResponse {
+            result_code,
+            result_message,
+            result_data: None,
+        },
+    }
 }
 
 async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
@@ -849,79 +784,16 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         query.slippage
     );
 
-    let amount = match (query.amount_in, query.amount_out) {
-        (Some(amount_in), None) => QuoteAmount::ExactIn(amount_in),
-        (None, Some(amount_out)) => QuoteAmount::ExactOut(amount_out),
-        _ => {
-            return Ok(error_reply(
-                RC_ROUTE_ERROR,
-                "Provide either amountIn or amountOut".into(),
-            ));
-        }
-    };
-    if amount.value() == 0 || query.token_in == query.token_out {
-        return Ok(error_reply(
-            RC_ROUTE_ERROR,
-            "Amount must be positive and tokens must be different".into(),
-        ));
-    }
-
-    if query.slippage < 0 || query.slippage > 1 {
-        return Ok(error_reply(RC_INVALID_SLIPPAGE, "Invalid slippage".into()));
-    }
-    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
-        .with_scale_round(0, RoundingMode::Down)
-        .to_u128()
-        .unwrap();
-
-    let pools = match get_pools().await {
-        Ok(pools) => pools,
-        Err(e) => return Ok(error_reply(RC_POOL_FETCH_ERROR, e.to_string())),
-    };
-    let (Some(&token_in), Some(&token_out)) = (
-        pools.token_ids.get(&query.token_in),
-        pools.token_ids.get(&query.token_out),
-    ) else {
-        return Ok(error_reply(RC_ROUTE_ERROR, "No routes found".into()));
-    };
-
-    // Emulating swaps is CPU-bound
-    let max_hops = query.max_hops;
-    let result = tokio::task::spawn_blocking(move || {
-        let best_route = route(&pools, token_in, token_out, amount, max_hops)
-            .map_err(|e| (RC_ROUTE_ERROR, e))?;
-        to_api_response(
-            &best_route,
-            &pools,
-            token_in,
-            token_out,
-            amount,
-            slippage_bp,
-        )
-        .map_err(|e| (RC_RESPONSE_BUILD_ERROR, e))
-    })
-    .await
-    .unwrap_or_else(|e| Err((RC_ROUTE_ERROR, e.into())));
-
-    match result {
-        Ok(data) => {
-            match &data {
-                RouteApiResponse::ExactIn { amount_out, .. } => info!(
-                    "Request id: {:06}, Estimated amount out: {}",
-                    request_id, amount_out.0
-                ),
-                RouteApiResponse::ExactOut { amount_in, .. } => info!(
-                    "Request id: {:06}, Estimated amount in: {}",
-                    request_id, amount_in.0
-                ),
+    let result = match parse_request(query) {
+        Ok(request) => match get_pools().await {
+            Ok(pools) => {
+                tokio::task::spawn_blocking(move || find_path(&pools, &request, request_id))
+                    .await
+                    .unwrap_or_else(|e| Err((RC_ROUTE_ERROR, e.to_string())))
             }
-            let resp = ApiResponse {
-                result_code: RC_SUCCESS,
-                result_message: "".into(),
-                result_data: Some(data),
-            };
-            Ok(warp::reply::json(&resp))
-        }
-        Err((result_code, e)) => Ok(error_reply(result_code, e.to_string())),
-    }
+            Err(e) => Err((RC_POOL_FETCH_ERROR, e.to_string())),
+        },
+        Err(e) => Err(e),
+    };
+    Ok(warp::reply::json(&api_response(result)))
 }

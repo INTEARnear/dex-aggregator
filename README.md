@@ -8,15 +8,21 @@ Refer to https://docs.intear.tech/docs/dex-aggregator/ for integration instructi
 
 ## Architecture
 
-It's separated into 3 crates:
+It's separated into 4 crates:
 
 - `swap-router`: the main aggregator crate, hosts the API and builds transactions. Example URL: https://router.intear.tech/route?token_in=rhea-nep141:wrap.near&token_out=juij.launch.intear.near&amount_in=1000000000000000000000000&max_wait_ms=2000&slippage_type=Fixed&slippage=0.01&dexes=Rhea%2CAidols%2CWrap%2CRheaDcl%2CMetaPool%2CLinear%2CXRhea%2CRNear%2CPlach&trader_account_id=intear.near&signing_public_key=ed25519%3A4WZAP6JoruNHR2W4mi9fM219viZKYskqLRDYkwBHCUY8&referrer_id=intear.near
-- `rhea-pathfinder`: smartrouter.ref.finance-almost-compatible internal API that finds the best route among all Rhea pools. Example URL: http://localhost:12345/findPath?amountIn=1000000000000000000000&tokenIn=wrap.near&tokenOut=jambo-1679.meme-cooking.near&maxHops=Four&slippage=0.05
-- `plach-pathfinder`: same thing as `rhea-pathfinder` but for Intear Plach. Example URL: http://localhost:12346/findPath?amountIn=1000000000000000000000000000&tokenIn=near&tokenOut=nep141:juij.launch.intear.near&maxHops=Four&slippage=0.0005, http://localhost:12346/findPath?amountOut=1000000000000000000000000000000&tokenIn=near&tokenOut=nep141:juij.launch.intear.near&maxHops=DirectOnly&slippage=0.005
+- `pathfinder`: internal API that finds the best route within a single DEX. One process serves every DEX on its own port:
+  - Rhea on port 12345: smartrouter.ref.finance-almost-compatible API that finds the best route among all Rhea pools. Example URL: http://localhost:12345/findPath?amountIn=1000000000000000000000&tokenIn=wrap.near&tokenOut=jambo-1679.meme-cooking.near&maxHops=Four&slippage=0.05
+  - Intear Plach on port 12346: same thing as Rhea but for Intear Plach. Example URL: http://localhost:12346/findPath?amountIn=1000000000000000000000000000&tokenIn=near&tokenOut=nep141:juij.launch.intear.near&maxHops=Four&slippage=0.0005, http://localhost:12346/findPath?amountOut=1000000000000000000000000000000&tokenIn=near&tokenOut=nep141:juij.launch.intear.near&maxHops=DirectOnly&slippage=0.005
+  - Rhea DCL on port 12347: finds the best route through up to 3 DCL pools
+- `rhea-dcl-math`: Rhea DCL swap math used by `pathfinder`, ported from iZiSwap (GPL-2.0-or-later)
+- `pool-indexer`: keeps a copy of the contract storage that pools are built from
+
+Routing is deterministic, so running `quote` again on the same block heights and queries gives identical output.
 
 ## Routing strategies
 
-- `Rhea`: uses `rhea-pathfinder`
+- `Rhea`: uses `pathfinder`
 - `Aidols`: calls `emulate_swap` or `emulate_swap_by_out` for *.aidols.near tokens. Fails if the token has already bonded to Rhea
 - `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different-output-token-locations))
 - `RheaDcl`: scans all direct pairs (max possible by contract is 4 between 2 tokens, due to 4 different fee tiers) and emulates each of them on chain using `quote` view method. Advanced cross-pool routing is not implemented due to there being only ~6 pools with over $0 daily volume, and DCL contract not being open source
@@ -24,8 +30,8 @@ It's separated into 3 crates:
 - `Linear`: staking NEAR into LiNEAR. Doesn't implement liquid withdrawal (official way is to sell on Rhea). Slippage is only ever possible between epoch boundaries, so API assumes there's no slippage
 - `XRhea`: staking RHEA into xRHEA & unstaking. There's no staking lock or fee.
 - `RNear`: liquid staking provider based on LiNEAR, so behavior copies `Linear`
-- `Plach`: uses `plach-pathfinder`
-- `RheaDclV2`: uses `rhea-dcl-pathfinder`. Finds the best route through up to 3 DCL pools.
+- `Plach`: uses `pathfinder`
+- `RheaDclV2`: uses `pathfinder`. Finds the best route through up to 3 DCL pools.
 
 ## Different output token locations
 

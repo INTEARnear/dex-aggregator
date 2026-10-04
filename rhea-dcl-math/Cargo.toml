@@ -1,0 +1,12 @@
+[package]
+name = "rhea-dcl-math"
+version = "0.1.0"
+edition = "2024"
+# based on iziswap
+license = "GPL-2.0-or-later"
+
+[dependencies]
+near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+anyhow = "1"
+lazy_static = "1"
+uint = "0.10"

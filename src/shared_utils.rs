@@ -12,7 +12,7 @@ use lazy_static::lazy_static;
 use near_min_api::{
     types::{
         AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, Finality,
-        FunctionCallAction, Gas, NearGas, NearToken, U128,
+        FunctionCallAction, Gas, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -152,17 +152,6 @@ pub trait NetworkView: Send + Sync {
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
-
-    fn native_balance(
-        &self,
-        account_id: &AccountId,
-    ) -> impl Future<Output = Result<NearToken, String>> + Send;
-
-    fn ft_balance(
-        &self,
-        account_id: &AccountId,
-        token_id: &AccountId,
-    ) -> impl Future<Output = Result<Balance, String>> + Send;
 }
 
 pub struct Mainnet;
@@ -237,35 +226,6 @@ impl NetworkView for Mainnet {
     fn current_block_height(&self) -> Result<BlockHeight, String> {
         BLOCK_HEIGHT.read().unwrap().clone()
     }
-
-    async fn native_balance(&self, account_id: &AccountId) -> Result<NearToken, String> {
-        RPC_CLIENT
-            .view_account(account_id.clone(), QueryFinality::Finality(Finality::None))
-            .await
-            .map(|account| account.amount)
-            .inspect_err(|err| println!("Error getting native balance: {err:?}"))
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    async fn ft_balance(
-        &self,
-        account_id: &AccountId,
-        token_id: &AccountId,
-    ) -> Result<Balance, String> {
-        RPC_CLIENT
-            .call::<U128>(
-                token_id.clone(),
-                "ft_balance_of",
-                serde_json::json!({
-                    "account_id": account_id,
-                }),
-                QueryFinality::Finality(Finality::None),
-            )
-            .await
-            .map(|balance| balance.0)
-            .inspect_err(|err| println!("Error getting ft balance: {err:?}"))
-            .map_err(|err| format!("{err:?}"))
-    }
 }
 
 #[cfg(test)]
@@ -278,7 +238,6 @@ pub(crate) struct TestNetworkView {
     tokens: Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
-    ft_balances: HashMap<(AccountId, AccountId), Balance>,
 }
 
 #[cfg(test)]
@@ -292,7 +251,6 @@ impl Default for TestNetworkView {
             tokens: Ok(Arc::default()),
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
-            ft_balances: HashMap::new(),
         }
     }
 }
@@ -414,26 +372,6 @@ impl NetworkView for TestNetworkView {
 
     fn current_block_height(&self) -> Result<BlockHeight, String> {
         self.block_height.clone()
-    }
-
-    async fn native_balance(&self, account_id: &AccountId) -> Result<NearToken, String> {
-        Ok(self
-            .native_balances
-            .get(account_id)
-            .copied()
-            .unwrap_or(NearToken::from_near(10)))
-    }
-
-    async fn ft_balance(
-        &self,
-        account_id: &AccountId,
-        token_id: &AccountId,
-    ) -> Result<Balance, String> {
-        Ok(self
-            .ft_balances
-            .get(&(account_id.clone(), token_id.clone()))
-            .copied()
-            .unwrap_or(Balance::zero()))
     }
 }
 

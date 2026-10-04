@@ -1,18 +1,17 @@
-#![deny(clippy::float_arithmetic)]
-#![allow(clippy::manual_div_ceil)]
-
 mod degen;
 mod rated;
 mod stable;
+mod storage;
+
+pub use self::storage::watch;
 
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, AccountIdRef, Balance};
+use near_min_api::types::{AccountId, AccountIdRef, Balance, BlockHeight};
 use near_min_api::utils::dec_format;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
-
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -20,13 +19,13 @@ use tokio::time::Instant;
 use uint::construct_uint;
 use warp::Filter;
 
-use near_min_api::{QueryFinality, RpcClient, types::Finality};
+use pool_indexer::PoolIndexer;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, error, info, warn};
+use tracing::{Level, info, warn};
 
-use crate::degen::DegenSwap;
-use crate::rated::RatedSwap;
-use crate::stable::StableSwap;
+use self::degen::DegenSwap;
+use self::rated::RatedSwap;
+use self::stable::StableSwap;
 
 #[derive(Serialize)]
 struct ApiResponse<T> {
@@ -76,8 +75,8 @@ const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
 const SMALL_AMOUNT_ROUTE_STEP_SIZE: u32 = 25; // %
 const MAX_SPLITS_COUNT: usize = 2;
 const FEE_DIVISOR: u32 = 10_000;
-const FETCH_POOLS_BATCH_SIZE: usize = 1000;
 const TOP_ROUTES_COUNT: usize = 10;
+const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
 const RC_SUCCESS: i32 = 0;
 const RC_POOL_FETCH_ERROR: i32 = 1;
@@ -534,6 +533,8 @@ lazy_static! {
 }
 
 struct Pools {
+    block_height: BlockHeight,
+    updated_at: Instant,
     pools: Vec<Pool>,
     pools_existing: HashSet<BTreeSet<AccountId>>,
     token_to_pools: HashMap<AccountId, Vec<usize>>,
@@ -570,64 +571,20 @@ impl Pools {
     }
 }
 
-async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
-    let number_of_pools: u64 = client
-        .call(
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_number_of_pools",
-            (),
-            QueryFinality::Finality(Finality::None),
-        )
-        .await?;
-    info!("Number of pools for data fetch: {}", number_of_pools);
+/// Everything a pools snapshot is built from, as returned by RPC at one block
+#[derive(Serialize, Deserialize)]
+struct PoolsSource {
+    block_height: BlockHeight,
+    pools: Vec<PoolInfo>,
+    detail_infos: Vec<PoolDetailInfo>,
+}
 
-    let mut pools_batch_requests = Vec::new();
-    let mut detail_infos_batch_requests = Vec::new();
-
-    for i in (0..number_of_pools).step_by(FETCH_POOLS_BATCH_SIZE) {
-        let request_args = serde_json::json!({
-            "from_index": i,
-            "limit": FETCH_POOLS_BATCH_SIZE,
-        });
-
-        pools_batch_requests.push((
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_pools",
-            request_args.clone(),
-            QueryFinality::Finality(Finality::None),
-        ));
-
-        detail_infos_batch_requests.push((
-            RHEA_CONTRACT_ID.parse().unwrap(),
-            "get_pool_detail_infos",
-            request_args,
-            QueryFinality::Finality(Finality::None),
-        ));
-    }
-
-    let (pools, detail_infos) = tokio::try_join!(
-        async {
-            let batches: Vec<Result<Vec<PoolInfo>, _>> =
-                client.batch_call(pools_batch_requests).await?;
-            let mut pools = Vec::new();
-            for result in batches {
-                let pool_batch = result?;
-                pools.extend(pool_batch);
-            }
-            Ok::<Vec<PoolInfo>, anyhow::Error>(pools)
-        },
-        async {
-            let batches: Vec<Result<Vec<PoolDetailInfo>, _>> =
-                client.batch_call(detail_infos_batch_requests).await?;
-            let mut detail_infos = Vec::new();
-            for result in batches {
-                let detail_batch = result?;
-                detail_infos.extend(detail_batch);
-            }
-            Ok::<Vec<PoolDetailInfo>, anyhow::Error>(detail_infos)
-        }
-    )?;
-
+fn build_pools(source: PoolsSource) -> Result<Pools, anyhow::Error> {
+    let PoolsSource {
+        block_height,
+        pools,
+        detail_infos,
+    } = source;
     if pools.len() != detail_infos.len() {
         return Err(anyhow::anyhow!(
             "Pools and detail infos have different lengths"
@@ -678,6 +635,8 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
     }
 
     Ok(Pools {
+        block_height,
+        updated_at: Instant::now(),
         pools: pools_vec,
         pools_existing,
         token_to_pools,
@@ -685,68 +644,60 @@ async fn get_all_pools(client: &RpcClient) -> Result<Pools, anyhow::Error> {
     })
 }
 
-async fn start_pools_update_task(client: Arc<RpcClient>) {
-    tokio::spawn(async move {
-        loop {
-            match get_all_pools(&client).await {
-                Ok(pools) => {
-                    let mut cache = POOLS_CACHE.write().await;
-                    *cache = Some(Arc::new(pools));
-                }
-                Err(e) => {
-                    error!("Failed to update pools: {}", e);
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-    });
-}
-
-async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
+/// Builds pools from indexed storage after every block, returns why it stopped
+async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
+    let account_id: AccountId = RHEA_CONTRACT_ID.parse().unwrap();
+    let mut blocks = indexer.blocks();
     loop {
-        if let Some(pools) = POOLS_CACHE.read().await.as_ref() {
-            return Ok(Arc::clone(pools));
+        if blocks.changed().await.is_err() {
+            return anyhow::anyhow!("Pool indexer stopped");
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let Some(state) = indexer.account_state(&account_id) else {
+            continue;
+        };
+        let height = state.block.height;
+        let pools =
+            tokio::task::spawn_blocking(move || build_pools(storage::pools_source(&state)?)).await;
+        match pools {
+            Ok(Ok(pools)) => *POOLS_CACHE.write().await = Some(Arc::new(pools)),
+            Ok(Err(e)) => {
+                return e.context(format!("Failed to build Rhea pools at block {height}"));
+            }
+            Err(e) => {
+                return anyhow::anyhow!("Building Rhea pools at block {height} panicked: {e}");
+            }
+        }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    dotenvy::dotenv().ok();
+async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
+    let Some(pools) = POOLS_CACHE.read().await.clone() else {
+        return Err(anyhow::anyhow!("Pools are not loaded"));
+    };
+    let age = pools.updated_at.elapsed();
+    if age > MAX_SNAPSHOT_AGE {
+        return Err(anyhow::anyhow!(
+            "Pools were last updated {age:?} ago, at block {}",
+            pools.block_height
+        ));
+    }
+    Ok(pools)
+}
 
-    tracing_subscriber::fmt()
-        .pretty()
-        .with_file(true)
-        .with_line_number(true)
-        .with_max_level(Level::INFO)
-        .init();
-
-    let client = Arc::new(RpcClient::new(
-        std::env::var("RPC_URLS")
-            .unwrap_or_else(|_| {
-                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
-                    .to_string()
-            })
-            .split(',')
-            .map(|url| url.to_string())
-            .collect::<Vec<_>>(),
-    ));
-
-    start_pools_update_task(client.clone()).await;
-
+/// Serves findPath, returns why it stopped
+pub async fn run(indexer: PoolIndexer) -> anyhow::Error {
     let api = warp::path("findPath")
         .and(warp::query::<FindPathQuery>())
         .and_then(handle_find_path);
 
     info!("Server listening on http://localhost:12345/findPath ...");
-    warp::serve(api).run(([127, 0, 0, 1], 12345)).await;
-
-    Ok(())
+    tokio::select! {
+        () = warp::serve(api).run(([127, 0, 0, 1], 12345)) => anyhow::anyhow!("Server stopped"),
+        error = update_pools(indexer) => error,
+    }
 }
 
-async fn route<'a>(
+fn route<'a>(
     token_in: &'a AccountId,
     token_out: &'a AccountId,
     amount: Balance,
@@ -1199,10 +1150,10 @@ fn find_best_routes<'a>(
 
     let starting_pool_tokens = starting_pool_candidates
         .flat_map(|pool| &pool.info.token_account_ids)
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let ending_pool_tokens = ending_pool_candidates
         .flat_map(|pool| &pool.info.token_account_ids)
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let possible_intermediate_tokens = starting_pool_tokens
         .intersection(&ending_pool_tokens)
         .filter(|&&token| token != token_in && token != token_out)
@@ -1381,6 +1332,81 @@ struct FindPathQuery {
     slippage: Option<f64>, // e.g., 0.005 for 0.5 %
 }
 
+struct Request {
+    token_in: AccountId,
+    token_out: AccountId,
+    amount_in: Balance,
+    max_hops: MaxHops,
+    slippage_bp: u128,
+}
+
+fn parse_request(query: FindPathQuery) -> Result<Request, (i32, String)> {
+    if query.slippage.is_some_and(|s| !(0.0..=1.0).contains(&s)) {
+        return Err((RC_INVALID_SLIPPAGE, "Invalid slippage".into()));
+    }
+    #[allow(clippy::float_arithmetic)]
+    let slippage_bp: u128 = query.slippage.map(|v| (v * 10_000.0) as u128).unwrap_or(50);
+    Ok(Request {
+        token_in: query.token_in,
+        token_out: query.token_out,
+        amount_in: query.amount_in,
+        max_hops: query.max_hops,
+        slippage_bp,
+    })
+}
+
+/// CPU-bound, emulates swaps
+fn find_path(
+    pools: &Pools,
+    request: Request,
+    request_id: u32,
+) -> Result<SplitRouteApiResponse, (i32, String)> {
+    let split_route = route(
+        &request.token_in,
+        &request.token_out,
+        request.amount_in,
+        pools,
+        request.max_hops,
+    )
+    .map_err(|e| (RC_ROUTE_ERROR, e.to_string()))?;
+    let estimated_out = split_route
+        .emulate_swap(
+            &request.token_in,
+            &request.token_out,
+            request.amount_in,
+            &mut PoolsDelta::default(),
+        )
+        .unwrap_or(0);
+    info!(
+        "Request id: {:06}, Estimated amount out: {}, block: {}",
+        request_id, estimated_out, pools.block_height
+    );
+
+    split_route
+        .to_api_response(
+            &request.token_in,
+            &request.token_out,
+            request.amount_in,
+            request.slippage_bp,
+        )
+        .map_err(|e| (RC_RESPONSE_BUILD_ERROR, e.to_string()))
+}
+
+fn api_response<T>(result: Result<T, (i32, String)>) -> ApiResponse<T> {
+    match result {
+        Ok(data) => ApiResponse {
+            result_code: RC_SUCCESS,
+            result_message: "".into(),
+            result_data: Some(data),
+        },
+        Err((result_code, result_message)) => ApiResponse {
+            result_code,
+            result_message,
+            result_data: None,
+        },
+    }
+}
+
 async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
     let request_id = rand::thread_rng().gen_range(1..1000000);
     info!(
@@ -1393,81 +1419,16 @@ async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp
         query.slippage
     );
 
-    if query.slippage.is_some_and(|s| !(0.0..=1.0).contains(&s)) {
-        let resp: ApiResponse<()> = ApiResponse {
-            result_code: RC_INVALID_SLIPPAGE,
-            result_message: "Invalid slippage".into(),
-            result_data: None,
-        };
-        return Ok(warp::reply::json(&resp));
-    }
-    #[allow(clippy::float_arithmetic)]
-    let slippage_bp: u128 = query.slippage.map(|v| (v * 10_000.0) as u128).unwrap_or(50);
-
-    match get_pools().await {
-        Ok(pools) => match route(
-            &query.token_in,
-            &query.token_out,
-            query.amount_in,
-            &pools,
-            query.max_hops,
-        )
-        .await
-        {
-            Ok(split_route) => {
-                let estimated_out = split_route
-                    .emulate_swap(
-                        &query.token_in,
-                        &query.token_out,
-                        query.amount_in,
-                        &mut PoolsDelta::default(),
-                    )
-                    .unwrap_or(0);
-                info!(
-                    "Request id: {:06}, Estimated amount out: {}",
-                    request_id, estimated_out
-                );
-
-                match split_route.to_api_response(
-                    &query.token_in,
-                    &query.token_out,
-                    query.amount_in,
-                    slippage_bp,
-                ) {
-                    Ok(data) => {
-                        let resp = ApiResponse {
-                            result_code: RC_SUCCESS,
-                            result_message: "".into(),
-                            result_data: Some(data),
-                        };
-                        Ok(warp::reply::json(&resp))
-                    }
-                    Err(e) => {
-                        let resp: ApiResponse<()> = ApiResponse {
-                            result_code: RC_RESPONSE_BUILD_ERROR,
-                            result_message: e.to_string(),
-                            result_data: None,
-                        };
-                        Ok(warp::reply::json(&resp))
-                    }
-                }
+    let result = match parse_request(query) {
+        Ok(request) => match get_pools().await {
+            Ok(pools) => {
+                tokio::task::spawn_blocking(move || find_path(&pools, request, request_id))
+                    .await
+                    .unwrap_or_else(|e| Err((RC_ROUTE_ERROR, e.to_string())))
             }
-            Err(e) => {
-                let resp: ApiResponse<()> = ApiResponse {
-                    result_code: RC_ROUTE_ERROR,
-                    result_message: e.to_string(),
-                    result_data: None,
-                };
-                Ok(warp::reply::json(&resp))
-            }
+            Err(e) => Err((RC_POOL_FETCH_ERROR, e.to_string())),
         },
-        Err(e) => {
-            let resp: ApiResponse<()> = ApiResponse {
-                result_code: RC_POOL_FETCH_ERROR,
-                result_message: e.to_string(),
-                result_data: None,
-            };
-            Ok(warp::reply::json(&resp))
-        }
-    }
+        Err(e) => Err(e),
+    };
+    Ok(warp::reply::json(&api_response(result)))
 }

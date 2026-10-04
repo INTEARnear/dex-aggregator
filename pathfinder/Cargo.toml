@@ -1,14 +1,17 @@
 [package]
-name = "rhea-pathfinder"
+name = "pathfinder"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+rhea-dcl-math = { path = "../rhea-dcl-math" }
+pool-indexer = { path = "../pool-indexer" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7.1"
 lazy_static = "1"
 itertools = "0.14"
 uint = "0.10"
@@ -17,3 +20,9 @@ rand = "0.8"
 dotenvy = "0.15.7"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+crypto-bigint = { version = "0.6.1", default-features = false }
+base64 = "0.21.0"
+borsh = "1.6.0"
+bigdecimal = "0.4.10"
+num-traits = "0.2.19"
+futures-util = "0.3.31"

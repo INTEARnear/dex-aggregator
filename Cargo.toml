@@ -30,4 +30,4 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 overflow-checks = true
 
 [workspace]
-members = ["rhea-pathfinder", "plach-pathfinder", "rhea-dcl-pathfinder"]
+members = ["pathfinder", "rhea-dcl-math", "pool-indexer"]

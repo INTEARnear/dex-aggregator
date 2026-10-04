@@ -11,8 +11,7 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage, needs_storage_deposit_for_contract, Mainnet, NetworkView, REQWEST_CLIENT,
-        WRAP_NEAR,
+        get_slippage, Mainnet, NetworkView, REQWEST_CLIENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -630,32 +629,6 @@ mod tests {
                 },
                 &TestNetworkView::default(),
                 &TestRheaDclQuotes::none(),
-            )
-            .await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn not_enough_near_for_storage_returns_none() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141("ft".parse().unwrap()),
-                    token_out: TokenId::Nep141("other".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default()
-                    .with_native_balance("trader.near", NearToken::from_millinear(100)),
-                &TestRheaDclQuotes::default(),
             )
             .await,
             None
