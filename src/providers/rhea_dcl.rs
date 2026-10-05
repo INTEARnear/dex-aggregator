@@ -1,19 +1,16 @@
 use std::{future::Future, pin::Pin};
 
-use bigdecimal::{BigDecimal, RoundingMode};
-use near_min_api::{
-    types::{AccountId, Action, Balance, Finality, FunctionCallAction, Gas, NearGas, NearToken},
-    utils::dec_format,
-    QueryFinality,
+use near_min_api::types::{AccountId, Action, FunctionCallAction, NearGas, NearToken};
+use pathfinder::{
+    dcl::{self, RouteApiResponse},
+    MaxHops, QuoteAmount,
 };
-use num_traits::ToPrimitive;
-use serde::Deserialize;
+use tracing::info;
 
 use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage, needs_storage_deposit_for_contract, Mainnet, NetworkView, RPC_CLIENT,
-        WRAP_NEAR,
+        get_slippage, swap_call_gas, Mainnet, NetworkView,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -22,81 +19,23 @@ use crate::{
 pub struct RheaDclProvider;
 
 const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
-const FEE_TIERS: [u64; 4] = [100, 400, 2000, 10000]; // 0.01%, 0.04%, 0.2%, 1%
-
-#[derive(Debug, Deserialize)]
-struct RheaDclQuoteResponse {
-    #[serde(with = "dec_format")]
-    amount: Balance,
-}
+const RESERVED_GAS: NearGas = NearGas::from_tgas(62);
 
 trait RheaDclQuotes: Send + Sync {
-    fn quote(
+    fn find_path(
         &self,
-        pool_id: &str,
-        input_token: &AccountId,
-        output_token: &AccountId,
-        input_amount: Balance,
-    ) -> impl Future<Output = Option<Balance>> + Send;
-
-    fn quote_by_output(
-        &self,
-        pool_id: &str,
-        input_token: &AccountId,
-        output_token: &AccountId,
-        output_amount: Balance,
-    ) -> impl Future<Output = Option<Balance>> + Send;
+        request: dcl::Request,
+    ) -> impl Future<Output = Option<RouteApiResponse>> + Send;
 }
 
 struct MainnetRheaDclQuotes;
 
 impl RheaDclQuotes for MainnetRheaDclQuotes {
-    async fn quote(
-        &self,
-        pool_id: &str,
-        input_token: &AccountId,
-        output_token: &AccountId,
-        input_amount: Balance,
-    ) -> Option<Balance> {
-        RPC_CLIENT
-            .call::<RheaDclQuoteResponse>(
-                RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                "quote",
-                serde_json::json!({
-                    "pool_ids": vec![pool_id],
-                    "input_token": input_token,
-                    "output_token": output_token,
-                    "input_amount": input_amount.to_string(),
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
+    async fn find_path(&self, request: dcl::Request) -> Option<RouteApiResponse> {
+        dcl::find_path(request)
             .await
+            .inspect_err(|e| info!("No Rhea DCL route: {e:#}"))
             .ok()
-            .map(|quote| quote.amount)
-    }
-
-    async fn quote_by_output(
-        &self,
-        pool_id: &str,
-        input_token: &AccountId,
-        output_token: &AccountId,
-        output_amount: Balance,
-    ) -> Option<Balance> {
-        RPC_CLIENT
-            .call::<RheaDclQuoteResponse>(
-                RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                "quote_by_output",
-                serde_json::json!({
-                    "pool_ids": vec![pool_id],
-                    "input_token": input_token,
-                    "output_token": output_token,
-                    "output_amount": output_amount.to_string(),
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .ok()
-            .map(|quote| quote.amount)
     }
 }
 
@@ -115,6 +54,13 @@ async fn route(
     network: &impl NetworkView,
     quotes: &impl RheaDclQuotes,
 ) -> Option<Route> {
+    let slippage = get_slippage(
+        network,
+        request.slippage,
+        &request.token_in,
+        &request.token_out,
+    );
+
     let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
     let (_, token_out) = convert_to_nep141(&request.token_out, None, 0).await?;
 
@@ -122,260 +68,133 @@ async fn route(
         return None;
     }
 
-    let (token_x, token_y) = if token_in < token_out {
-        (token_in.clone(), token_out.clone())
-    } else {
-        (token_out.clone(), token_in.clone())
+    let response = quotes
+        .find_path(dcl::Request {
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amount: match request.amount {
+                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
+                Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
+            },
+            max_hops: MaxHops::Four,
+            slippage,
+        })
+        .await?;
+
+    let unwrapping_near = request.token_out == TokenId::Near;
+    let (amount_in, message, estimated_amount, worst_case_amount, swap_gas) = match response {
+        RouteApiResponse::ExactIn { route, .. } => {
+            let pool_ids = route
+                .pools
+                .iter()
+                .map(|step| step.pool_id.as_str())
+                .collect::<Vec<_>>();
+            let message = serde_json::json!({
+                "Swap": {
+                    "pool_ids": pool_ids,
+                    "output_token": token_out,
+                    "min_output_amount": route.min_amount_out.0.to_string(),
+                    "skip_unwrap_near": !unwrapping_near,
+                }
+            });
+            (
+                route.amount_in.0,
+                message,
+                Amount::AmountOut(route.amount_out.0),
+                Amount::AmountOut(route.min_amount_out.0),
+                route.swap_gas,
+            )
+        }
+        RouteApiResponse::ExactOut { route, .. } => {
+            // SwapByOutput walks the pools from the output token
+            let pool_ids = route
+                .pools
+                .iter()
+                .rev()
+                .map(|step| step.pool_id.as_str())
+                .collect::<Vec<_>>();
+            let message = serde_json::json!({
+                "SwapByOutput": {
+                    "pool_ids": pool_ids,
+                    "output_token": token_out,
+                    "output_amount": route.amount_out.0.to_string(),
+                    "skip_unwrap_near": !unwrapping_near,
+                }
+            });
+            (
+                route.max_amount_in.0,
+                message,
+                Amount::AmountIn(route.amount_in.0),
+                Amount::AmountIn(route.max_amount_in.0),
+                route.swap_gas,
+            )
+        }
     };
 
-    match request.amount {
-        Amount::AmountIn(exact_amount_in) => {
-            let futures = FEE_TIERS.into_iter().map(|fee| {
-                let pool_id = format!("{token_x}|{token_y}|{fee}");
-                let token_in = token_in.clone();
-                let token_out = token_out.clone();
-                async move {
-                    quotes
-                        .quote(&pool_id, &token_in, &token_out, exact_amount_in)
-                        .await
-                        .map(|amount| (pool_id, amount))
-                }
-            });
-            let routes = futures_util::future::join_all(futures)
-                .await
-                .into_iter()
-                .flatten()
-                .filter(|(_, amount)| *amount > 0)
-                .collect::<Vec<_>>();
-            let best_route = routes.iter().max_by_key(|(_, amount)| *amount);
-            if let Some((pool_id, quote_amount)) = best_route {
-                let slippage = get_slippage(
-                    network,
-                    request.slippage,
-                    &request.token_in,
-                    &request.token_out,
-                );
-                let min_amount_out = ToPrimitive::to_u128(
-                    &(BigDecimal::from(*quote_amount) * (BigDecimal::from(1) - slippage))
-                        .with_scale_round(0, RoundingMode::Down),
-                )?;
+    let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "ft_transfer_call".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({
+            "receiver_id": RHEA_DCL_CONTRACT_ID,
+            "amount": amount_in.to_string(),
+            "msg": serde_json::to_string(&message).unwrap(),
+        }))
+        .unwrap(),
+        gas: swap_call_gas(swap_gas, RESERVED_GAS, true),
+        deposit: NearToken::from_yoctonear(1),
+    }));
+    let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+        receiver_id: token_in,
+        actions: vec![swap_action],
+    }];
 
-                let unwrapping_near = request.token_out == TokenId::Near;
-                let ft_transfer_call_swap_action =
-                    Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "ft_transfer_call".to_string(),
-                        args: serde_json::to_vec(&serde_json::json!({
-                            "receiver_id": RHEA_DCL_CONTRACT_ID,
-                            "amount": exact_amount_in.to_string(),
-                            "msg": serde_json::to_string(&serde_json::json!({
-                                "Swap": {
-                                    "pool_ids": vec![pool_id],
-                                    "output_token": token_out,
-                                    "min_output_amount": min_amount_out.to_string(),
-                                    "skip_unwrap_near": !unwrapping_near,
-                                }
-                            })).unwrap(),
-                        }))
-                        .unwrap(),
-                        gas: Gas(NearGas::from_tgas(100)),
-                        deposit: NearToken::from_yoctonear(1),
-                    }));
-
-                let swap_transactions = vec![ExecutionInstruction::NearTransaction {
-                    receiver_id: token_in,
-                    actions: vec![ft_transfer_call_swap_action],
-                }];
-                let (input_to_nep141, input_nep141) = convert_to_nep141(
-                    &request.token_in,
-                    request.trader_account_id.clone(),
-                    exact_amount_in,
-                )
-                .await?;
-                if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-                    if needs_storage_deposit_for_contract(
-                        network,
-                        trader_account_id,
-                        &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
-                    )
-                    .await
-                    {
-                        if let (Ok(native_amount), Ok(wrap_amount)) = (
-                            network.native_balance(trader_account_id).await,
-                            network
-                                .ft_balance(
-                                    trader_account_id,
-                                    &WRAP_NEAR.parse::<AccountId>().unwrap(),
-                                )
-                                .await,
-                        ) {
-                            if native_amount.as_yoctonear() + wrap_amount
-                                < NearToken::from_millinear(500).as_yoctonear()
-                            {
-                                return None;
-                            }
-                        }
-                    }
-                }
-                let transactions = [
-                    deposit_storage_on_contract_if_needed(
-                        network,
-                        &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
-                        request.trader_account_id.clone(),
-                        NearToken::from_millinear(500),
-                    )
-                    .await,
-                    deposit_storage_if_needed(
-                        network,
-                        &request.token_out,
-                        request.trader_account_id.clone(),
-                    )
-                    .await,
-                    deposit_storage_if_needed(
-                        network,
-                        &TokenId::Nep141(input_nep141),
-                        request.trader_account_id.clone(),
-                    )
-                    .await,
-                    input_to_nep141,
-                    swap_transactions,
-                ]
-                .concat();
-                Some(Route {
-                    dex_id: DexId::RheaDcl,
-                    estimated_amount: Amount::AmountOut(*quote_amount),
-                    deadline: None,
-                    has_slippage: true,
-                    worst_case_amount: Amount::AmountOut(min_amount_out),
-                    execution_instructions: transactions,
-                    deprecated_needs_unwrap_always_false: false,
-                    token_output: if unwrapping_near {
-                        TokenId::Near
-                    } else {
-                        TokenId::Nep141(token_out)
-                    },
-                })
-            } else {
-                None
-            }
-        }
-        Amount::AmountOut(exact_amount_out) => {
-            let futures = FEE_TIERS.into_iter().map(|fee| {
-                let pool_id = format!("{token_x}|{token_y}|{fee}");
-                let token_in = token_in.clone();
-                let token_out = token_out.clone();
-                async move {
-                    quotes
-                        .quote_by_output(&pool_id, &token_in, &token_out, exact_amount_out)
-                        .await
-                        .map(|amount| (pool_id, amount))
-                }
-            });
-            let routes = futures_util::future::join_all(futures)
-                .await
-                .into_iter()
-                .flatten()
-                .filter(|(_, amount)| *amount > 0)
-                .collect::<Vec<_>>();
-            let best_route = routes.iter().min_by_key(|(_, amount)| *amount);
-            if let Some((pool_id, quote_amount)) = best_route {
-                let slippage = get_slippage(
-                    network,
-                    request.slippage,
-                    &request.token_in,
-                    &request.token_out,
-                );
-                let max_amount_in = ToPrimitive::to_u128(
-                    &(BigDecimal::from(*quote_amount) / (BigDecimal::from(1) - slippage))
-                        .with_scale_round(0, RoundingMode::Down),
-                )?;
-
-                let unwrapping_near = request.token_out == TokenId::Near;
-                let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "ft_transfer_call".to_string(),
-                    args: serde_json::to_vec(&serde_json::json!({
-                        "receiver_id": RHEA_DCL_CONTRACT_ID,
-                        "amount": max_amount_in.to_string(),
-                        "msg": serde_json::to_string(&serde_json::json!({
-                            "SwapByOutput": {
-                                "pool_ids": vec![pool_id],
-                                "output_token": token_out,
-                                "output_amount": exact_amount_out.to_string(),
-                                "skip_unwrap_near": !unwrapping_near,
-                            }
-                        })).unwrap(),
-                    }))
-                    .unwrap(),
-                    gas: Gas(NearGas::from_tgas(100)),
-                    deposit: NearToken::from_yoctonear(1),
-                }));
-
-                let swap_transactions = vec![ExecutionInstruction::NearTransaction {
-                    receiver_id: token_in,
-                    actions: vec![swap_action],
-                }];
-                let (input_to_nep141, input_nep141) = convert_to_nep141(
-                    &request.token_in,
-                    request.trader_account_id.clone(),
-                    max_amount_in,
-                )
-                .await?;
-                let transactions = [
-                    deposit_storage_on_contract_if_needed(
-                        network,
-                        &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
-                        request.trader_account_id.clone(),
-                        NearToken::from_millinear(500),
-                    )
-                    .await,
-                    deposit_storage_if_needed(
-                        network,
-                        &if unwrapping_near {
-                            TokenId::Near
-                        } else {
-                            TokenId::Nep141(token_out.clone())
-                        },
-                        request.trader_account_id.clone(),
-                    )
-                    .await,
-                    deposit_storage_if_needed(
-                        network,
-                        &TokenId::Nep141(input_nep141),
-                        request.trader_account_id.clone(),
-                    )
-                    .await,
-                    input_to_nep141,
-                    swap_transactions,
-                ]
-                .concat();
-                Some(Route {
-                    dex_id: DexId::RheaDcl,
-                    estimated_amount: Amount::AmountIn(*quote_amount),
-                    deadline: None,
-                    has_slippage: true,
-                    worst_case_amount: Amount::AmountIn(max_amount_in),
-                    execution_instructions: transactions,
-                    deprecated_needs_unwrap_always_false: false,
-                    token_output: if unwrapping_near {
-                        TokenId::Near
-                    } else {
-                        TokenId::Nep141(token_out)
-                    },
-                })
-            } else {
-                None
-            }
-        }
-    }
+    let (input_to_nep141, input_nep141) = convert_to_nep141(
+        &request.token_in,
+        request.trader_account_id.clone(),
+        amount_in,
+    )
+    .await?;
+    let token_output = if unwrapping_near {
+        TokenId::Near
+    } else {
+        TokenId::Nep141(token_out)
+    };
+    let transactions = [
+        deposit_storage_on_contract_if_needed(
+            network,
+            &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+            request.trader_account_id.clone(),
+            NearToken::from_millinear(500),
+        )
+        .await,
+        deposit_storage_if_needed(network, &token_output, request.trader_account_id.clone()).await,
+        deposit_storage_if_needed(
+            network,
+            &TokenId::Nep141(input_nep141),
+            request.trader_account_id.clone(),
+        )
+        .await,
+        input_to_nep141,
+        swap_transactions,
+    ]
+    .concat();
+    Some(Route {
+        dex_id: DexId::RheaDcl,
+        estimated_amount,
+        deadline: None,
+        has_slippage: true,
+        worst_case_amount,
+        execution_instructions: transactions,
+        deprecated_needs_unwrap_always_false: false,
+        token_output,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken};
+    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken, U128};
 
     use super::*;
-    use crate::providers::intear_plach::AssetId;
     use crate::shared_utils::{
-        create_intear_dex_withdraw_action, create_rhea_withdraw_action,
         create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
@@ -383,69 +202,68 @@ mod tests {
     #[derive(Clone)]
     struct TestRheaDclQuotes {
         enabled: bool,
-        zero_quotes: bool,
     }
 
     impl Default for TestRheaDclQuotes {
         fn default() -> Self {
-            Self {
-                enabled: true,
-                zero_quotes: false,
-            }
+            Self { enabled: true }
         }
     }
 
     impl TestRheaDclQuotes {
         fn none() -> Self {
-            Self {
-                enabled: false,
-                zero_quotes: false,
-            }
-        }
-
-        fn zero_quotes() -> Self {
-            Self {
-                enabled: true,
-                zero_quotes: true,
-            }
+            Self { enabled: false }
         }
     }
 
-    fn is_preferred_pool(pool_id: &str) -> bool {
-        pool_id.ends_with("|2000")
+    fn step(pool_id: String, token_in: &AccountId, token_out: &AccountId) -> dcl::ApiPoolStep {
+        dcl::ApiPoolStep {
+            pool_id,
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+        }
     }
 
     impl RheaDclQuotes for TestRheaDclQuotes {
-        async fn quote(
-            &self,
-            pool_id: &str,
-            _input_token: &AccountId,
-            _output_token: &AccountId,
-            _input_amount: Balance,
-        ) -> Option<Balance> {
+        async fn find_path(&self, request: dcl::Request) -> Option<RouteApiResponse> {
             if !self.enabled {
                 return None;
             }
-            if self.zero_quotes {
-                return Some(0);
+            let (token_in, token_out) = (&request.token_in, &request.token_out);
+            let usdc: AccountId = "usdc".parse().unwrap();
+            let pools = vec![
+                step(format!("{token_in}|usdc|100"), token_in, &usdc),
+                step(format!("{token_out}|usdc|2000"), &usdc, token_out),
+            ];
+            match request.amount {
+                QuoteAmount::ExactIn(_) => Some(RouteApiResponse::ExactIn {
+                    route: dcl::ExactInRoute {
+                        pools,
+                        amount_in: U128(100),
+                        min_amount_out: U128(79),
+                        amount_out: U128(80),
+                        swap_gas: NearGas::from_tgas(20),
+                    },
+                    contract_in: token_in.clone(),
+                    contract_out: token_out.clone(),
+                    amount_in: U128(100),
+                    amount_out: U128(80),
+                }),
+                QuoteAmount::ExactOut(_) => Some(RouteApiResponse::ExactOut {
+                    route: dcl::ExactOutRoute {
+                        pools,
+                        amount_in: U128(100),
+                        max_amount_in: U128(101),
+                        amount_out: U128(80),
+                        swap_gas: NearGas::from_tgas(20),
+                    },
+                    contract_in: token_in.clone(),
+                    contract_out: token_out.clone(),
+                    amount_in: U128(100),
+                    max_amount_in: U128(101),
+                    amount_out: U128(80),
+                }),
             }
-            Some(if is_preferred_pool(pool_id) { 80 } else { 70 })
-        }
-
-        async fn quote_by_output(
-            &self,
-            pool_id: &str,
-            _input_token: &AccountId,
-            _output_token: &AccountId,
-            _output_amount: Balance,
-        ) -> Option<Balance> {
-            if !self.enabled {
-                return None;
-            }
-            if self.zero_quotes {
-                return Some(0);
-            }
-            Some(if is_preferred_pool(pool_id) { 100 } else { 110 })
         }
     }
 
@@ -511,7 +329,7 @@ mod tests {
                                 "amount": "100",
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
+                                        "pool_ids": vec!["wrap.near|usdc|100", "ft|usdc|2000"],
                                         "output_token": "ft",
                                         "min_output_amount": "79",
                                         "skip_unwrap_near": true,
@@ -520,360 +338,13 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
+                            gas: Gas(NearGas::from_tgas(114)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_wnear_to_ft() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
-                    token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
-                                        "output_token": "ft",
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": true,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Nep141("ft".parse().unwrap()),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_rhea_wnear_to_ft() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141OnRhea(WRAP_NEAR.parse().unwrap()),
-                    token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![create_rhea_withdraw_action(
-                            &WRAP_NEAR.parse().unwrap(),
-                            100,
-                            false,
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
-                                        "output_token": "ft",
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": true,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Nep141("ft".parse().unwrap()),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_intear_near_to_ft() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::TokenOnIntearDex(AssetId::Near),
-                    token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "dex.intear.near".parse().unwrap(),
-                        actions: vec![create_intear_dex_withdraw_action(&AssetId::Near, 100)],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
-                                        "output_token": "ft",
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": true,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Nep141("ft".parse().unwrap()),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_rhea_to_rhea() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141OnRhea("ft".parse().unwrap()),
-                    token_out: TokenId::Nep141OnRhea("other".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![
-                            create_storage_deposit_action_for_contract(
-                                NearToken::from_millinear(10),
-                                false,
-                            ),
-                            Action::FunctionCall(Box::new(FunctionCallAction {
-                                method_name: "register_tokens".to_string(),
-                                args: serde_json::to_vec(&serde_json::json!({
-                                    "token_ids": ["other"],
-                                }))
-                                .unwrap(),
-                                gas: Gas(NearGas::from_tgas(10)),
-                                deposit: NearToken::from_yoctonear(1),
-                            })),
-                        ],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![create_rhea_withdraw_action(
-                            &"ft".parse().unwrap(),
-                            100,
-                            false,
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|other|2000"],
-                                        "output_token": "other",
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": true,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Nep141("other".parse().unwrap()),
             })
         );
     }
@@ -929,7 +400,7 @@ mod tests {
                                 "amount": "100",
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
+                                        "pool_ids": vec!["ft|usdc|100", "wrap.near|usdc|2000"],
                                         "output_token": WRAP_NEAR,
                                         "min_output_amount": "79",
                                         "skip_unwrap_near": false,
@@ -938,181 +409,13 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
+                            gas: Gas(NearGas::from_tgas(114)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Near,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_rhea_ft_to_near() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141OnRhea("ft".parse().unwrap()),
-                    token_out: TokenId::Near,
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![create_rhea_withdraw_action(
-                            &"ft".parse().unwrap(),
-                            100,
-                            false,
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
-                                        "output_token": WRAP_NEAR,
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": false,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Near,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_in_ft_to_rhea_ft() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141("ft".parse().unwrap()),
-                    token_out: TokenId::Nep141OnRhea("other".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                        actions: vec![
-                            create_storage_deposit_action_for_contract(
-                                NearToken::from_millinear(10),
-                                false
-                            ),
-                            Action::FunctionCall(Box::new(FunctionCallAction {
-                                method_name: "register_tokens".to_string(),
-                                args: serde_json::to_vec(&serde_json::json!({
-                                    "token_ids": ["other"],
-                                }))
-                                .unwrap(),
-                                gas: Gas(NearGas::from_tgas(10)),
-                                deposit: NearToken::from_yoctonear(1),
-                            })),
-                        ],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|other|2000"],
-                                        "output_token": "other",
-                                        "min_output_amount": "79",
-                                        "skip_unwrap_near": true,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Nep141("other".parse().unwrap()),
             })
         );
     }
@@ -1179,7 +482,7 @@ mod tests {
                                 "amount": "101",
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "SwapByOutput": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
+                                        "pool_ids": vec!["ft|usdc|2000", "wrap.near|usdc|100"],
                                         "output_token": "ft",
                                         "output_amount": "80",
                                         "skip_unwrap_near": true,
@@ -1188,84 +491,13 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
+                            gas: Gas(NearGas::from_tgas(114)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn amount_out_ft_to_near() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Nep141("ft".parse().unwrap()),
-                    token_out: TokenId::Near,
-                    amount: Amount::AmountOut(80),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::default(),
-            )
-            .await,
-            Some(Route {
-                deadline: None,
-                has_slippage: true,
-                estimated_amount: Amount::AmountIn(100),
-                worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            NearToken::from_millinear(500),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
-                            true
-                        )],
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: "ft_transfer_call".to_string(),
-                            args: serde_json::to_vec(&serde_json::json!({
-                                "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "101",
-                                "msg": serde_json::to_string(&serde_json::json!({
-                                    "SwapByOutput": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
-                                        "output_token": WRAP_NEAR,
-                                        "output_amount": "80",
-                                        "skip_unwrap_near": false,
-                                    }
-                                }))
-                                .unwrap(),
-                            }))
-                            .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
-                            deposit: NearToken::from_yoctonear(1),
-                        }))],
-                    },
-                ],
-                deprecated_needs_unwrap_always_false: false,
-                token_output: TokenId::Near,
             })
         );
     }
@@ -1321,38 +553,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_quotes_returns_none() {
-        assert_eq!(
-            route(
-                SwapRequest {
-                    token_in: TokenId::Near,
-                    token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
-                    slippage: Slippage::Fixed {
-                        slippage: "0.01".parse().unwrap(),
-                    },
-                    dexes: None,
-                    trader_account_id: Some("trader.near".parse().unwrap()),
-                    signing_public_key: None,
-                    referrer_id: None,
-                },
-                &TestNetworkView::default(),
-                &TestRheaDclQuotes::zero_quotes(),
-            )
-            .await,
-            None
-        );
-    }
-
-    #[tokio::test]
     async fn no_trader_omits_storage() {
         assert_eq!(
             route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
-                    amount: Amount::AmountIn(100),
+                    amount: Amount::AmountOut(80),
                     max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
@@ -1369,13 +576,13 @@ mod tests {
             Some(Route {
                 deadline: None,
                 has_slippage: true,
-                estimated_amount: Amount::AmountOut(80),
-                worst_case_amount: Amount::AmountOut(79),
+                estimated_amount: Amount::AmountIn(100),
+                worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::RheaDcl,
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        actions: vec![create_wrap_action(NearToken::from_yoctonear(101))],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -1383,19 +590,19 @@ mod tests {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
-                                "amount": "100",
+                                "amount": "101",
                                 "msg": serde_json::to_string(&serde_json::json!({
-                                    "Swap": {
-                                        "pool_ids": vec!["ft|wrap.near|2000"],
+                                    "SwapByOutput": {
+                                        "pool_ids": vec!["ft|usdc|2000", "wrap.near|usdc|100"],
                                         "output_token": "ft",
-                                        "min_output_amount": "79",
+                                        "output_amount": "80",
                                         "skip_unwrap_near": true,
                                     }
                                 }))
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(100)),
+                            gas: Gas(NearGas::from_tgas(114)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },

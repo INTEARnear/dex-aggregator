@@ -20,7 +20,7 @@ use near_min_api::{
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     providers::intear_plach::AssetId,
@@ -29,6 +29,32 @@ use crate::{
 
 pub const WRAP_NEAR: &str = "wrap.near";
 pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
+pub const STORAGE_BYTE_COST: NearToken = NearToken::from_yoctonear(10u128.pow(19));
+
+const MAX_SWAP_GAS: NearGas = NearGas::from_tgas(900);
+const FT_TRANSFER_CALL_GAS: NearGas = NearGas::from_tgas(10);
+const SWAP_GAS_MARGIN_FIXED_PART: NearGas = NearGas::from_tgas(20);
+const SWAP_GAS_MARGIN_PERCENT_PART: u64 = 10;
+
+/// Gas to attach to a call that swaps: the gas the DEX is predicted to burn for the swaps with a
+/// margin, `reserved` for everything else the DEX needs in the call, its callbacks and transfers,
+/// and `FT_TRANSFER_CALL_GAS` if it's `ft_transfer_call`. Rounded up to a TGas.
+pub fn swap_call_gas(swap_gas: NearGas, reserved: NearGas, ft_transfer_call: bool) -> Gas {
+    let gas = swap_gas.as_gas() * (100 + SWAP_GAS_MARGIN_PERCENT_PART) / 100
+        + SWAP_GAS_MARGIN_FIXED_PART.as_gas()
+        + reserved.as_gas()
+        + if ft_transfer_call {
+            FT_TRANSFER_CALL_GAS.as_gas()
+        } else {
+            0
+        };
+    let gas = NearGas::from_gas(gas);
+    if gas > MAX_SWAP_GAS {
+        warn!("A swap needs {gas}, attaching {MAX_SWAP_GAS}");
+        return Gas(MAX_SWAP_GAS);
+    }
+    Gas(gas)
+}
 
 pub fn create_wrap_action(amount: NearToken) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
@@ -118,6 +144,12 @@ pub fn create_intear_nep141_deposit_action(contract_id: &AccountId, amount: Bala
 pub struct StorageDeposit {
     available: NearToken,
     total: NearToken,
+}
+
+impl StorageDeposit {
+    pub fn available(&self) -> NearToken {
+        self.available
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

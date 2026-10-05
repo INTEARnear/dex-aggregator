@@ -18,6 +18,8 @@ const EXACT_IN_HIGH_POINT: i32 = 799_999;
 
 const ENDPOINT: u8 = 1;
 const ORDER: u8 = 2;
+/// Points of a word of the contract's bitmap of points
+const BITMAP_WORD_POINTS: i32 = 256;
 
 /// Pool data that doesn't change while swaps are simulated
 #[derive(Debug)]
@@ -26,6 +28,7 @@ pub struct PoolData {
     pub token_x: AccountId,
     pub token_y: AccountId,
     fee: u32,
+    point_delta: i32,
     /// Points with liquidity_sum != 0 (even with a zero net delta) and the liquidity delta when
     /// crossed from left to right
     endpoints: BTreeMap<i32, i128>,
@@ -44,6 +47,21 @@ pub struct Pool {
     protocol_fee_rate: u32,
     /// Limit orders changed by simulated swaps
     filled_orders: BTreeMap<i32, (Balance, Balance)>,
+    /// Steps of the swaps simulated on this pool
+    work: Work,
+}
+
+/// Steps the contract takes in swaps, which their gas depends on
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Work {
+    /// Swaps within a range of the same liquidity
+    pub ranges: u64,
+    /// Liquidity endpoints crossed
+    pub crossings: u64,
+    /// Points with limit orders reached
+    pub orders: u64,
+    /// Words of the bitmap of points searched for the next point
+    pub words: u64,
 }
 
 pub struct PoolInit {
@@ -106,6 +124,7 @@ impl Pool {
                 token_x: init.token_x,
                 token_y: init.token_y,
                 fee: init.fee,
+                point_delta: init.point_delta,
                 endpoints,
                 orders,
                 marked,
@@ -120,7 +139,13 @@ impl Pool {
             fee_charged_y: init.fee_charged_y,
             protocol_fee_rate: init.protocol_fee_rate,
             filled_orders: BTreeMap::new(),
+            work: Work::default(),
         })
+    }
+
+    /// Steps of the swaps simulated on this pool since it was built
+    pub fn work(&self) -> Work {
+        self.work
     }
 
     pub fn set_protocol_fee_rate(&mut self, protocol_fee_rate: u32) {
@@ -180,24 +205,36 @@ impl Pool {
 
     /// slot_bitmap.rs:70: the nearest marked point at or left of `point`. Unlike iZiSwap, the
     /// search doesn't stop at bitmap word boundaries.
-    fn nearest_left(&self, point: i32, low: i32) -> Option<i32> {
-        self.data
+    fn nearest_left(&mut self, point: i32, low: i32) -> Option<i32> {
+        let found = self
+            .data
             .marked
             .range(..=point)
             .rev()
             .copied()
             .find(|point| self.flags(*point) != 0)
-            .filter(|point| *point >= low)
+            .filter(|point| *point >= low);
+        self.work.words += self.words_between(found.unwrap_or(low), point);
+        found
     }
 
     /// slot_bitmap.rs:117: the nearest marked point right of `point`
-    fn nearest_right(&self, point: i32) -> i32 {
-        self.data
+    fn nearest_right(&mut self, point: i32) -> i32 {
+        let found = self
+            .data
             .marked
             .range(point + 1..)
             .copied()
             .find(|point| self.flags(*point) != 0)
-            .unwrap_or(RIGHT_MOST_POINT)
+            .unwrap_or(RIGHT_MOST_POINT);
+        self.work.words += self.words_between(point, found);
+        found
+    }
+
+    /// Bitmap words a search from `left` to `right` reads
+    fn words_between(&self, left: i32, right: i32) -> u64 {
+        let word = |point: i32| (point / self.data.point_delta).div_euclid(BITMAP_WORD_POINTS);
+        (word(right) - word(left)).unsigned_abs() as u64 + 1
     }
 
     fn move_to(&mut self, point: i32) -> SwapResult<()> {
@@ -224,6 +261,7 @@ impl Pool {
     }
 
     fn cross_endpoint_leftwards(&mut self) -> SwapResult<()> {
+        self.work.crossings += 1;
         let delta = self
             .data
             .endpoints
@@ -239,6 +277,7 @@ impl Pool {
     }
 
     fn cross_endpoint_rightwards(&mut self, point: i32) -> SwapResult<()> {
+        self.work.crossings += 1;
         let delta = self.data.endpoints.get(&point).copied().unwrap_or(0);
         self.add_liquidity_delta(delta)
     }
@@ -307,6 +346,7 @@ impl Pool {
             }
             return Ok((false, 0, 0));
         }
+        self.work.ranges += 1;
         let range = x2y_range(&self.state, left, amount_no_fee)?;
         let fee = self.exact_in_fee(amount, range.cost, amount_no_fee)?;
         self.charge_fee(true, fee)?;
@@ -326,6 +366,7 @@ impl Pool {
         while low <= self.state.point {
             let flags = self.flags(self.state.point);
             if flags & ORDER != 0 {
+                self.work.orders += 1;
                 let amount_no_fee = self.amount_no_fee(amount)?;
                 if amount_no_fee == 0 {
                     return Ok(acquired);
@@ -391,6 +432,7 @@ impl Pool {
         let mut flags = self.flags(self.state.point);
         while self.state.point < high {
             if flags & ORDER != 0 {
+                self.work.orders += 1;
                 let amount_no_fee = self.amount_no_fee(amount)?;
                 if amount_no_fee == 0 {
                     return Ok(acquired);
@@ -428,6 +470,7 @@ impl Pool {
             if amount_no_fee == 0 {
                 return Ok(acquired);
             }
+            self.work.ranges += 1;
             let range = y2x_range(&self.state, next_point, amount_no_fee)?;
             let fee = self.exact_in_fee(amount, range.cost, amount_no_fee)?;
             self.charge_fee(false, fee)?;
@@ -466,6 +509,7 @@ impl Pool {
             }
             return Ok((false, 0, 0));
         }
+        self.work.ranges += 1;
         let range = x2y_range_desire(&self.state, left, desire)?;
         let fee = self.exact_out_fee(range.cost)?;
         self.charge_fee(true, fee)?;
@@ -481,6 +525,7 @@ impl Pool {
         while low <= self.state.point {
             let flags = self.flags(self.state.point);
             if flags & ORDER != 0 {
+                self.work.orders += 1;
                 let point = self.state.point;
                 let (selling_x, selling_y) = self.order(point);
                 let (cost, acquire) =
@@ -543,6 +588,7 @@ impl Pool {
         let mut flags = self.flags(self.state.point);
         while self.state.point < high {
             if flags & ORDER != 0 {
+                self.work.orders += 1;
                 let point = self.state.point;
                 let (selling_x, selling_y) = self.order(point);
                 let (cost, acquire) =
@@ -575,6 +621,7 @@ impl Pool {
             if desire == 0 {
                 return Ok(paid);
             }
+            self.work.ranges += 1;
             let range = y2x_range_desire(&self.state, next_point, desire)?;
             let fee = self.exact_out_fee(range.cost)?;
             self.charge_fee(false, fee)?;

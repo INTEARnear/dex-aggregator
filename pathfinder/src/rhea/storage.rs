@@ -9,14 +9,17 @@ use pool_indexer::{AccountState, Watch};
 
 use super::{DegenPoolInfo, U256};
 use super::{
-    PoolDetailInfo, PoolInfo, PoolKind, PoolsSource, RHEA_CONTRACT_ID, RatedPoolInfo,
-    SimplePoolInfo, StablePoolInfo, degen, rated, stable,
+    Pool, PoolDetailInfo, RHEA_CONTRACT_ID, RatedPoolInfo, SimplePoolInfo, StablePoolInfo, degen,
+    rated, stable,
 };
 
 /// `pools: Vector<Pool>`, keys are the prefix and u64 index
 const POOLS_PREFIX: &[u8] = &[0];
 const RATES_KEY: &[u8] = b"custom_rate_key";
 const DEGENS_KEY: &[u8] = b"custom_degen_key";
+const DEGEN_ORACLES_KEY: &[u8] = b"custom_degen_oracle_config_key";
+/// Rated pools refuse swaps with a rate this old
+const RATE_EXPIRY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
 pub fn watch() -> Watch {
     Watch {
@@ -25,6 +28,7 @@ pub fn watch() -> Watch {
             POOLS_PREFIX.to_vec(),
             RATES_KEY.to_vec(),
             DEGENS_KEY.to_vec(),
+            DEGEN_ORACLES_KEY.to_vec(),
         ],
     }
 }
@@ -47,7 +51,7 @@ struct StoredSimplePool {
     _exchange_fee: u32,
     _referral_fee: u32,
     _shares_prefix: Vec<u8>,
-    shares_total_supply: Balance,
+    _shares_total_supply: Balance,
 }
 
 /// Stable, rated and degen pools share the layout
@@ -59,7 +63,7 @@ struct StoredStablePool {
     _volumes: Vec<(u128, u128)>,
     total_fee: u32,
     _shares_prefix: Vec<u8>,
-    shares_total_supply: Balance,
+    _shares_total_supply: Balance,
     init_amp_factor: u128,
     target_amp_factor: u128,
     init_amp_time: u64,
@@ -78,14 +82,14 @@ enum StoredRate {
 #[derive(BorshDeserialize)]
 struct StoredContractRate {
     stored_rates: Balance,
-    _rates_updated_at: u64,
+    rates_updated_at: u64,
     _contract_id: String,
 }
 
 #[derive(BorshDeserialize)]
 struct StoredOracleRate {
     stored_rates: Balance,
-    _rates_updated_at: u64,
+    rates_updated_at: u64,
     _contract_id: String,
     _oracle_kind: u8,
     _oracle_id: String,
@@ -94,10 +98,13 @@ struct StoredOracleRate {
 }
 
 impl StoredRate {
-    fn stored_rates(&self) -> Balance {
+    /// The rate and when it was updated
+    fn stored_rates(&self) -> (Balance, u64) {
         match self {
-            Self::Stnear(rate) | Self::Linear(rate) | Self::Nearx(rate) => rate.stored_rates,
-            Self::Sfrax(rate) => rate.stored_rates,
+            Self::Stnear(rate) | Self::Linear(rate) | Self::Nearx(rate) => {
+                (rate.stored_rates, rate.rates_updated_at)
+            }
+            Self::Sfrax(rate) => (rate.stored_rates, rate.rates_updated_at),
         }
     }
 }
@@ -108,24 +115,49 @@ struct StoredDegen {
     kind: u8,
     oracle: u8,
     price: Balance,
-    _updated_at: u64,
+    updated_at: u64,
     _price_id: [u8; 32],
+}
+
+/// How long the prices of each oracle are valid, degen pools refuse swaps with older prices
+#[derive(BorshDeserialize)]
+enum StoredDegenOracle {
+    PriceOracle {
+        _oracle_id: String,
+        _expire_ts: u64,
+        _maximum_recency_duration_sec: u32,
+        _maximum_staleness_duration_sec: u32,
+    },
+    PythOracle {
+        _oracle_id: String,
+        expire_ts: u64,
+        _pyth_price_valid_duration_sec: u32,
+    },
 }
 
 /// Rate of tokens without a stored rate
 const DEFAULT_RATE: Balance = rated::PRECISION;
 
-pub(super) fn pools_source(state: &AccountState) -> Result<PoolsSource, anyhow::Error> {
+/// A rate or degen price, `None` if the contract would refuse to swap with it
+type Price = Option<Balance>;
+
+pub(super) fn pools(state: &AccountState) -> Result<Vec<Pool>, anyhow::Error> {
+    let timestamp = state.block.timestamp_nanosec;
     let rates = match state.entries.get(RATES_KEY) {
         Some(value) => borsh::from_slice::<Vec<(AccountId, StoredRate)>>(value)
             .map_err(|e| anyhow::anyhow!("Invalid {}: {e}", String::from_utf8_lossy(RATES_KEY)))?
             .into_iter()
-            .map(|(token_id, rate)| (token_id, rate.stored_rates()))
+            .map(|(token_id, rate)| {
+                let (rate, updated_at) = rate.stored_rates();
+                let valid = timestamp.saturating_sub(updated_at) < RATE_EXPIRY_NANOS;
+                (token_id, valid.then_some(rate))
+            })
             .collect(),
         None => HashMap::new(),
     };
     let mut degens = HashMap::new();
     if let Some(value) = state.entries.get(DEGENS_KEY) {
+        let pyth_expiry = pyth_expiry(state)?;
         for (token_id, degen) in borsh::from_slice::<Vec<(AccountId, StoredDegen)>>(value)
             .map_err(|e| anyhow::anyhow!("Invalid {}: {e}", String::from_utf8_lossy(DEGENS_KEY)))?
         {
@@ -136,7 +168,8 @@ pub(super) fn pools_source(state: &AccountState) -> Result<PoolsSource, anyhow::
                     degen.oracle
                 );
             }
-            degens.insert(token_id, degen.price);
+            let valid = timestamp.saturating_sub(degen.updated_at) < pyth_expiry;
+            degens.insert(token_id, valid.then_some(degen.price));
         }
     }
 
@@ -149,100 +182,109 @@ pub(super) fn pools_source(state: &AccountState) -> Result<PoolsSource, anyhow::
     }
 
     let mut pools = Vec::with_capacity(stored_pools.len());
-    let mut detail_infos = Vec::with_capacity(stored_pools.len());
     for (expected_index, (index, value)) in stored_pools.into_iter().enumerate() {
         if index != expected_index as u64 {
             anyhow::bail!("Pool {expected_index} is missing");
         }
         let pool = borsh::from_slice::<StoredPool>(value)
             .map_err(|e| anyhow::anyhow!("Invalid pool {index}: {e}"))?;
-        let (info, detail) = pool_info(pool, state.block.timestamp_nanosec, &rates, &degens)
-            .map_err(|e| anyhow::anyhow!("Pool {index}: {e}"))?;
-        pools.push(info);
-        detail_infos.push(detail);
+        let Some((tokens, detail)) = pool_detail(pool, timestamp, &rates, &degens)
+            .map_err(|e| anyhow::anyhow!("Pool {index}: {e}"))?
+        else {
+            continue;
+        };
+        pools.push(Pool {
+            id: index,
+            tokens: tokens.into(),
+            detail: detail.with_invariant(),
+        });
     }
-    Ok(PoolsSource {
-        block_height: state.block.height,
-        pools,
-        detail_infos,
-    })
+    Ok(pools)
 }
 
-fn pool_info(
+/// How long the degens' oracle keeps prices valid
+fn pyth_expiry(state: &AccountState) -> Result<u64, anyhow::Error> {
+    let value = state
+        .entries
+        .get(DEGEN_ORACLES_KEY)
+        .ok_or_else(|| anyhow::anyhow!("No {}", String::from_utf8_lossy(DEGEN_ORACLES_KEY)))?;
+    borsh::from_slice::<Vec<(String, StoredDegenOracle)>>(value)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid {}: {e}",
+                String::from_utf8_lossy(DEGEN_ORACLES_KEY)
+            )
+        })?
+        .into_iter()
+        .find_map(|(_, oracle)| match oracle {
+            StoredDegenOracle::PythOracle { expire_ts, .. } => Some(expire_ts),
+            StoredDegenOracle::PriceOracle { .. } => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("No Pyth oracle config for degens"))
+}
+
+/// The pool's tokens and what swaps are simulated with, `None` if a rate or degen price of
+/// the pool is too old to swap
+fn pool_detail(
     pool: StoredPool,
     timestamp: u64,
-    rates: &HashMap<AccountId, Balance>,
-    degens: &HashMap<AccountId, Balance>,
-) -> Result<(PoolInfo, PoolDetailInfo), anyhow::Error> {
+    rates: &HashMap<AccountId, Price>,
+    degens: &HashMap<AccountId, Price>,
+) -> Result<Option<(Vec<AccountId>, PoolDetailInfo)>, anyhow::Error> {
+    enum CurvePoolKind {
+        Stable,
+        Rated,
+        Degen,
+    }
+
     let (kind, pool) = match pool {
         StoredPool::SimplePool(pool) => {
-            let info = PoolInfo {
-                amounts: pool.amounts.clone(),
-                amp: 0,
-                pool_kind: PoolKind::SimplePool,
-                shares_total_supply: pool.shares_total_supply.to_string(),
-                token_account_ids: pool.token_account_ids.clone(),
-                total_fee: pool.total_fee as u64,
-            };
             let detail = PoolDetailInfo::SimplePoolInfo(SimplePoolInfo {
-                token_account_ids: pool.token_account_ids,
-                amounts: pool.amounts,
+                amounts: pool.amounts.into(),
                 total_fee: pool.total_fee,
-                shares_total_supply: pool.shares_total_supply,
             });
-            return Ok((info, detail));
+            return Ok(Some((pool.token_account_ids, detail)));
         }
-        StoredPool::StableSwapPool(pool) => (PoolKind::StableSwap, pool),
-        StoredPool::RatedSwapPool(pool) => (PoolKind::RatedSwap, pool),
-        StoredPool::DegenSwapPool(pool) => (PoolKind::DegenSwap, pool),
+        StoredPool::StableSwapPool(pool) => (CurvePoolKind::Stable, pool),
+        StoredPool::RatedSwapPool(pool) => (CurvePoolKind::Rated, pool),
+        StoredPool::DegenSwapPool(pool) => (CurvePoolKind::Degen, pool),
     };
     let target_decimal = match kind {
-        PoolKind::StableSwap => stable::TARGET_DECIMAL,
-        PoolKind::RatedSwap => rated::TARGET_DECIMAL,
-        PoolKind::DegenSwap => degen::TARGET_DECIMAL,
-        PoolKind::SimplePool => unreachable!(),
+        CurvePoolKind::Stable => stable::TARGET_DECIMAL,
+        CurvePoolKind::Rated => rated::TARGET_DECIMAL,
+        CurvePoolKind::Degen => degen::TARGET_DECIMAL,
     };
-    let amounts = pool
-        .c_amounts
-        .iter()
-        .zip(&pool.token_decimals)
-        .map(|(&c_amount, &decimals)| c_amount_to_amount(c_amount, decimals, target_decimal))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Like get_pool_detail_infos, fails for amounts it can't convert
+    for (&c_amount, &decimals) in pool.c_amounts.iter().zip(&pool.token_decimals) {
+        c_amount_to_amount(c_amount, decimals, target_decimal)?;
+    }
     let amp = amp_factor(&pool, timestamp)?;
-    let info = PoolInfo {
-        amounts: amounts.clone(),
-        amp,
-        pool_kind: kind.clone(),
-        shares_total_supply: pool.shares_total_supply.to_string(),
-        token_account_ids: pool.token_account_ids.clone(),
-        total_fee: pool.total_fee as u64,
-    };
     let detail = match kind {
-        PoolKind::StableSwap => PoolDetailInfo::StablePoolInfo(StablePoolInfo {
-            token_account_ids: pool.token_account_ids,
-            decimals: pool.token_decimals,
-            amounts,
-            c_amounts: pool.c_amounts,
+        CurvePoolKind::Stable => PoolDetailInfo::StablePoolInfo(StablePoolInfo {
+            decimals: pool.token_decimals.into(),
+            c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
-            shares_total_supply: pool.shares_total_supply,
             amp,
+            d: None,
         }),
-        PoolKind::RatedSwap => PoolDetailInfo::RatedPoolInfo(RatedPoolInfo {
-            rates: pool
+        CurvePoolKind::Rated => PoolDetailInfo::RatedPoolInfo(RatedPoolInfo {
+            rates: match pool
                 .token_account_ids
                 .iter()
-                .map(|token_id| rates.get(token_id).copied().unwrap_or(DEFAULT_RATE))
-                .collect(),
-            token_account_ids: pool.token_account_ids,
-            decimals: pool.token_decimals,
-            amounts,
-            c_amounts: pool.c_amounts,
+                .map(|token_id| rates.get(token_id).copied().unwrap_or(Some(DEFAULT_RATE)))
+                .collect()
+            {
+                Some(rates) => rates,
+                None => return Ok(None),
+            },
+            decimals: pool.token_decimals.into(),
+            c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
-            shares_total_supply: pool.shares_total_supply,
             amp,
+            d: None,
         }),
-        PoolKind::DegenSwap => PoolDetailInfo::DegenPoolInfo(DegenPoolInfo {
-            degens: pool
+        CurvePoolKind::Degen => PoolDetailInfo::DegenPoolInfo(DegenPoolInfo {
+            degens: match pool
                 .token_account_ids
                 .iter()
                 .map(|token_id| {
@@ -251,18 +293,19 @@ fn pool_info(
                         .copied()
                         .ok_or_else(|| anyhow::anyhow!("No degen for {token_id}"))
                 })
-                .collect::<Result<_, _>>()?,
-            token_account_ids: pool.token_account_ids,
-            decimals: pool.token_decimals,
-            amounts,
-            c_amounts: pool.c_amounts,
+                .collect::<Result<Option<_>, _>>()?
+            {
+                Some(degens) => degens,
+                None => return Ok(None),
+            },
+            decimals: pool.token_decimals.into(),
+            c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
-            shares_total_supply: pool.shares_total_supply,
             amp,
+            d: None,
         }),
-        PoolKind::SimplePool => unreachable!(),
     };
-    Ok((info, detail))
+    Ok(Some((pool.token_account_ids, detail)))
 }
 
 fn c_amount_to_amount(
@@ -291,7 +334,7 @@ fn amp_factor(pool: &StoredStablePool, timestamp: u64) -> Result<u64, anyhow::Er
             anyhow::anyhow!("Amp ramp starts at {} after block time", pool.init_amp_time)
         })?;
         let ramp = |from: u128, to: u128| {
-            (U256::from(from - to) * U256::from(time_delta) / U256::from(time_range)).as_u128()
+            (U256::from(from - to) * U256::from(time_delta) / U256::from(time_range)).to::<u128>()
         };
         if pool.target_amp_factor > pool.init_amp_factor {
             pool.init_amp_factor + ramp(pool.target_amp_factor, pool.init_amp_factor)

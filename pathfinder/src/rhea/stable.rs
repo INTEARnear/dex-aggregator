@@ -54,37 +54,40 @@ impl StableSwap {
         let n_coins = c_amounts.len() as u128;
         let sum_x = c_amounts.iter().sum::<u128>();
         if sum_x == 0 {
-            Some(0.into())
+            Some(U256::from(0))
         } else {
             let amp_factor = self.compute_amp_factor()?;
             let mut d_prev: U256;
-            let mut d: U256 = sum_x.into();
+            let mut d: U256 = U256::from(sum_x);
             for _ in 0..256 {
                 // $ D_{k,prod} = \frac{D_k^{n+1}}{n^n \prod x_{i}} = \frac{D^3}{4xy} $
                 let mut d_prod = d;
                 for c_amount in c_amounts {
                     d_prod = d_prod
                         .checked_mul(d)?
-                        .checked_div((c_amount * n_coins).into())?;
+                        .checked_div(U256::from(c_amount * n_coins))?;
                 }
                 d_prev = d;
 
                 let ann = amp_factor.checked_mul(n_coins.checked_pow(n_coins as u32)?)?;
-                let leverage = (U256::from(sum_x)).checked_mul(ann.into())?;
+                let leverage = (U256::from(sum_x)).checked_mul(U256::from(ann))?;
                 // d = (ann * sum_x + d_prod * n_coins) * d_prev / ((ann - 1) * d_prev + (n_coins + 1) * d_prod)
-                let numerator = d_prev
-                    .checked_mul(d_prod.checked_mul(n_coins.into())?.checked_add(leverage)?)?;
+                let numerator = d_prev.checked_mul(
+                    d_prod
+                        .checked_mul(U256::from(n_coins))?
+                        .checked_add(leverage)?,
+                )?;
                 let denominator = d_prev
-                    .checked_mul(ann.checked_sub(1)?.into())?
-                    .checked_add(d_prod.checked_mul((n_coins + 1).into())?)?;
+                    .checked_mul(U256::from(ann.checked_sub(1)?))?
+                    .checked_add(d_prod.checked_mul(U256::from(n_coins + 1))?)?;
                 d = numerator.checked_div(denominator)?;
 
                 // Equality with the precision of 1
                 if d > d_prev {
-                    if d.checked_sub(d_prev)? <= 1.into() {
+                    if d.checked_sub(d_prev)? <= U256::from(1) {
                         break;
                     }
-                } else if d_prev.checked_sub(d)? <= 1.into() {
+                } else if d_prev.checked_sub(d)? <= U256::from(1) {
                     break;
                 }
             }
@@ -100,26 +103,26 @@ impl StableSwap {
         current_c_amounts: &[Balance], // in-pool tokens amount in comparable precision,
         index_x: usize,      // x token's index
         index_y: usize,      // y token's index
+        d: U256,             // invariant of current_c_amounts
     ) -> Option<U256> {
         let n_coins = current_c_amounts.len() as u128;
         let amp_factor = self.compute_amp_factor()?;
         let ann = amp_factor.checked_mul(n_coins.checked_pow(n_coins as u32)?)?;
-        // invariant
-        let d = self.compute_d(current_c_amounts)?;
         let mut s_ = x_c_amount;
-        let mut c = d.checked_mul(d)?.checked_div(x_c_amount.into())?;
+        let mut c = d.checked_mul(d)?.checked_div(U256::from(x_c_amount))?;
         for (idx, c_amount) in current_c_amounts.iter().enumerate() {
             if idx != index_x && idx != index_y {
                 s_ += *c_amount;
-                c = c.checked_mul(d)?.checked_div((*c_amount).into())?;
+                c = c.checked_mul(d)?.checked_div(U256::from(*c_amount))?;
             }
         }
-        c = c.checked_mul(d)?.checked_div(
-            ann.checked_mul(n_coins.checked_pow(n_coins as u32)?)?
-                .into(),
-        )?;
+        c = c.checked_mul(d)?.checked_div(U256::from(
+            ann.checked_mul(n_coins.checked_pow(n_coins as u32)?)?,
+        ))?;
 
-        let b = d.checked_div(ann.into())?.checked_add(s_.into())?; // d will be subtracted later
+        let b = d
+            .checked_div(U256::from(ann))?
+            .checked_add(U256::from(s_))?; // d will be subtracted later
 
         // Solve for y by approximating: y**2 + b*y = c
         let mut y_prev: U256;
@@ -127,14 +130,17 @@ impl StableSwap {
         for _ in 0..256 {
             y_prev = y;
             // $ y_{k+1} = \frac{y_k^2 + c}{2y_k + b - D} $
-            let y_numerator = y.checked_pow(2.into())?.checked_add(c)?;
-            let y_denominator = y.checked_mul(2.into())?.checked_add(b)?.checked_sub(d)?;
+            let y_numerator = y.checked_mul(y)?.checked_add(c)?;
+            let y_denominator = y
+                .checked_mul(U256::from(2))?
+                .checked_add(b)?
+                .checked_sub(d)?;
             y = y_numerator.checked_div(y_denominator)?;
             if y > y_prev {
-                if y.checked_sub(y_prev)? <= 1.into() {
+                if y.checked_sub(y_prev)? <= U256::from(1) {
                     break;
                 }
-            } else if y_prev.checked_sub(y)? <= 1.into() {
+            } else if y_prev.checked_sub(y)? <= U256::from(1) {
                 break;
             }
         }
@@ -150,15 +156,21 @@ impl StableSwap {
         token_out_idx: usize,          // token_out index in token vector,
         current_c_amounts: &[Balance], // in-pool tokens comparable amounts vector,
         fees: &Fees,
+        d: Option<U256>, // invariant of current_c_amounts if known
     ) -> Option<SwapResult> {
+        let d = match d {
+            Some(d) => d,
+            None => self.compute_d(current_c_amounts)?,
+        };
         let y = self
             .compute_y(
                 token_in_amount + current_c_amounts[token_in_idx],
                 current_c_amounts,
                 token_in_idx,
                 token_out_idx,
+                d,
             )?
-            .as_u128();
+            .to::<u128>();
         // https://github.com/curvefi/curve-contract/blob/b0bbf77f8f93c9c5f4e415bce9cd71f0cdee960e/contracts/pool-templates/base/SwapTemplateBase.vy#L466
         let dy = current_c_amounts[token_out_idx]
             .checked_sub(y)?

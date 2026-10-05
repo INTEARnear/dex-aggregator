@@ -9,3 +9,4 @@ inindexer = { git = "https://github.com/INTEARnear/inindexer", features = ["tear
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1.41"
+borsh = { version = "1.6.0", features = ["derive"] }

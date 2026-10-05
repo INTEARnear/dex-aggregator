@@ -1,20 +1,19 @@
-use std::{collections::HashMap, fmt::Display, future::Future, pin::Pin, str::FromStr};
+use std::{collections::HashMap, future::Future, pin::Pin, str::FromStr};
 
 use base64::{prelude::BASE64_STANDARD, Engine};
-use borsh::{BorshDeserialize, BorshSerialize};
-use near_min_api::{
-    types::{AccountId, Action, Balance, FunctionCallAction, Gas, NearGas, NearToken, U128},
-    utils::dec_format,
+use borsh::BorshSerialize;
+use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken, U128};
+use pathfinder::{
+    plach::{self, SplitRouteApiResponse},
+    MaxHops, QuoteAmount,
 };
-use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use tracing::info;
-
-use bigdecimal::BigDecimal;
 
 use crate::{
     shared_utils::{
         convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage, is_near,
-        Mainnet, NetworkView, DEFAULT_REFERRER_ID, REQWEST_CLIENT,
+        swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -24,85 +23,11 @@ pub struct IntearPlachProvider;
 
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
+const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(36);
+const DEPOSIT_NEAR_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
+const EXECUTE_OPERATIONS_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 
-#[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug, BorshSerialize, BorshDeserialize)]
-pub enum AssetId {
-    Near,
-    Nep141(AccountId),
-    Nep245(AccountId, String),
-    Nep171(AccountId, String),
-}
-
-impl Display for AssetId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Near => write!(f, "near"),
-            Self::Nep141(contract_id) => write!(f, "nep141:{contract_id}"),
-            Self::Nep245(contract_id, token_id) => write!(f, "nep245:{contract_id}:{token_id}"),
-            Self::Nep171(contract_id, token_id) => write!(f, "nep171:{contract_id}:{token_id}"),
-        }
-    }
-}
-
-impl FromStr for AssetId {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "near" => Ok(Self::Near),
-            _ => match s.split_once(':') {
-                Some(("nep141", contract_id)) => {
-                    Ok(Self::Nep141(contract_id.parse().map_err(|e| {
-                        format!("Invalid account id {contract_id}: {e}")
-                    })?))
-                }
-                Some(("nep245", rest)) => {
-                    if let Some((contract_id, token_id)) = rest.split_once(':') {
-                        Ok(Self::Nep245(
-                            contract_id
-                                .parse()
-                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
-                            token_id.to_string(),
-                        ))
-                    } else {
-                        Err(format!("Invalid asset id: {s}"))
-                    }
-                }
-                Some(("nep171", rest)) => {
-                    if let Some((contract_id, token_id)) = rest.split_once(':') {
-                        Ok(Self::Nep171(
-                            contract_id
-                                .parse()
-                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
-                            token_id.to_string(),
-                        ))
-                    } else {
-                        Err(format!("Invalid asset id: {s}"))
-                    }
-                }
-                _ => Err(format!("Invalid asset id: {s}")),
-            },
-        }
-    }
-}
-
-impl Serialize for AssetId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serde::Serialize::serialize(&self.to_string(), serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for AssetId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = Deserialize::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
+pub use pathfinder::plach::AssetId;
 
 #[derive(BorshSerialize, Serialize, Clone, Debug)]
 enum SwapRequestAmount {
@@ -209,54 +134,101 @@ enum WithdrawAmount {
     PreviousSwapOutput,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum MaxHops {
-    DirectOnly,
-    Four,
-}
-
-impl Display for MaxHops {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MaxHops::DirectOnly => write!(f, "DirectOnly"),
-            MaxHops::Four => write!(f, "Four"),
-        }
-    }
-}
-
 trait PlachQuotes: Send + Sync {
     fn find_path(
         &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount: Amount,
-        max_hops: MaxHops,
-        slippage: &BigDecimal,
+        request: plach::Request,
     ) -> impl Future<Output = Option<SplitRouteApiResponse>> + Send;
 }
 
 struct MainnetPlachQuotes;
 
 impl PlachQuotes for MainnetPlachQuotes {
-    async fn find_path(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount: Amount,
-        max_hops: MaxHops,
-        slippage: &BigDecimal,
-    ) -> Option<SplitRouteApiResponse> {
-        let amount_query = match amount {
-            Amount::AmountIn(amount_in) => format!("amountIn={amount_in}"),
-            Amount::AmountOut(amount_out) => format!("amountOut={amount_out}"),
-        };
-        let url = format!("http://localhost:12346/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops={max_hops}&slippage={slippage}&{amount_query}");
-        info!("URL: {url}");
-        let response = REQWEST_CLIENT.get(url).send().await.ok()?;
-        let response = response.json::<ApiResponse>().await.ok()?;
-        info!("Found Plach route: {:?}", response.result_data);
-        response.result_data
+    async fn find_path(&self, request: plach::Request) -> Option<SplitRouteApiResponse> {
+        plach::find_path(request)
+            .await
+            .inspect_err(|e| info!("No Plach route: {e:#}"))
+            .ok()
     }
+}
+
+const RECORD_BYTES: u128 = 40;
+const ACCOUNT_ID_LENGTH_BYTES: u128 = 4;
+
+fn account_storage_bytes(id: u128) -> u128 {
+    RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 32
+}
+
+fn balances_storage_bytes(id: u128) -> u128 {
+    let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
+    RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 4 + (4 + key_prefix) + (4 + key_prefix)
+}
+
+fn balance_storage_bytes(id: u128, asset_id: &AssetId) -> u128 {
+    let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
+    let asset_id = borsh::to_vec(asset_id).unwrap().len() as u128;
+    (RECORD_BYTES + key_prefix + 4 + asset_id) + (RECORD_BYTES + 32 + 16 + 4)
+}
+/// `storage_deposit` takes no less
+const MIN_STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(5);
+
+/// Registers the assets the trader doesn't have yet, with the storage deposit they lack. The map
+/// of the trader's balances is paid for even if it exists, since the engine has no view for it.
+async fn registration(
+    network: &impl NetworkView,
+    trader_account_id: &AccountId,
+    asset_ids: &[&AssetId],
+) -> Option<Vec<ExecutionInstruction>> {
+    let mut unregistered = Vec::new();
+    for &asset_id in asset_ids {
+        if !unregistered.contains(&asset_id)
+            && !network
+                .is_intear_asset_registered(trader_account_id, asset_id)
+                .await
+        {
+            unregistered.push(asset_id);
+        }
+    }
+    if unregistered.is_empty() {
+        return Some(vec![]);
+    }
+    let storage = network
+        .storage_balance(INTEAR_DEX_CONTRACT_ID.parse().unwrap(), trader_account_id)
+        .await
+        .inspect_err(|e| info!("Failed to get the storage balance of {trader_account_id}: {e}"))
+        .ok()?;
+    let id = trader_account_id.len() as u128;
+    let account_bytes = match storage {
+        Some(_) => 0,
+        None => account_storage_bytes(id),
+    };
+    let bytes = account_bytes
+        + balances_storage_bytes(id)
+        + unregistered
+            .iter()
+            .map(|asset_id| balance_storage_bytes(id, asset_id))
+            .sum::<u128>();
+    let needed = STORAGE_BYTE_COST.saturating_mul(bytes);
+    let available = storage.map_or(NearToken::from_yoctonear(0), |storage| storage.available());
+    let mut actions = Vec::new();
+    if needed > available {
+        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "storage_deposit".to_string(),
+            args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            gas: Gas(NearGas::from_tgas(5)),
+            deposit: needed.saturating_sub(available).max(MIN_STORAGE_DEPOSIT),
+        })));
+    }
+    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "register_assets".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({ "asset_ids": unregistered })).unwrap(),
+        gas: Gas(NearGas::from_tgas(5)),
+        deposit: NearToken::from_yoctonear(1),
+    })));
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+        actions,
+    }])
 }
 
 impl Provider for IntearPlachProvider {
@@ -316,9 +288,22 @@ async fn route(
         Amount::AmountOut(_) => MaxHops::DirectOnly,
     };
     let response = quotes
-        .find_path(&token_in, &token_out, request.amount, max_hops, &slippage)
+        .find_path(plach::Request {
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amount: match request.amount {
+                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
+                Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
+            },
+            max_hops,
+            slippage,
+        })
         .await?;
 
+    let swap_gas = match response {
+        SplitRouteApiResponse::ExactIn { swap_gas, .. }
+        | SplitRouteApiResponse::ExactOut { swap_gas, .. } => swap_gas,
+    };
     let (swaps, total_min_amount_out, total_max_amount_in, estimated_amount, worst_case_amount) =
         match response {
             SplitRouteApiResponse::ExactIn {
@@ -327,7 +312,7 @@ async fn route(
                 if routes.is_empty() {
                     return None;
                 }
-                let total_min_amount_out = routes.iter().map(|route| route.min_amount_out).sum();
+                let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
                 let steps = routes
                     .into_iter()
                     .flat_map(|route| route.pools)
@@ -339,22 +324,19 @@ async fn route(
                         message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
                         asset_in: step.token_in.clone(),
                         asset_out: step.token_out.clone(),
-                        amount: if step.amount_in > 0 {
-                            SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(
-                                step.amount_in,
-                            )))
+                        amount: if step.amount_in.0 > 0 {
+                            SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(step.amount_in))
                         } else {
                             SwapOperationAmount::OutputOfLastIn
                         },
-                        constraint: (step.min_amount_out > 0)
-                            .then(|| U128::from(step.min_amount_out)),
+                        constraint: (step.min_amount_out.0 > 0).then_some(step.min_amount_out),
                     })
                     .collect::<Vec<_>>();
                 (
                     swaps,
                     total_min_amount_out,
                     0,
-                    Amount::AmountOut(amount_out),
+                    Amount::AmountOut(amount_out.0),
                     Amount::AmountOut(total_min_amount_out),
                 )
             }
@@ -379,18 +361,17 @@ async fn route(
                         asset_in: step.token_in.clone(),
                         asset_out: step.token_out.clone(),
                         amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(
-                            U128::from(step.amount_out),
+                            step.amount_out,
                         )),
-                        constraint: (step.max_amount_in > 0)
-                            .then(|| U128::from(step.max_amount_in)),
+                        constraint: (step.max_amount_in.0 > 0).then_some(step.max_amount_in),
                     })
                     .collect::<Vec<_>>();
                 (
                     swaps,
                     0,
-                    max_amount_in,
-                    Amount::AmountIn(amount_in),
-                    Amount::AmountIn(max_amount_in),
+                    max_amount_in.0,
+                    Amount::AmountIn(amount_in.0),
+                    Amount::AmountIn(max_amount_in.0),
                 )
             }
         };
@@ -443,39 +424,25 @@ async fn route(
         true
     };
 
-    let both_registered = if let Some(trader_account_id) = request.trader_account_id.as_ref() {
-        network
-            .is_intear_asset_registered(trader_account_id, &token_in)
-            .await
-            && network
-                .is_intear_asset_registered(trader_account_id, &token_out)
-                .await
+    let route_assets = if use_fast_path {
+        operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::SwapSimple {
+                    asset_in,
+                    asset_out,
+                    ..
+                } => Some([asset_in, asset_out]),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     } else {
-        true
+        vec![&token_in, &token_out]
     };
-    let registration_transactions = if !both_registered {
-        vec![ExecutionInstruction::NearTransaction {
-            receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-            actions: vec![
-                Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "storage_deposit".to_string(),
-                    args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                    gas: Gas(NearGas::from_tgas(5)),
-                    deposit: "0.005 NEAR".parse().unwrap(),
-                })),
-                Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "register_assets".to_string(),
-                    args: serde_json::to_vec(&serde_json::json!({
-                        "asset_ids": vec![token_in.clone(), token_out.clone()],
-                    }))
-                    .unwrap(),
-                    gas: Gas(NearGas::from_tgas(5)),
-                    deposit: NearToken::from_yoctonear(1),
-                })),
-            ],
-        }]
-    } else {
-        vec![]
+    let registration_transactions = match request.trader_account_id.as_ref() {
+        Some(trader_account_id) => registration(network, trader_account_id, &route_assets).await?,
+        None => vec![],
     };
 
     let input_amount = match request.amount {
@@ -492,7 +459,7 @@ async fn route(
                             "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(280)),
+                        gas: swap_call_gas(swap_gas, EXECUTE_OPERATIONS_RESERVED_GAS, false),
                         deposit: NearToken::from_yoctonear(1),
                     }));
         vec![ExecutionInstruction::NearTransaction {
@@ -517,7 +484,7 @@ async fn route(
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: swap_call_gas(swap_gas, DEPOSIT_NEAR_RESERVED_GAS, false),
                             deposit: NearToken::from_yoctonear(input_amount),
                         }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -559,7 +526,7 @@ async fn route(
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
-                                gas: Gas(NearGas::from_tgas(280)),
+                                gas: swap_call_gas(swap_gas, FT_TRANSFER_CALL_RESERVED_GAS, true),
                                 deposit: NearToken::from_yoctonear(1),
                             }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -623,95 +590,14 @@ async fn route(
     })
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct ApiResponse {
-    result_code: i32,
-    result_message: String,
-    result_data: Option<SplitRouteApiResponse>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-#[serde(tag = "quote_type", rename_all = "snake_case")]
-enum SplitRouteApiResponse {
-    ExactIn {
-        routes: Vec<ExactInRoute>,
-        contract_in: AssetId,
-        contract_out: AssetId,
-        #[serde(with = "dec_format")]
-        amount_in: Balance,
-        #[serde(with = "dec_format")]
-        amount_out: Balance,
-    },
-    ExactOut {
-        routes: Vec<ExactOutRoute>,
-        contract_in: AssetId,
-        contract_out: AssetId,
-        #[serde(with = "dec_format")]
-        amount_in: Balance,
-        #[serde(with = "dec_format")]
-        max_amount_in: Balance,
-        #[serde(with = "dec_format")]
-        amount_out: Balance,
-    },
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct ExactInRoute {
-    pools: Vec<ExactInPoolStep>,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    min_amount_out: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct ExactOutRoute {
-    pools: Vec<ExactOutPoolStep>,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    max_amount_in: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct ExactInPoolStep {
-    #[serde(with = "dec_format")]
-    pool_id: u32,
-    token_in: AssetId,
-    token_out: AssetId,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    min_amount_out: Balance,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[allow(dead_code)]
-struct ExactOutPoolStep {
-    #[serde(with = "dec_format")]
-    pool_id: u32,
-    token_in: AssetId,
-    token_out: AssetId,
-    #[serde(with = "dec_format")]
-    amount_in: Balance,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
-    #[serde(with = "dec_format")]
-    max_amount_in: Balance,
-}
-
 #[cfg(test)]
 mod tests {
-    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken};
+    /// trader.near (11 bytes) with balances of `near` (1 byte) and `nep141:ft` (7 bytes)
+    const NEW_TRADER_NEAR_AND_FT_STORAGE: NearToken = NearToken::from_yoctonear(
+        ((77 + 11) + (69 + 3 * 11) + (142 + 11 + 1) + (142 + 11 + 7)) * 10u128.pow(19),
+    );
+
+    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken, U128};
 
     use super::*;
     use crate::shared_utils::{
@@ -752,64 +638,61 @@ mod tests {
     }
 
     impl PlachQuotes for TestPlachQuotes {
-        async fn find_path(
-            &self,
-            token_in: &AssetId,
-            token_out: &AssetId,
-            amount: Amount,
-            _max_hops: MaxHops,
-            _slippage: &BigDecimal,
-        ) -> Option<SplitRouteApiResponse> {
+        async fn find_path(&self, request: plach::Request) -> Option<SplitRouteApiResponse> {
             if !self.enabled {
                 return None;
             }
+            let (token_in, token_out) = (&request.token_in, &request.token_out);
             if self.empty_routes {
                 return Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: 100,
-                    amount_out: 80,
+                    amount_in: U128(100),
+                    amount_out: U128(80),
+                    swap_gas: NearGas::from_tgas(34),
                 });
             }
-            match amount {
-                Amount::AmountIn(_) => Some(SplitRouteApiResponse::ExactIn {
-                    routes: vec![ExactInRoute {
-                        pools: vec![ExactInPoolStep {
+            match request.amount {
+                QuoteAmount::ExactIn(_) => Some(SplitRouteApiResponse::ExactIn {
+                    routes: vec![plach::ExactInRoute {
+                        pools: vec![plach::ExactInPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
                             token_out: token_out.clone(),
-                            amount_in: 100,
-                            min_amount_out: 79,
+                            amount_in: U128(100),
+                            min_amount_out: U128(79),
                         }],
-                        amount_in: 100,
-                        min_amount_out: 79,
-                        amount_out: 80,
+                        amount_in: U128(100),
+                        min_amount_out: U128(79),
+                        amount_out: U128(80),
                     }],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: 100,
-                    amount_out: 80,
+                    amount_in: U128(100),
+                    amount_out: U128(80),
+                    swap_gas: NearGas::from_tgas(34),
                 }),
-                Amount::AmountOut(_) => Some(SplitRouteApiResponse::ExactOut {
-                    routes: vec![ExactOutRoute {
-                        pools: vec![ExactOutPoolStep {
+                QuoteAmount::ExactOut(_) => Some(SplitRouteApiResponse::ExactOut {
+                    routes: vec![plach::ExactOutRoute {
+                        pools: vec![plach::ExactOutPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
                             token_out: token_out.clone(),
-                            amount_in: 100,
-                            amount_out: 80,
-                            max_amount_in: 101,
+                            amount_in: U128(100),
+                            amount_out: U128(80),
+                            max_amount_in: U128(101),
                         }],
-                        amount_in: 100,
-                        max_amount_in: 101,
-                        amount_out: 80,
+                        amount_in: U128(100),
+                        max_amount_in: U128(101),
+                        amount_out: U128(80),
                     }],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: 100,
-                    max_amount_in: 101,
-                    amount_out: 80,
+                    amount_in: U128(100),
+                    max_amount_in: U128(101),
+                    amount_out: U128(80),
+                    swap_gas: NearGas::from_tgas(34),
                 }),
             }
         }
@@ -852,7 +735,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -899,7 +782,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -947,7 +830,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -998,7 +881,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1046,7 +929,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1101,7 +984,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1149,7 +1032,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1178,7 +1061,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1226,7 +1109,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1276,7 +1159,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(104)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1324,7 +1207,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1382,7 +1265,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(104)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1430,7 +1313,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1483,7 +1366,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(101),
                         }))],
                     },
@@ -1531,7 +1414,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1568,7 +1451,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1616,7 +1499,7 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: "0.005 NEAR".parse().unwrap(),
+                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
@@ -1645,7 +1528,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(280)),
+                            gas: Gas(NearGas::from_tgas(75)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1786,7 +1669,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(280)),
+                        gas: Gas(NearGas::from_tgas(75)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],
@@ -1851,7 +1734,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(280)),
+                        gas: Gas(NearGas::from_tgas(75)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],

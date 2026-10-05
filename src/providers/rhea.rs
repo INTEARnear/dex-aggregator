@@ -1,17 +1,16 @@
 use std::{future::Future, pin::Pin};
 
-use bigdecimal::BigDecimal;
-use near_min_api::{
-    types::{AccountId, Action, Balance, FunctionCallAction, Gas, NearGas, NearToken},
-    utils::dec_format,
+use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken};
+use pathfinder::{
+    rhea::{self, SplitRouteApiResponse},
+    MaxHops,
 };
-use serde::Deserialize;
 use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, get_slippage, Mainnet, NetworkView,
-        DEFAULT_REFERRER_ID, REQWEST_CLIENT,
+        convert_to_nep141, create_storage_deposit_action_for_contract, deposit_storage_if_needed,
+        get_slippage, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -20,52 +19,77 @@ use crate::{
 pub struct RheaProvider;
 
 const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
+const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(57);
+const SWAP_RESERVED_GAS: NearGas = NearGas::from_tgas(10);
+const ACCOUNT_STORAGE_BYTES: u128 = 102;
+const TOKEN_STORAGE_BYTES: u128 = 148;
 
-#[derive(Debug, Deserialize)]
-struct RheaSmartRouterResponse {
-    result_data: RheaSmartRouterResultData,
-}
-
-#[derive(Debug, Deserialize)]
-struct RheaSmartRouterResultData {
-    routes: Vec<RheaSmartRouterRoute>,
-    #[serde(with = "dec_format")]
-    amount_out: Balance,
-}
-
-#[derive(Debug, Deserialize)]
-struct RheaSmartRouterRoute {
-    pools: Vec<serde_json::Value>,
-    #[serde(with = "dec_format")]
-    min_amount_out: Balance,
+/// Registers the tokens the trader has no balance of on Rhea yet, with the storage deposit they
+/// lack. `swap` adds a balance of every token it outputs, also the ones in the middle of a route.
+async fn registration(
+    network: &impl NetworkView,
+    trader_account_id: &AccountId,
+    token_ids: &[&AccountId],
+) -> Option<Vec<ExecutionInstruction>> {
+    let mut unregistered = Vec::new();
+    for &token_id in token_ids {
+        if !unregistered.contains(&token_id)
+            && !network
+                .is_rhea_token_registered(trader_account_id, token_id)
+                .await
+        {
+            unregistered.push(token_id);
+        }
+    }
+    if unregistered.is_empty() {
+        return Some(vec![]);
+    }
+    let storage = network
+        .storage_balance(RHEA_CONTRACT_ID.parse().unwrap(), trader_account_id)
+        .await
+        .inspect_err(|e| info!("Failed to get the storage balance of {trader_account_id}: {e}"))
+        .ok()?;
+    let account_bytes = match storage {
+        Some(_) => 0,
+        None => ACCOUNT_STORAGE_BYTES,
+    };
+    let available = storage.map_or(NearToken::from_yoctonear(0), |storage| storage.available());
+    let needed = STORAGE_BYTE_COST
+        .saturating_mul(account_bytes + TOKEN_STORAGE_BYTES * unregistered.len() as u128);
+    let mut actions = Vec::new();
+    if needed > available {
+        actions.push(create_storage_deposit_action_for_contract(
+            needed.saturating_sub(available),
+            false,
+        ));
+    }
+    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "register_tokens".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({ "token_ids": unregistered })).unwrap(),
+        gas: Gas(NearGas::from_tgas(10)),
+        deposit: NearToken::from_yoctonear(1),
+    })));
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+        actions,
+    }])
 }
 
 trait RheaQuotes: Send + Sync {
     fn find_path(
         &self,
-        token_in: &AccountId,
-        token_out: &AccountId,
-        amount_in: Balance,
-        slippage: &BigDecimal,
-    ) -> impl Future<Output = Option<RheaSmartRouterResultData>> + Send;
+        request: rhea::Request,
+    ) -> impl Future<Output = Option<SplitRouteApiResponse>> + Send;
 }
 
 struct MainnetRheaQuotes;
 
 impl RheaQuotes for MainnetRheaQuotes {
-    async fn find_path(
-        &self,
-        token_in: &AccountId,
-        token_out: &AccountId,
-        amount_in: Balance,
-        slippage: &BigDecimal,
-    ) -> Option<RheaSmartRouterResultData> {
-        let url = format!("http://localhost:12345/findPath?tokenIn={token_in}&tokenOut={token_out}&maxHops=Four&slippage={slippage}&amountIn={amount_in}");
-        info!("URL: {url}");
-        let response = REQWEST_CLIENT.get(url).send().await.ok()?;
-        let response = response.json::<RheaSmartRouterResponse>().await.ok()?;
-        info!("Found Rhea route: {:?}", response.result_data);
-        Some(response.result_data)
+    async fn find_path(&self, request: rhea::Request) -> Option<SplitRouteApiResponse> {
+        rhea::find_path(request)
+            .await
+            .inspect_err(|e| info!("No Rhea route: {e:#}"))
+            .ok()
     }
 }
 
@@ -104,7 +128,13 @@ async fn route(
     }
 
     let response = quotes
-        .find_path(&token_in, &token_out, exact_amount_in, &slippage)
+        .find_path(rhea::Request {
+            token_in: token_in.clone(),
+            token_out: token_out.clone(),
+            amount_in: exact_amount_in,
+            max_hops: MaxHops::Four,
+            slippage,
+        })
         .await?;
 
     if response.routes.is_empty() {
@@ -116,10 +146,29 @@ async fn route(
         .iter()
         .map(|route| route.min_amount_out)
         .sum();
-    let steps = response.routes.into_iter().flat_map(|route| route.pools);
+    let swap_gas = response.swap_gas;
+    let steps = response
+        .routes
+        .into_iter()
+        .flat_map(|route| route.pools)
+        .collect::<Vec<_>>();
+    let route_tokens = [&token_in]
+        .into_iter()
+        .chain(steps.iter().map(|step| &step.token_out))
+        .collect::<Vec<_>>();
+    let registration_transactions = match (&request.token_in, &request.trader_account_id) {
+        (TokenId::Nep141OnRhea(_), Some(trader_account_id))
+            if matches!(request.token_out, TokenId::Nep141OnRhea(_)) =>
+        {
+            registration(network, trader_account_id, &route_tokens).await?
+        }
+        _ => vec![],
+    };
 
     let actions: Vec<serde_json::Value> = steps
+        .iter()
         .map(|step| {
+            let step = serde_json::to_value(step).unwrap();
             let mut new_step = step.clone();
             if let Some(pool) = step.get("pool_id") {
                 if let Some(pool_str) = pool.as_str() {
@@ -147,16 +196,21 @@ async fn route(
             args: serde_json::to_vec(&serde_json::json!({
                 "actions": actions,
                 "referral_id": DEFAULT_REFERRER_ID,
+                "skip_degen_price_sync": true,
             }))
             .unwrap(),
-            gas: Gas(NearGas::from_tgas(150)),
+            gas: swap_call_gas(swap_gas, SWAP_RESERVED_GAS, false),
             deposit: NearToken::from_yoctonear(1),
         }));
 
-        let transactions = vec![ExecutionInstruction::NearTransaction {
-            receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
-            actions: vec![swap_action],
-        }];
+        let transactions = [
+            registration_transactions,
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+                actions: vec![swap_action],
+            }],
+        ]
+        .concat();
 
         return Some(Route {
             dex_id: DexId::Rhea,
@@ -185,7 +239,7 @@ async fn route(
             })).unwrap(),
         }))
         .unwrap(),
-        gas: Gas(NearGas::from_tgas(150)),
+        gas: swap_call_gas(swap_gas, FT_TRANSFER_CALL_RESERVED_GAS, true),
         deposit: NearToken::from_yoctonear(1),
     }));
     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -282,35 +336,34 @@ mod tests {
     }
 
     impl RheaQuotes for TestRheaQuotes {
-        async fn find_path(
-            &self,
-            token_in: &AccountId,
-            token_out: &AccountId,
-            _amount_in: Balance,
-            _slippage: &BigDecimal,
-        ) -> Option<RheaSmartRouterResultData> {
+        async fn find_path(&self, request: rhea::Request) -> Option<SplitRouteApiResponse> {
             if !self.enabled {
                 return None;
             }
-            if self.empty_routes {
-                return Some(RheaSmartRouterResultData {
-                    routes: vec![],
-                    amount_out: 80,
-                });
-            }
-            Some(RheaSmartRouterResultData {
-                routes: vec![RheaSmartRouterRoute {
-                    pools: vec![serde_json::json!({
-                        "pool_id": "1",
-                        "token_in": token_in,
-                        "token_out": token_out,
-                        "amount_in": "100",
-                        "amount_out": "0",
-                        "min_amount_out": "79",
-                    })],
+            let routes = if self.empty_routes {
+                vec![]
+            } else {
+                vec![rhea::ApiResponseRoute {
+                    pools: vec![rhea::ApiResponsePoolStep {
+                        pool_id: 1,
+                        token_in: request.token_in.clone(),
+                        token_out: request.token_out.clone(),
+                        amount_in: 100,
+                        amount_out: 0,
+                        min_amount_out: 79,
+                    }],
+                    amount_in: 100,
                     min_amount_out: 79,
-                }],
+                    amount_out: 0,
+                }]
+            };
+            Some(SplitRouteApiResponse {
+                routes,
+                contract_in: request.token_in,
+                contract_out: request.token_out,
+                amount_in: 100,
                 amount_out: 80,
+                swap_gas: NearGas::from_ggas(5_500),
             })
         }
     }
@@ -385,7 +438,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -462,7 +515,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -547,7 +600,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -632,7 +685,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -660,7 +713,14 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default()
+                    .with_storage(
+                        RHEA_CONTRACT_ID,
+                        "trader.near",
+                        NearToken::from_millinear(100),
+                        NearToken::from_micronear(500),
+                    )
+                    .with_rhea_registered("trader.near", "ft", true),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -670,26 +730,47 @@ mod tests {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
-                execution_instructions: vec![ExecutionInstruction::NearTransaction {
-                    receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
-                    actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "swap".to_string(),
-                        args: serde_json::to_vec(&serde_json::json!({
-                            "actions": vec![serde_json::json!({
-                                "pool_id": 1,
-                                "token_in": "ft",
-                                "token_out": "other",
-                                "amount_in": "100",
-                                "amount_out": "0",
-                                "min_amount_out": "79",
-                            })],
-                            "referral_id": DEFAULT_REFERRER_ID,
-                        }))
-                        .unwrap(),
-                        gas: Gas(NearGas::from_tgas(150)),
-                        deposit: NearToken::from_yoctonear(1),
-                    }))],
-                }],
+                execution_instructions: vec![
+                    ExecutionInstruction::NearTransaction {
+                        receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+                        actions: vec![
+                            create_storage_deposit_action_for_contract(
+                                "0.00098 NEAR".parse().unwrap(),
+                                false,
+                            ),
+                            Action::FunctionCall(Box::new(FunctionCallAction {
+                                method_name: "register_tokens".to_string(),
+                                args: serde_json::to_vec(&serde_json::json!({
+                                    "token_ids": ["other"],
+                                }))
+                                .unwrap(),
+                                gas: Gas(NearGas::from_tgas(10)),
+                                deposit: NearToken::from_yoctonear(1),
+                            })),
+                        ],
+                    },
+                    ExecutionInstruction::NearTransaction {
+                        receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                            method_name: "swap".to_string(),
+                            args: serde_json::to_vec(&serde_json::json!({
+                                "actions": vec![serde_json::json!({
+                                    "pool_id": 1,
+                                    "token_in": "ft",
+                                    "token_out": "other",
+                                    "amount_in": "100",
+                                    "amount_out": "0",
+                                    "min_amount_out": "79",
+                                })],
+                                "referral_id": DEFAULT_REFERRER_ID,
+                                "skip_degen_price_sync": true,
+                            }))
+                            .unwrap(),
+                            gas: Gas(NearGas::from_tgas(37)),
+                            deposit: NearToken::from_yoctonear(1),
+                        }))],
+                    },
+                ],
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Nep141OnRhea("other".parse().unwrap()),
             })
@@ -755,7 +836,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -833,7 +914,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -910,7 +991,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1077,7 +1158,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1144,7 +1225,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(150)),
+                            gas: Gas(NearGas::from_tgas(94)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },

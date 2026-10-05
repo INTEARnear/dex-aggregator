@@ -1,7 +1,5 @@
 //! Builds pools from raw dclv2.ref-labs.near storage. The contract is not open source, so the
-//! layout was worked out by comparing storage with view methods at the same block. Fields whose
-//! meaning is unknown are kept to check the layout, and bytes that hold the running state are
-//! only accepted while they're all zero (every pool and the contract are running now).
+//! layout was worked out by comparing storage with view methods at the same block.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,7 +78,7 @@ enum StoredPool {
     V0(StoredPoolV0),
     V1 {
         pool: StoredPoolV0,
-        _whitelist: Option<Vec<String>>,
+        whitelist: Option<Vec<AccountId>>,
     },
 }
 
@@ -199,10 +197,11 @@ pub(super) fn pools(state: &AccountState, pool_count: u64) -> Result<Vec<PoolInf
                 .entries
                 .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("Pool {index} is missing"))?;
-            let pool = match borsh::from_slice::<StoredPool>(value)
+            let (pool, whitelist) = match borsh::from_slice::<StoredPool>(value)
                 .map_err(|e| anyhow::anyhow!("Invalid pool {index}: {e}"))?
             {
-                StoredPool::V0(pool) | StoredPool::V1 { pool, .. } => pool,
+                StoredPool::V0(pool) => (pool, None),
+                StoredPool::V1 { pool, whitelist } => (pool, whitelist),
             };
             if pool.state != [0; 9] {
                 anyhow::bail!(
@@ -226,6 +225,7 @@ pub(super) fn pools(state: &AccountState, pool_count: u64) -> Result<Vec<PoolInf
                 total_order_x: pool.total_order_x.to_string(),
                 total_order_y: pool.total_order_y.to_string(),
                 state: "Running".to_string(),
+                whitelist,
             })
         })
         .collect()

@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
+use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, BlockHeight, CryptoHash};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshDeserialize)]
 pub struct BlockInfo {
     pub height: BlockHeight,
     pub hash: CryptoHash,
@@ -10,6 +11,7 @@ pub struct BlockInfo {
 }
 
 /// Storage of an account after a block, only keys under the watched prefixes
+#[derive(BorshDeserialize)]
 pub struct AccountState {
     pub block: BlockInfo,
     pub entries: BTreeMap<Vec<u8>, Vec<u8>>,

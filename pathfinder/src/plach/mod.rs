@@ -2,15 +2,12 @@ mod storage;
 
 pub use self::storage::watch;
 
-use bigdecimal::{BigDecimal, RoundingMode};
-use borsh::BorshDeserialize;
-use crypto_bigint::U256;
+use bigdecimal::BigDecimal;
+use borsh::{BorshDeserialize, BorshSerialize};
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, U128};
+use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
-use num_traits::{FromPrimitive, ToPrimitive};
-use rand::Rng;
-use std::collections::{BTreeSet, HashMap, HashSet};
+
 use std::fmt::{self, Display};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
@@ -18,28 +15,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use warp::Filter;
 
-use pool_indexer::PoolIndexer;
+use pool_indexer::{AccountState, PoolIndexer};
+
+use crate::search::{
+    self, Graph, MaxHops, PoolsDelta, QuoteAmount, Settings, SplitRoute, split_exactly,
+};
 use serde::{Deserialize, Serialize};
-use tracing::{Level, info, warn};
+use tracing::{info, warn};
 
-#[derive(Serialize)]
-struct ApiResponse<T> {
-    result_code: i32,
-    result_message: String,
-    result_data: Option<T>,
-}
-
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(tag = "quote_type", rename_all = "snake_case")]
-enum SplitRouteApiResponse {
+pub enum SplitRouteApiResponse {
     ExactIn {
         routes: Vec<ExactInRoute>,
         contract_in: AssetId,
         contract_out: AssetId,
         amount_in: U128,
         amount_out: U128,
+        swap_gas: NearGas,
     },
     ExactOut {
         routes: Vec<ExactOutRoute>,
@@ -48,64 +42,102 @@ enum SplitRouteApiResponse {
         amount_in: U128,
         max_amount_in: U128,
         amount_out: U128,
+        swap_gas: NearGas,
     },
 }
 
-#[derive(Serialize, Debug)]
-struct ExactInRoute {
-    pools: Vec<ExactInPoolStep>,
-    amount_in: U128,
-    min_amount_out: U128,
-    amount_out: U128,
+#[derive(Serialize, Debug, Clone)]
+pub struct ExactInRoute {
+    pub pools: Vec<ExactInPoolStep>,
+    pub amount_in: U128,
+    pub min_amount_out: U128,
+    pub amount_out: U128,
 }
 
-#[derive(Serialize, Debug)]
-struct ExactOutRoute {
-    pools: Vec<ExactOutPoolStep>,
-    amount_in: U128,
-    max_amount_in: U128,
-    amount_out: U128,
+#[derive(Serialize, Debug, Clone)]
+pub struct ExactOutRoute {
+    pub pools: Vec<ExactOutPoolStep>,
+    pub amount_in: U128,
+    pub max_amount_in: U128,
+    pub amount_out: U128,
 }
 
-#[derive(Serialize, Debug)]
-struct ExactInPoolStep {
+#[derive(Serialize, Debug, Clone)]
+pub struct ExactInPoolStep {
     #[serde(with = "dec_format")]
-    pool_id: u32,
-    token_in: AssetId,
-    token_out: AssetId,
-    amount_in: U128,
-    min_amount_out: U128,
+    pub pool_id: u32,
+    pub token_in: AssetId,
+    pub token_out: AssetId,
+    pub amount_in: U128,
+    pub min_amount_out: U128,
 }
 
-#[derive(Serialize, Debug)]
-struct ExactOutPoolStep {
+#[derive(Serialize, Debug, Clone)]
+pub struct ExactOutPoolStep {
     #[serde(with = "dec_format")]
-    pool_id: u32,
-    token_in: AssetId,
-    token_out: AssetId,
-    amount_in: U128,
-    amount_out: U128,
-    max_amount_in: U128,
+    pub pool_id: u32,
+    pub token_in: AssetId,
+    pub token_out: AssetId,
+    pub amount_in: U128,
+    pub amount_out: U128,
+    pub max_amount_in: U128,
 }
 
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-const SPLIT_ROUTE_STEP_SIZE: u32 = 1; // %
-const SMALL_AMOUNT_ROUTE_STEP_SIZE: u32 = 25; // %
-const MAX_SPLITS_COUNT: usize = 2;
-const TOP_ROUTES_COUNT: usize = 2;
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
-const RC_SUCCESS: i32 = 0;
-const RC_POOL_FETCH_ERROR: i32 = 1;
-const RC_ROUTE_ERROR: i32 = 2;
-const RC_RESPONSE_BUILD_ERROR: i32 = 3;
-const RC_INVALID_SLIPPAGE: i32 = 4;
+type U256 = ruint::aliases::U256;
 
 #[derive(Debug, Clone)]
 pub struct Pool {
     id: u32,
-    data: PoolData,
+    reserves: [Balance; 2],
+    /// What swaps don't change, shared so simulations clone pools without allocating
+    info: Arc<PoolInfo>,
+}
+
+#[derive(Debug)]
+struct PoolInfo {
+    tokens: [AssetId; 2],
+    fees: CurrentFees,
+    /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom NEAR
+    /// liquidity.
+    min_reserves: [Balance; 2],
+}
+
+impl Pool {
+    fn new(id: u32, data: PoolData) -> Self {
+        let (tokens, reserves, fees, min_reserves) = match data {
+            PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => (
+                [assets.0.asset_id, assets.1.asset_id],
+                [assets.0.balance.0, assets.1.balance.0],
+                fees,
+                [0, 0],
+            ),
+            PoolData::Launch {
+                near_amount,
+                launched_asset,
+                fees,
+                phantom_liquidity_near,
+                ..
+            } => (
+                [AssetId::Near, launched_asset.asset_id],
+                [near_amount.0, launched_asset.balance.0],
+                fees,
+                [phantom_liquidity_near.0, 0],
+            ),
+        };
+        Self {
+            id,
+            reserves,
+            info: Arc::new(PoolInfo {
+                tokens,
+                fees,
+                min_reserves,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
@@ -233,7 +265,7 @@ pub struct AssetWithBalance {
     pub balance: U128,
 }
 
-#[derive(Debug, PartialEq, BorshDeserialize, Clone, PartialOrd, Eq, Ord, Hash)]
+#[derive(Debug, PartialEq, BorshSerialize, BorshDeserialize, Clone, PartialOrd, Eq, Ord, Hash)]
 pub enum AssetId {
     Near,
     Nep141(AccountId),
@@ -312,20 +344,12 @@ impl<'de> Deserialize<'de> for AssetId {
     }
 }
 
-#[derive(Debug, Default)]
-struct PoolsDelta {
-    changed_pools: HashMap<u32, Pool>,
-}
-
 fn u128_to_u256(value: u128) -> U256 {
     U256::from(value)
 }
 
 fn u256_to_u128(value: U256) -> u128 {
-    assert!(value.bits() <= 128, "Value must be less than 128 bits");
-    let bytes = value.to_le_bytes();
-    let first_chunk = bytes.first_chunk().unwrap();
-    u128::from_le_bytes(*first_chunk)
+    u128::try_from(value).expect("Value must be less than 128 bits")
 }
 
 fn total_fee_fraction(fees: &CurrentFees) -> u128 {
@@ -348,53 +372,47 @@ fn collect_fees(amount_in: u128, fees: &CurrentFees) -> u128 {
 }
 
 impl Pool {
-    fn emulate_swap(
+    /// Input and output reserves, the fees, and the least the output reserve can be left with
+    fn reserves(&mut self, first_in: bool) -> (&mut Balance, &mut Balance, &CurrentFees, Balance) {
+        let [balance0, balance1] = &mut self.reserves;
+        let [min0, min1] = self.info.min_reserves;
+        if first_in {
+            (balance0, balance1, &self.info.fees, min1)
+        } else {
+            (balance1, balance0, &self.info.fees, min0)
+        }
+    }
+
+    /// Simulations panic on overflows like the contract
+    fn unless_panicked(
         &mut self,
-        token_in: &AssetId,
-        token_out: &AssetId,
+        swap: impl FnOnce(&mut Self) -> Option<Balance>,
+    ) -> Option<Balance> {
+        let id = self.id;
+        std::panic::catch_unwind(AssertUnwindSafe(|| swap(self))).unwrap_or_else(|_| {
+            warn!("Panicked while emulating a swap in pool {id}");
+            None
+        })
+    }
+}
+
+impl search::Pool for Pool {
+    type Token = AssetId;
+
+    fn tokens(&self) -> Vec<AssetId> {
+        self.info.tokens.to_vec()
+    }
+
+    fn swap_exact_in(
+        &mut self,
+        token_in: usize,
+        _token_out: usize,
         amount_in: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let self_before_modifications = self.clone();
-        let mut unwind_safe_self = AssertUnwindSafe(&mut *self);
-        let result = std::panic::catch_unwind(move || {
-            let (asset0_id, asset0_balance, asset1_id, asset1_balance, fees) =
-                match &mut unwind_safe_self.data {
-                    PoolData::Private { assets, fees, .. }
-                    | PoolData::Public { assets, fees, .. } => (
-                        assets.0.asset_id.clone(),
-                        &mut assets.0.balance,
-                        assets.1.asset_id.clone(),
-                        &mut assets.1.balance,
-                        fees,
-                    ),
-                    PoolData::Launch {
-                        near_amount,
-                        launched_asset,
-                        fees,
-                        ..
-                    } => (
-                        AssetId::Near,
-                        near_amount,
-                        launched_asset.asset_id.clone(),
-                        &mut launched_asset.balance,
-                        fees,
-                    ),
-                };
-            let first_in = match (
-                asset0_id == *token_in && asset1_id == *token_out,
-                asset1_id == *token_in && asset0_id == *token_out,
-            ) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => panic!("Invalid assets or pool ID"),
-            };
-            let (in_balance, out_balance) = if first_in {
-                (&mut asset0_balance.0, &mut asset1_balance.0)
-            } else {
-                (&mut asset1_balance.0, &mut asset0_balance.0)
-            };
+    ) -> Option<Balance> {
+        self.unless_panicked(|pool| {
+            let (in_balance, out_balance, fees, min_out_balance) = pool.reserves(token_in == 0);
             if *in_balance == 0 {
-                return Err(anyhow::anyhow!("In balance is zero"));
+                return None;
             }
             let amount_in_after_fees = collect_fees(amount_in, fees);
             // u128 * u128 or u128 + u128 can't overflow u256; in_balance was checked to be positive
@@ -407,76 +425,26 @@ impl Pool {
                 .checked_add(amount_in_after_fees)
                 .expect("Overflow");
             *out_balance = out_balance.checked_sub(amount_out).expect("Underflow");
-            Ok(amount_out)
-        });
-        match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => {
-                // println!("Error emulating swap {amount_in} {token_in} -> {token_out}: {e:?}");
-                Err(e)
+            if *out_balance < min_out_balance {
+                return None;
             }
-            Err(e) => {
-                *self = self_before_modifications;
-                warn!(
-                    "Panicked while emulating swap {} -> {}",
-                    token_in, token_out
-                );
-                Err(anyhow::anyhow!("Panic: {:?}", e))
-            }
-        }
+            Some(amount_out)
+        })
     }
 
-    fn emulate_swap_exact_out(
+    fn swap_exact_out(
         &mut self,
-        token_in: &AssetId,
-        token_out: &AssetId,
+        token_in: usize,
+        _token_out: usize,
         amount_out: Balance,
-    ) -> Result<Balance, anyhow::Error> {
-        let self_before_modifications = self.clone();
-        let mut unwind_safe_self = AssertUnwindSafe(&mut *self);
-        let result = std::panic::catch_unwind(move || {
+    ) -> Option<Balance> {
+        self.unless_panicked(|pool| {
             if amount_out == 0 {
-                return Err(anyhow::anyhow!("Amount must be greater than 0"));
+                return None;
             }
-
-            let (asset0_id, asset0_balance, asset1_id, asset1_balance, fees) =
-                match &mut unwind_safe_self.data {
-                    PoolData::Private { assets, fees, .. }
-                    | PoolData::Public { assets, fees, .. } => (
-                        assets.0.asset_id.clone(),
-                        &mut assets.0.balance,
-                        assets.1.asset_id.clone(),
-                        &mut assets.1.balance,
-                        fees,
-                    ),
-                    PoolData::Launch {
-                        near_amount,
-                        launched_asset,
-                        fees,
-                        ..
-                    } => (
-                        AssetId::Near,
-                        near_amount,
-                        launched_asset.asset_id.clone(),
-                        &mut launched_asset.balance,
-                        fees,
-                    ),
-                };
-            let first_in = match (
-                asset0_id == *token_in && asset1_id == *token_out,
-                asset1_id == *token_in && asset0_id == *token_out,
-            ) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => panic!("Invalid assets or pool ID"),
-            };
-            let (in_balance, out_balance) = if first_in {
-                (&mut asset0_balance.0, &mut asset1_balance.0)
-            } else {
-                (&mut asset1_balance.0, &mut asset0_balance.0)
-            };
-            if amount_out >= *out_balance {
-                return Err(anyhow::anyhow!("Amount must be less than out balance"));
+            let (in_balance, out_balance, fees, min_out_balance) = pool.reserves(token_in == 0);
+            if amount_out >= *out_balance || *out_balance - amount_out < min_out_balance {
+                return None;
             }
 
             #[allow(clippy::arithmetic_side_effects)]
@@ -504,20 +472,8 @@ impl Pool {
                 .checked_add(amount_in_after_fees)
                 .expect("Overflow");
             *out_balance = out_balance.checked_sub(amount_out).expect("Underflow");
-            Ok(amount_in)
-        });
-        match result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(e),
-            Err(e) => {
-                *self = self_before_modifications;
-                warn!(
-                    "Panicked while emulating swap {} -> {}",
-                    token_in, token_out
-                );
-                Err(anyhow::anyhow!("Panic: {:?}", e))
-            }
-        }
+            Some(amount_in)
+        })
     }
 }
 
@@ -525,43 +481,10 @@ lazy_static! {
     static ref POOLS_CACHE: Arc<RwLock<Option<Arc<Pools>>>> = Arc::new(RwLock::new(None));
 }
 
-struct Pools {
+pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
-    pools: Vec<Pool>,
-    pools_existing: HashSet<BTreeSet<AssetId>>,
-    token_to_pools: HashMap<AssetId, Vec<usize>>,
-    pair_to_pools: HashMap<(AssetId, AssetId), Vec<usize>>,
-}
-
-impl Pools {
-    fn has_direct_pool(&self, token_a: &AssetId, token_b: &AssetId) -> bool {
-        let pair = BTreeSet::from([token_a.clone(), token_b.clone()]);
-        self.pools_existing.contains(&pair)
-    }
-
-    fn direct_pools<'a>(
-        &'a self,
-        token_a: &AssetId,
-        token_b: &AssetId,
-    ) -> impl Iterator<Item = &'a Pool> {
-        let key = if token_a <= token_b {
-            (token_a.clone(), token_b.clone())
-        } else {
-            (token_b.clone(), token_a.clone())
-        };
-        self.pair_to_pools
-            .get(&key)
-            .into_iter()
-            .flat_map(move |indices| indices.iter().map(move |&idx| &self.pools[idx]))
-    }
-
-    fn pools_with_token<'a>(&'a self, token: &AssetId) -> impl Iterator<Item = &'a Pool> {
-        self.token_to_pools
-            .get(token)
-            .into_iter()
-            .flat_map(move |indices| indices.iter().map(move |&idx| &self.pools[idx]))
-    }
+    graph: Graph<Pool>,
 }
 
 /// Everything a pools snapshot is built from, as returned by RPC at one block
@@ -579,64 +502,22 @@ fn build_pools(source: PoolsSource) -> Pools {
     let pools = pools
         .into_iter()
         .enumerate()
-        .map(|(i, data)| Pool { id: i as u32, data })
+        .map(|(i, data)| Pool::new(i as u32, data))
         .collect::<Vec<_>>();
-
-    let pools_existing = {
-        let mut pools_existing = HashSet::new();
-        for pool in pools.iter() {
-            let (asset0_id, asset1_id) = match &pool.data {
-                PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
-                    (assets.0.asset_id.clone(), assets.1.asset_id.clone())
-                }
-                PoolData::Launch { launched_asset, .. } => {
-                    (AssetId::Near, launched_asset.asset_id.clone())
-                }
-            };
-            pools_existing.insert(BTreeSet::from_iter([asset0_id.clone(), asset1_id.clone()]));
-            pools_existing.insert(BTreeSet::from_iter([asset1_id, asset0_id]));
-        }
-        pools_existing
-    };
-
-    let mut token_to_pools: HashMap<AssetId, Vec<usize>> = HashMap::new();
-    let mut pair_to_pools: HashMap<(AssetId, AssetId), Vec<usize>> = HashMap::new();
-
-    for (idx, pool) in pools.iter().enumerate() {
-        let (asset0_id, asset1_id) = match &pool.data {
-            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
-                (assets.0.asset_id.clone(), assets.1.asset_id.clone())
-            }
-            PoolData::Launch { launched_asset, .. } => {
-                (AssetId::Near, launched_asset.asset_id.clone())
-            }
-        };
-        token_to_pools
-            .entry(asset0_id.clone())
-            .or_default()
-            .push(idx);
-        token_to_pools
-            .entry(asset1_id.clone())
-            .or_default()
-            .push(idx);
-
-        let mut tokens_sorted = [asset0_id, asset1_id];
-        tokens_sorted.sort_unstable();
-        let key = (tokens_sorted[0].clone(), tokens_sorted[1].clone());
-        pair_to_pools.entry(key).or_default().push(idx);
-    }
     Pools {
         block_height,
         updated_at: Instant::now(),
-        pools,
-        pools_existing,
-        token_to_pools,
-        pair_to_pools,
+        graph: Graph::new(pools),
     }
 }
 
+/// Builds pools from indexed storage
+pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error> {
+    storage::pools_source(state).map(build_pools)
+}
+
 /// Builds pools from indexed storage after every block, returns why it stopped
-async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
+pub async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
     let account_id: AccountId = INTEAR_DEX_CONTRACT_ID.parse().unwrap();
     let mut blocks = indexer.blocks();
     loop {
@@ -647,9 +528,7 @@ async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
             continue;
         };
         let height = state.block.height;
-        let pools =
-            tokio::task::spawn_blocking(move || storage::pools_source(&state).map(build_pools))
-                .await;
+        let pools = tokio::task::spawn_blocking(move || build_indexed_pools(&state)).await;
         match pools {
             Ok(Ok(pools)) => *POOLS_CACHE.write().await = Some(Arc::new(pools)),
             Ok(Err(e)) => {
@@ -676,1187 +555,201 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-/// Serves findPath, returns why it stopped
-pub async fn run(indexer: PoolIndexer) -> anyhow::Error {
-    let api = warp::path("findPath")
-        .and(warp::query::<FindPathQuery>())
-        .and_then(handle_find_path);
+const SETTINGS: Settings = Settings {
+    top_routes: 5,
+    max_splits: 2,
+    allow_unused_input: false,
+    keep_shorter_routes: true,
+};
 
-    info!("Server listening on http://localhost:12346/findPath ...");
-    tokio::select! {
-        () = warp::serve(api).run(([127, 0, 0, 1], 12346)) => anyhow::anyhow!("Server stopped"),
-        error = update_pools(indexer) => error,
-    }
+fn swap_gas(split_route: &SplitRoute) -> NearGas {
+    let pools = split_route
+        .parts
+        .iter()
+        .map(|part| part.route.hops.len() as u64)
+        .sum::<u64>();
+    NearGas::from_tgas(8 + 26 * pools)
 }
 
-#[derive(Clone, Copy, Debug)]
-enum QuoteAmount {
-    ExactIn(Balance),
-    ExactOut(Balance),
-}
+fn to_api_response(
+    split_route: &SplitRoute,
+    graph: &Graph<Pool>,
+    token_in: &AssetId,
+    token_out: &AssetId,
+    amount: QuoteAmount,
+    slippage_bp: u128,
+) -> Result<SplitRouteApiResponse, anyhow::Error> {
+    match amount {
+        QuoteAmount::ExactIn(total_amount_in) => {
+            let mut routes_resp = Vec::new();
+            let mut total_estimated_out: Balance = 0;
+            let mut pools_delta = PoolsDelta::default();
+            let amount_parts = split_exactly(total_amount_in, &split_route.parts);
 
-impl QuoteAmount {
-    fn value(self) -> Balance {
-        match self {
-            Self::ExactIn(amount) | Self::ExactOut(amount) => amount,
+            for (part, amount_part) in split_route.parts.iter().zip(amount_parts) {
+                let estimated_out = part
+                    .route
+                    .emulate_exact_in(graph, amount_part, &mut pools_delta)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
+                let min_amount_out = u256_to_u128(
+                    u128_to_u256(estimated_out) * u128_to_u256(10_000u128 - slippage_bp)
+                        / u128_to_u256(10_000u128),
+                );
+
+                let mut pools_resp = Vec::new();
+                let mut current_token = token_in.clone();
+                for (idx, hop) in part.route.hops.iter().enumerate() {
+                    let is_first = idx == 0;
+                    let is_last = idx + 1 == part.route.hops.len();
+
+                    pools_resp.push(ExactInPoolStep {
+                        pool_id: graph.pools()[hop.pool].id,
+                        token_in: current_token.clone(),
+                        token_out: graph.token(hop.token_out).clone(),
+                        amount_in: U128(if is_first { amount_part } else { 0 }),
+                        min_amount_out: U128(if is_last { min_amount_out } else { 0 }),
+                    });
+
+                    current_token = graph.token(hop.token_out).clone();
+                }
+
+                routes_resp.push(ExactInRoute {
+                    pools: pools_resp,
+                    amount_in: U128(amount_part),
+                    min_amount_out: U128(min_amount_out),
+                    amount_out: U128(estimated_out),
+                });
+                total_estimated_out = total_estimated_out
+                    .checked_add(estimated_out)
+                    .ok_or_else(|| anyhow::anyhow!("Total estimated out overflows u128"))?;
+            }
+            Ok(SplitRouteApiResponse::ExactIn {
+                routes: routes_resp,
+                contract_in: token_in.clone(),
+                contract_out: token_out.clone(),
+                amount_in: U128(total_amount_in),
+                amount_out: U128(total_estimated_out),
+                swap_gas: swap_gas(split_route),
+            })
+        }
+        QuoteAmount::ExactOut(total_amount_out) => {
+            let mut routes_resp = Vec::new();
+            let mut total_estimated_in: Balance = 0;
+            let mut total_max_amount_in: Balance = 0;
+            let mut pools_delta = PoolsDelta::default();
+            for (part, amount_out_part) in split_route
+                .parts
+                .iter()
+                .zip(split_exactly(total_amount_out, &split_route.parts))
+            {
+                let (amount_in, step_amounts) = part
+                    .route
+                    .emulate_exact_out(graph, amount_out_part, &mut pools_delta)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
+                let max_amount_in = u256_to_u128(
+                    u128_to_u256(amount_in) * u128_to_u256(10_000u128 + slippage_bp)
+                        / u128_to_u256(10_000),
+                );
+
+                let mut pools_resp = Vec::new();
+                let mut current_token = token_in.clone();
+                for (idx, hop) in part.route.hops.iter().enumerate() {
+                    let step_amount = step_amounts
+                        .get(idx)
+                        .ok_or_else(|| anyhow::anyhow!("Missing step amount"))?;
+
+                    pools_resp.push(ExactOutPoolStep {
+                        pool_id: graph.pools()[hop.pool].id,
+                        token_in: current_token.clone(),
+                        token_out: graph.token(hop.token_out).clone(),
+                        amount_in: U128(step_amount.0),
+                        amount_out: U128(step_amount.1),
+                        max_amount_in: U128(u256_to_u128(
+                            u128_to_u256(step_amount.0) * u128_to_u256(10_000u128 + slippage_bp)
+                                / u128_to_u256(10_000),
+                        )),
+                    });
+
+                    current_token = graph.token(hop.token_out).clone();
+                }
+
+                routes_resp.push(ExactOutRoute {
+                    pools: pools_resp,
+                    amount_in: U128(amount_in),
+                    max_amount_in: U128(max_amount_in),
+                    amount_out: U128(amount_out_part),
+                });
+                total_estimated_in = total_estimated_in
+                    .checked_add(amount_in)
+                    .ok_or_else(|| anyhow::anyhow!("Total estimated in overflows u128"))?;
+                total_max_amount_in = total_max_amount_in
+                    .checked_add(max_amount_in)
+                    .ok_or_else(|| anyhow::anyhow!("Total max in overflows u128"))?;
+            }
+            Ok(SplitRouteApiResponse::ExactOut {
+                routes: routes_resp,
+                contract_in: token_in.clone(),
+                contract_out: token_out.clone(),
+                amount_in: U128(total_estimated_in),
+                max_amount_in: U128(total_max_amount_in),
+                amount_out: U128(total_amount_out),
+                swap_gas: swap_gas(split_route),
+            })
         }
     }
 }
 
-fn route<'a>(
-    token_in: &'a AssetId,
-    token_out: &'a AssetId,
-    amount: QuoteAmount,
-    pools: &'a Pools,
-    max_hops: MaxHops,
-) -> Result<SplitRoute<'a>, anyhow::Error> {
-    let span = tracing::span!(
-        Level::INFO,
-        "find_best_routes",
-        token_in = token_in.to_string(),
-        token_out = token_out.to_string(),
-        amount = amount.value(),
-    );
-    let _enter = span.enter();
-    let now = Instant::now();
-    let routes = find_best_routes(
-        pools,
-        amount,
+pub struct Request {
+    pub token_in: AssetId,
+    pub token_out: AssetId,
+    pub amount: QuoteAmount,
+    pub max_hops: MaxHops,
+    /// 0.005 is 0.5%
+    pub slippage: BigDecimal,
+}
+
+pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
+    let pools = get_pools().await?;
+    tokio::task::spawn_blocking(move || find_path_in(&pools, &request)).await?
+}
+
+pub fn find_path_in(
+    pools: &Pools,
+    request: &Request,
+) -> Result<SplitRouteApiResponse, anyhow::Error> {
+    let slippage_bp = crate::slippage_bp(&request.slippage)?;
+    let graph = &pools.graph;
+    let (Some(token_in), Some(token_out)) = (
+        graph.token_index(&request.token_in),
+        graph.token_index(&request.token_out),
+    ) else {
+        anyhow::bail!("No routes found");
+    };
+    let split_route = search::route(
+        graph,
         token_in,
         token_out,
-        max_hops,
-        TOP_ROUTES_COUNT,
+        request.amount,
+        request.max_hops,
+        SETTINGS,
     )?;
-    info!("Found routes: {routes:#?}");
-    let duration = now.elapsed();
-    info!("Time to find best routes: {:?}", duration);
-
-    if routes.is_empty() {
-        return Err(anyhow::anyhow!("No routes found"));
-    }
-
-    let now = Instant::now();
-    let Some(best_split) = find_best_split_route(routes.clone(), amount, token_in, token_out)
-    else {
-        return Err(anyhow::anyhow!("No valid split route found"));
-    };
-    let duration = now.elapsed();
-    info!("Time to find best split route {best_split:#?} {duration:?}");
-
-    let best_split_metric =
-        best_split.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default())?;
-
-    if best_split_metric == 0 {
-        warn!("Estimated amount is 0");
-        return Err(anyhow::anyhow!("Estimated amount is 0"));
-    }
-
-    // There could be a bug, sometimes a bad route is chose. Make sure the best
-    // route is at least better or equal to the simplest (top 1) route.
-    let mut best_split = best_split;
-    let mut best_split_metric = best_split_metric;
-    for route in routes {
-        let single_split = SplitRoute::new(vec![SplitRouteStep { route, weight: 100 }]);
-        let single_split_metric = if let Ok(metric) =
-            single_split.emulate_swap(token_in, token_out, amount, &mut PoolsDelta::default())
-        {
-            metric
-        } else {
-            continue;
-        };
-        let is_better = match amount {
-            QuoteAmount::ExactIn(_) => single_split_metric > best_split_metric,
-            QuoteAmount::ExactOut(_) => single_split_metric < best_split_metric,
-        };
-        if is_better {
-            best_split = single_split;
-            best_split_metric = single_split_metric;
-        }
-    }
-    info!("Best split route: {best_split:#?} {best_split_metric:?}");
-
-    Ok(best_split)
-}
-
-#[derive(Debug, Clone)]
-struct SplitRoute<'a> {
-    steps: Vec<SplitRouteStep<'a>>,
-}
-
-impl<'a> Display for SplitRoute<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Split Route:")?;
-        for (i, step) in self.steps.iter().enumerate() {
-            write!(f, "  {}% {}", step.weight, step.route)?;
-            if i < self.steps.len() - 1 {
-                writeln!(f)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<'a> SplitRoute<'a> {
-    fn new(steps: Vec<SplitRouteStep<'a>>) -> Self {
-        Self { steps }
-    }
-
-    fn emulate_swap(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount: QuoteAmount,
-        pools_delta: &mut PoolsDelta,
-    ) -> Result<Balance, anyhow::Error> {
-        match amount {
-            QuoteAmount::ExactIn(amount_in) => {
-                self.emulate_swap_exact_in(token_in, token_out, amount_in, pools_delta)
-            }
-            QuoteAmount::ExactOut(amount_out) => {
-                self.emulate_swap_exact_out(token_in, token_out, amount_out, pools_delta)
-            }
-        }
-    }
-
-    fn emulate_swap_exact_in(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount_in: Balance,
-        pools_delta: &mut PoolsDelta,
-    ) -> Result<Balance, anyhow::Error> {
-        let mut total_out: Balance = 0;
-        for step in &self.steps {
-            let amount_part = u256_to_u128(
-                u128_to_u256(amount_in) * u128_to_u256(step.weight as u128) / u128_to_u256(100),
-            );
-            let out =
-                step.route
-                    .emulate_swap_exact_in(token_in, token_out, amount_part, pools_delta)?;
-            total_out += out;
-        }
-        Ok(total_out)
-    }
-
-    fn emulate_swap_exact_out(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount_out: Balance,
-        pools_delta: &mut PoolsDelta,
-    ) -> Result<Balance, anyhow::Error> {
-        let mut total_in: Balance = 0;
-        for step in &self.steps {
-            let amount_part_out = u256_to_u128(
-                u128_to_u256(amount_out) * u128_to_u256(step.weight as u128) / u128_to_u256(100),
-            );
-            let amount_in = step
-                .route
-                .emulate_swap_exact_out(token_in, token_out, amount_part_out, pools_delta)?
-                .0;
-            total_in = total_in
-                .checked_add(amount_in)
-                .ok_or_else(|| anyhow::anyhow!("Total estimated in overflows u128"))?;
-        }
-        Ok(total_in)
-    }
-}
-
-impl<'a> SplitRoute<'a> {
-    fn to_api_response(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount: QuoteAmount,
-        slippage_bp: u128,
-    ) -> Result<SplitRouteApiResponse, anyhow::Error> {
-        match amount {
-            QuoteAmount::ExactIn(total_amount_in) => {
-                let mut routes_resp = Vec::new();
-                let mut total_estimated_out: Balance = 0;
-                let mut pools_delta = PoolsDelta::default();
-                let mut amount_parts: Vec<Balance> = self
-                    .steps
-                    .iter()
-                    .map(|step| {
-                        u256_to_u128(
-                            u128_to_u256(total_amount_in) * u128_to_u256(step.weight as u128)
-                                / u128_to_u256(100),
-                        )
-                    })
-                    .collect();
-                let total_split_amount_in: Balance = amount_parts.iter().copied().sum();
-                if total_split_amount_in < total_amount_in {
-                    let leftover = total_amount_in - total_split_amount_in;
-                    const ROUNDING_ERROR_THRESHOLD: u128 = 50;
-                    if leftover < ROUNDING_ERROR_THRESHOLD {
-                        if let Some(first_amount) = amount_parts.first_mut() {
-                            *first_amount = first_amount.checked_add(leftover).unwrap_or_else(|| {
-                                panic!(
-                                    "Overflow while adding leftover to first split: first={}, leftover={}",
-                                    *first_amount, leftover
-                                )
-                            });
-                        } else {
-                            panic!(
-                                "No split steps available to apply leftover amount: leftover={}",
-                                leftover
-                            );
-                        }
-                    } else {
-                        panic!(
-                            "Total split amount_in is less than requested amount_in by too much: split_total={}, requested={}, leftover={}",
-                            total_split_amount_in, total_amount_in, leftover
-                        );
-                    }
-                } else if total_split_amount_in > total_amount_in {
-                    panic!(
-                        "Total split amount_in exceeds requested amount_in: split_total={}, requested={}",
-                        total_split_amount_in, total_amount_in
-                    );
-                }
-
-                for (step, amount_part) in self.steps.iter().zip(amount_parts) {
-                    let estimated_out = step.route.emulate_swap_exact_in(
-                        token_in,
-                        token_out,
-                        amount_part,
-                        &mut pools_delta,
-                    )?;
-                    let min_amount_out = estimated_out * (10_000u128 - slippage_bp) / 10_000u128;
-
-                    let mut pools_resp = Vec::new();
-                    let mut current_token = token_in.clone();
-                    for (idx, route_step) in step.route.steps.iter().enumerate() {
-                        let is_first = idx == 0;
-                        let is_last = idx + 1 == step.route.steps.len();
-
-                        pools_resp.push(ExactInPoolStep {
-                            pool_id: route_step.pool.id,
-                            token_in: current_token.clone(),
-                            token_out: route_step.token_out.to_owned(),
-                            amount_in: U128(if is_first { amount_part } else { 0 }),
-                            min_amount_out: U128(if is_last { min_amount_out } else { 0 }),
-                        });
-
-                        current_token = route_step.token_out.to_owned();
-                    }
-
-                    routes_resp.push(ExactInRoute {
-                        pools: pools_resp,
-                        amount_in: U128(amount_part),
-                        min_amount_out: U128(min_amount_out),
-                        amount_out: U128(estimated_out),
-                    });
-                    total_estimated_out = total_estimated_out
-                        .checked_add(estimated_out)
-                        .ok_or_else(|| anyhow::anyhow!("Total estimated out overflows u128"))?;
-                }
-                Ok(SplitRouteApiResponse::ExactIn {
-                    routes: routes_resp,
-                    contract_in: token_in.clone(),
-                    contract_out: token_out.clone(),
-                    amount_in: U128(total_amount_in),
-                    amount_out: U128(total_estimated_out),
-                })
-            }
-            QuoteAmount::ExactOut(total_amount_out) => {
-                let mut routes_resp = Vec::new();
-                let mut total_estimated_in: Balance = 0;
-                let mut total_max_amount_in: Balance = 0;
-                let mut pools_delta = PoolsDelta::default();
-                for step in &self.steps {
-                    let amount_out_part = u256_to_u128(
-                        u128_to_u256(total_amount_out) * u128_to_u256(step.weight as u128)
-                            / u128_to_u256(100),
-                    );
-                    let (amount_in, step_amounts) = step.route.emulate_swap_exact_out(
-                        token_in,
-                        token_out,
-                        amount_out_part,
-                        &mut pools_delta,
-                    )?;
-                    let max_amount_in = u256_to_u128(
-                        u128_to_u256(amount_in) * u128_to_u256(10_000u128 + slippage_bp)
-                            / u128_to_u256(10_000),
-                    );
-
-                    let mut pools_resp = Vec::new();
-                    let mut current_token = token_in.clone();
-                    for (idx, route_step) in step.route.steps.iter().enumerate() {
-                        let step_amount = step_amounts
-                            .get(idx)
-                            .ok_or_else(|| anyhow::anyhow!("Missing step amount"))?;
-
-                        pools_resp.push(ExactOutPoolStep {
-                            pool_id: route_step.pool.id,
-                            token_in: current_token.clone(),
-                            token_out: route_step.token_out.to_owned(),
-                            amount_in: U128(step_amount.0),
-                            amount_out: U128(step_amount.1),
-                            max_amount_in: U128(u256_to_u128(
-                                u128_to_u256(step_amount.0)
-                                    * u128_to_u256(10_000u128 + slippage_bp)
-                                    / u128_to_u256(10_000),
-                            )),
-                        });
-
-                        current_token = route_step.token_out.to_owned();
-                    }
-
-                    routes_resp.push(ExactOutRoute {
-                        pools: pools_resp,
-                        amount_in: U128(amount_in),
-                        max_amount_in: U128(max_amount_in),
-                        amount_out: U128(amount_out_part),
-                    });
-                    total_estimated_in = total_estimated_in
-                        .checked_add(amount_in)
-                        .ok_or_else(|| anyhow::anyhow!("Total estimated in overflows u128"))?;
-                    total_max_amount_in = total_max_amount_in
-                        .checked_add(max_amount_in)
-                        .ok_or_else(|| anyhow::anyhow!("Total max in overflows u128"))?;
-                }
-                Ok(SplitRouteApiResponse::ExactOut {
-                    routes: routes_resp,
-                    contract_in: token_in.clone(),
-                    contract_out: token_out.clone(),
-                    amount_in: U128(total_estimated_in),
-                    max_amount_in: U128(total_max_amount_in),
-                    amount_out: U128(total_amount_out),
-                })
-            }
-        }
-    }
-}
-
-fn find_best_split_route<'a>(
-    routes: Vec<Route<'a>>,
-    total_amount: QuoteAmount,
-    token_in: &'a AssetId,
-    token_out: &'a AssetId,
-) -> Option<SplitRoute<'a>> {
-    if routes.is_empty() {
-        return None;
-    }
-    const SMALL_AMOUNT_THRESHOLD: Balance = 1000;
-    let is_small_amount = match total_amount {
-        QuoteAmount::ExactIn(amount) => {
-            amount < SMALL_AMOUNT_THRESHOLD
-                || routes[0]
-                    .emulate_swap_exact_in(token_in, token_out, amount, &mut PoolsDelta::default())
-                    .map_or(true, |t| t < SMALL_AMOUNT_THRESHOLD)
-        }
-        QuoteAmount::ExactOut(amount) => {
-            amount < SMALL_AMOUNT_THRESHOLD
-                || routes[0]
-                    .emulate_swap_exact_out(token_in, token_out, amount, &mut PoolsDelta::default())
-                    .map_or(true, |t| t.0 < SMALL_AMOUNT_THRESHOLD)
-        }
-    };
-    let step = if is_small_amount {
-        SMALL_AMOUNT_ROUTE_STEP_SIZE
-    } else {
-        SPLIT_ROUTE_STEP_SIZE
-    };
-    let slices = 100 / step;
-    let mut weights: Vec<u32> = vec![0; routes.len()];
-
-    let mut best_split: Option<SplitRoute<'a>> = None;
-    let mut best_metric: Balance = match total_amount {
-        QuoteAmount::ExactIn(_) => 0,
-        QuoteAmount::ExactOut(_) => Balance::MAX,
-    };
-
-    for _ in 0..slices {
-        let mut local_best_metric = match total_amount {
-            QuoteAmount::ExactIn(_) => best_metric,
-            QuoteAmount::ExactOut(_) => Balance::MAX,
-        };
-        let mut local_best_idx: Option<usize> = None;
-
-        for (idx, _route) in routes.iter().enumerate() {
-            if weights[idx] == 0 {
-                // Route not yet chosen, check if we can still add new route
-                if weights.iter().filter(|&&w| w > 0).count() >= MAX_SPLITS_COUNT {
-                    continue;
-                }
-            }
-            if weights[idx] + step > 100 {
-                continue;
-            }
-            let mut candidate_weights = weights.clone();
-            candidate_weights[idx] += step;
-            // Build candidate split route
-            let mut candidate_steps: Vec<SplitRouteStep<'a>> = routes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    let w = candidate_weights[i];
-                    if w > 0 {
-                        Some(SplitRouteStep {
-                            route: r.clone(),
-                            weight: w,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            candidate_steps.sort_by_key(|s| std::cmp::Reverse(s.weight));
-            let candidate_split = SplitRoute::new(candidate_steps);
-            if let Ok(metric) = candidate_split.emulate_swap(
-                token_in,
-                token_out,
-                total_amount,
-                &mut PoolsDelta::default(),
-            ) {
-                let is_better = match total_amount {
-                    QuoteAmount::ExactIn(_) => metric > local_best_metric,
-                    QuoteAmount::ExactOut(_) => metric < local_best_metric,
-                };
-                if is_better {
-                    local_best_metric = metric;
-                    local_best_idx = Some(idx);
-                }
-            }
-        }
-
-        if let Some(idx) = local_best_idx {
-            // Accept the improvement
-            weights[idx] += step;
-            best_metric = local_best_metric;
-            // Rebuild best_split
-            let mut steps: Vec<SplitRouteStep<'a>> = routes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    let w = weights[i];
-                    if w > 0 {
-                        Some(SplitRouteStep {
-                            route: r.clone(),
-                            weight: w,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            steps.sort_by_key(|s| std::cmp::Reverse(s.weight));
-            best_split = Some(SplitRoute::new(steps));
-        } else {
-            // No further improvement found
-            break;
-        }
-    }
-
-    if weights.iter().copied().sum::<u32>() != 100 {
-        return None;
-    }
-
-    best_split
-}
-
-#[derive(Debug, Clone)]
-struct SplitRouteStep<'a> {
-    route: Route<'a>,
-    weight: u32,
-}
-
-#[derive(Debug, Clone)]
-struct Route<'a> {
-    steps: Vec<RouteStep<'a>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RouteStep<'a> {
-    pool: &'a Pool,
-    token_in: &'a AssetId,
-    token_out: &'a AssetId,
-}
-
-impl<'a> Display for Route<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Some(first_step) = self.steps.first() else {
-            return write!(f, "(empty route)");
-        };
-        f.write_str("Route: ")?;
-        f.write_str(first_step.token_in.to_string().as_str())?;
-        for step in self.steps.iter() {
-            write!(f, " --- ({}) ---> {}", step.pool.id, step.token_out)?;
-        }
-        Ok(())
-    }
-}
-
-impl Route<'_> {
-    fn emulate_swap_exact_in(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount_in: Balance,
-        pools_delta: &mut PoolsDelta,
-    ) -> Result<Balance, anyhow::Error> {
-        let mut current_token = token_in;
-        let mut current_amount = amount_in;
-        for step in self.steps.iter() {
-            if current_token != step.token_in {
-                return Err(anyhow::anyhow!("Invalid route"));
-            }
-            let pool = if let Some(pool) = pools_delta.changed_pools.get(&step.pool.id) {
-                pool
-            } else {
-                step.pool
-            };
-            let mut new_pool = pool.clone();
-
-            current_amount =
-                new_pool.emulate_swap(current_token, step.token_out, current_amount)?;
-
-            pools_delta.changed_pools.insert(new_pool.id, new_pool);
-            current_token = step.token_out;
-        }
-        if current_token != token_out {
-            return Err(anyhow::anyhow!("Invalid route"));
-        }
-        Ok(current_amount)
-    }
-
-    fn emulate_swap_exact_out(
-        &self,
-        token_in: &AssetId,
-        token_out: &AssetId,
-        amount_out: Balance,
-        pools_delta: &mut PoolsDelta,
-    ) -> Result<(Balance, Vec<(Balance, Balance)>), anyhow::Error> {
-        let mut current_token = token_out;
-        let mut current_amount_out = amount_out;
-        let mut step_amounts = Vec::with_capacity(self.steps.len());
-        for step in self.steps.iter().rev() {
-            if current_token != step.token_out {
-                return Err(anyhow::anyhow!("Invalid route"));
-            }
-            let pool = if let Some(pool) = pools_delta.changed_pools.get(&step.pool.id) {
-                pool
-            } else {
-                step.pool
-            };
-            let mut new_pool = pool.clone();
-            let amount_in = new_pool.emulate_swap_exact_out(
-                step.token_in,
-                step.token_out,
-                current_amount_out,
-            )?;
-            pools_delta.changed_pools.insert(new_pool.id, new_pool);
-            step_amounts.push((amount_in, current_amount_out));
-            current_amount_out = amount_in;
-            current_token = step.token_in;
-        }
-        if current_token != token_in {
-            return Err(anyhow::anyhow!("Invalid route"));
-        }
-        step_amounts.reverse();
-        Ok((current_amount_out, step_amounts))
-    }
-}
-
-#[derive(Deserialize, Debug)]
-enum MaxHops {
-    DirectOnly,
-    Two,
-    Three,
-    Four,
-    Max,
-}
-
-fn select_top_k<T, F, K>(mut items: Vec<T>, k: usize, key_fn: F) -> Vec<T>
-where
-    F: Fn(&T) -> K,
-    K: Ord + Clone,
-{
-    if k == 0 {
-        panic!("k cannot be 0");
-    }
-
-    if items.len() <= k {
-        items.sort_unstable_by_key(|a| std::cmp::Reverse(key_fn(a))); // descending order
-        return items;
-    }
-
-    items.select_nth_unstable_by_key(k - 1, |a| std::cmp::Reverse(key_fn(a)));
-
-    items.truncate(k);
-    items.sort_unstable_by_key(|a| std::cmp::Reverse(key_fn(a))); // descending order
-
-    items
-}
-
-fn find_best_route<'a>(
-    pools: &'a Pools,
-    amount: QuoteAmount,
-    token_in: &'a AssetId,
-    token_out: &'a AssetId,
-    max_hops: MaxHops,
-) -> Result<Route<'a>, anyhow::Error> {
-    let routes = find_best_routes(pools, amount, token_in, token_out, max_hops, 1)?;
-    if let [route, ..] = &routes[..] {
-        return Ok(route.clone());
-    }
-    Err(anyhow::anyhow!("No route found"))
-}
-
-fn find_best_routes<'a>(
-    pools: &'a Pools,
-    amount: QuoteAmount,
-    token_in: &'a AssetId,
-    token_out: &'a AssetId,
-    max_hops: MaxHops,
-    count: usize,
-) -> Result<Vec<Route<'a>>, anyhow::Error> {
-    if !pools.has_direct_pool(token_in, token_out) && matches!(max_hops, MaxHops::DirectOnly) {
-        return Ok(Vec::new());
-    }
-    let single_pool_candidates = select_top_k(
-        pools.direct_pools(token_in, token_out).collect(),
-        3,
-        |pool| {
-            let metric = match amount {
-                QuoteAmount::ExactIn(amount_in) => (*pool)
-                    .clone()
-                    .emulate_swap(token_in, token_out, amount_in)
-                    .ok(),
-                QuoteAmount::ExactOut(amount_out) => (*pool)
-                    .clone()
-                    .emulate_swap_exact_out(token_in, token_out, amount_out)
-                    .ok(),
-            };
-            match amount {
-                QuoteAmount::ExactIn(_) => metric
-                    .and_then(|value| i128::try_from(value).ok())
-                    .unwrap_or_default(),
-                QuoteAmount::ExactOut(_) => metric
-                    .and_then(|value| i128::try_from(value).ok())
-                    .map(|value| -value)
-                    .unwrap_or(i128::MIN),
-            }
-        },
-    );
-
-    let single_pool_routes = single_pool_candidates
-        .into_iter()
-        .map(|pool| Route {
-            steps: vec![RouteStep {
-                pool,
-                token_in,
-                token_out,
-            }],
-        })
-        .collect::<Vec<_>>();
-
-    if matches!(max_hops, MaxHops::DirectOnly) {
-        // already sorted
-        return Ok(single_pool_routes.into_iter().take(count).collect());
-    }
-
-    // Two hops
-
-    let starting_pool_candidates = pools.pools_with_token(token_in);
-    let ending_pool_candidates = pools.pools_with_token(token_out);
-
-    let starting_pool_tokens = starting_pool_candidates
-        .flat_map(|pool| match &pool.data {
-            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
-                vec![&assets.0.asset_id, &assets.1.asset_id]
-            }
-            PoolData::Launch { launched_asset, .. } => {
-                vec![&AssetId::Near, &launched_asset.asset_id]
-            }
-        })
-        .collect::<BTreeSet<_>>();
-    let ending_pool_tokens = ending_pool_candidates
-        .flat_map(|pool| match &pool.data {
-            PoolData::Private { assets, .. } | PoolData::Public { assets, .. } => {
-                vec![&assets.0.asset_id, &assets.1.asset_id]
-            }
-            PoolData::Launch { launched_asset, .. } => {
-                vec![&AssetId::Near, &launched_asset.asset_id]
-            }
-        })
-        .collect::<BTreeSet<_>>();
-    let possible_intermediate_tokens = starting_pool_tokens
-        .intersection(&ending_pool_tokens)
-        .filter(|&&token| token != token_in && token != token_out)
-        .collect::<Vec<_>>();
-
-    let mut routes = Vec::new();
-    routes.extend(single_pool_routes);
-
-    match amount {
-        QuoteAmount::ExactIn(amount_in) => {
-            for intermediate_token in possible_intermediate_tokens {
-                if !pools.has_direct_pool(token_in, intermediate_token)
-                    || !pools.has_direct_pool(intermediate_token, token_out)
-                {
-                    continue;
-                }
-
-                let Ok(first_route) = find_best_route(
-                    pools,
-                    QuoteAmount::ExactIn(amount_in),
-                    token_in,
-                    intermediate_token,
-                    MaxHops::DirectOnly,
-                ) else {
-                    continue;
-                };
-                let Ok(intermediate_amount) = first_route.emulate_swap_exact_in(
-                    token_in,
-                    intermediate_token,
-                    amount_in,
-                    &mut PoolsDelta::default(),
-                ) else {
-                    continue;
-                };
-                let Ok(second_route) = find_best_route(
-                    pools,
-                    QuoteAmount::ExactIn(intermediate_amount),
-                    intermediate_token,
-                    token_out,
-                    MaxHops::DirectOnly,
-                ) else {
-                    continue;
-                };
-
-                let mut combined_steps = Vec::new();
-                combined_steps.extend(first_route.steps);
-                combined_steps.extend(second_route.steps);
-
-                routes.push(Route {
-                    steps: combined_steps,
-                });
-            }
-
-            if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
-                // Three hops
-                for first_intermediate_token in starting_pool_tokens.iter() {
-                    if *first_intermediate_token == token_in
-                        || *first_intermediate_token == token_out
-                    {
-                        continue;
-                    }
-                    for second_intermediate_token in ending_pool_tokens.iter() {
-                        if *second_intermediate_token == token_in
-                            || *second_intermediate_token == token_out
-                        {
-                            continue;
-                        }
-                        if first_intermediate_token == second_intermediate_token {
-                            continue;
-                        }
-
-                        if !pools.has_direct_pool(token_in, first_intermediate_token)
-                            || !pools.has_direct_pool(
-                                first_intermediate_token,
-                                second_intermediate_token,
-                            )
-                            || !pools.has_direct_pool(second_intermediate_token, token_out)
-                        {
-                            continue;
-                        }
-
-                        let Ok(in_to_first) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactIn(amount_in),
-                            token_in,
-                            first_intermediate_token,
-                            match max_hops {
-                                MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let Ok(first_intermediate_amount) = in_to_first.emulate_swap_exact_in(
-                            token_in,
-                            first_intermediate_token,
-                            amount_in,
-                            &mut PoolsDelta::default(),
-                        ) else {
-                            continue;
-                        };
-                        let Ok(first_to_second) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactIn(first_intermediate_amount),
-                            first_intermediate_token,
-                            second_intermediate_token,
-                            match max_hops {
-                                MaxHops::Three => MaxHops::DirectOnly,
-                                MaxHops::Four => MaxHops::Two,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let Ok(second_intermediate_amount) = first_to_second.emulate_swap_exact_in(
-                            first_intermediate_token,
-                            second_intermediate_token,
-                            first_intermediate_amount,
-                            &mut PoolsDelta::default(),
-                        ) else {
-                            continue;
-                        };
-                        let Ok(second_to_out) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactIn(second_intermediate_amount),
-                            second_intermediate_token,
-                            token_out,
-                            match max_hops {
-                                MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let mut combined_steps = Vec::new();
-                        combined_steps.extend(in_to_first.steps);
-                        combined_steps.extend(first_to_second.steps);
-                        combined_steps.extend(second_to_out.steps);
-                        routes.push(Route {
-                            steps: combined_steps,
-                        });
-                    }
-                }
-            }
-        }
-        QuoteAmount::ExactOut(amount_out) => {
-            for intermediate_token in possible_intermediate_tokens {
-                if !pools.has_direct_pool(token_in, intermediate_token)
-                    || !pools.has_direct_pool(intermediate_token, token_out)
-                {
-                    continue;
-                }
-
-                let Ok(second_route) = find_best_route(
-                    pools,
-                    QuoteAmount::ExactOut(amount_out),
-                    intermediate_token,
-                    token_out,
-                    MaxHops::DirectOnly,
-                ) else {
-                    continue;
-                };
-                let Ok((intermediate_amount, _)) = second_route.emulate_swap_exact_out(
-                    intermediate_token,
-                    token_out,
-                    amount_out,
-                    &mut PoolsDelta::default(),
-                ) else {
-                    continue;
-                };
-                let Ok(first_route) = find_best_route(
-                    pools,
-                    QuoteAmount::ExactOut(intermediate_amount),
-                    token_in,
-                    intermediate_token,
-                    MaxHops::DirectOnly,
-                ) else {
-                    continue;
-                };
-
-                let mut combined_steps = Vec::new();
-                combined_steps.extend(first_route.steps);
-                combined_steps.extend(second_route.steps);
-
-                routes.push(Route {
-                    steps: combined_steps,
-                });
-            }
-
-            if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
-                // Three hops
-                for first_intermediate_token in starting_pool_tokens.iter() {
-                    if *first_intermediate_token == token_in
-                        || *first_intermediate_token == token_out
-                    {
-                        continue;
-                    }
-                    for second_intermediate_token in ending_pool_tokens.iter() {
-                        if *second_intermediate_token == token_in
-                            || *second_intermediate_token == token_out
-                        {
-                            continue;
-                        }
-                        if first_intermediate_token == second_intermediate_token {
-                            continue;
-                        }
-
-                        if !pools.has_direct_pool(token_in, first_intermediate_token)
-                            || !pools.has_direct_pool(
-                                first_intermediate_token,
-                                second_intermediate_token,
-                            )
-                            || !pools.has_direct_pool(second_intermediate_token, token_out)
-                        {
-                            continue;
-                        }
-
-                        let Ok(second_to_out) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactOut(amount_out),
-                            second_intermediate_token,
-                            token_out,
-                            match max_hops {
-                                MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let Ok((second_intermediate_amount, _)) = second_to_out
-                            .emulate_swap_exact_out(
-                                second_intermediate_token,
-                                token_out,
-                                amount_out,
-                                &mut PoolsDelta::default(),
-                            )
-                        else {
-                            continue;
-                        };
-                        let Ok(first_to_second) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactOut(second_intermediate_amount),
-                            first_intermediate_token,
-                            second_intermediate_token,
-                            match max_hops {
-                                MaxHops::Three => MaxHops::DirectOnly,
-                                MaxHops::Four => MaxHops::Two,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let Ok((first_intermediate_amount, _)) = first_to_second
-                            .emulate_swap_exact_out(
-                                first_intermediate_token,
-                                second_intermediate_token,
-                                second_intermediate_amount,
-                                &mut PoolsDelta::default(),
-                            )
-                        else {
-                            continue;
-                        };
-                        let Ok(in_to_first) = find_best_route(
-                            pools,
-                            QuoteAmount::ExactOut(first_intermediate_amount),
-                            token_in,
-                            first_intermediate_token,
-                            match max_hops {
-                                MaxHops::Three | MaxHops::Four => MaxHops::DirectOnly,
-                                MaxHops::Max => MaxHops::Three,
-                                _ => unreachable!(),
-                            },
-                        ) else {
-                            continue;
-                        };
-                        let mut combined_steps = Vec::new();
-                        combined_steps.extend(in_to_first.steps);
-                        combined_steps.extend(first_to_second.steps);
-                        combined_steps.extend(second_to_out.steps);
-                        routes.push(Route {
-                            steps: combined_steps,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if matches!(max_hops, MaxHops::Three | MaxHops::Four | MaxHops::Max) {
-        info!("Choosing from {} routes", routes.len());
-    }
-
-    // Remove duplicate tokens
-    routes.retain(|route| {
-        if route.steps.is_empty() {
-            return false;
-        }
-        let mut seen: HashSet<&AssetId> = HashSet::new();
-        std::iter::once(route.steps[0].token_in)
-            .chain(route.steps.iter().map(|s| s.token_out))
-            .all(|token| seen.insert(token))
-    });
-
-    let best_routes = select_top_k(routes, count, |route| {
-        let metric = match amount {
-            QuoteAmount::ExactIn(amount_in) => route
-                .emulate_swap_exact_in(token_in, token_out, amount_in, &mut PoolsDelta::default())
-                .ok(),
-            QuoteAmount::ExactOut(amount_out) => route
-                .emulate_swap_exact_out(token_in, token_out, amount_out, &mut PoolsDelta::default())
-                .map(|(amount, _)| amount)
-                .ok(),
-        };
-        match amount {
-            QuoteAmount::ExactIn(_) => metric
-                .and_then(|value| i128::try_from(value).ok())
-                .unwrap_or_default(),
-            QuoteAmount::ExactOut(_) => metric
-                .and_then(|value| i128::try_from(value).ok())
-                .map(|value| -value)
-                .unwrap_or(i128::MIN),
-        }
-    });
-    Ok(best_routes.clone())
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FindPathQuery {
-    #[serde(default, with = "dec_format")]
-    amount_in: Option<Balance>,
-    #[serde(default, with = "dec_format")]
-    amount_out: Option<Balance>,
-    token_in: AssetId,
-    token_out: AssetId,
-    max_hops: MaxHops,
-    #[serde(deserialize_with = "deserialize_bigdecimal")]
-    slippage: BigDecimal,
-}
-
-fn deserialize_bigdecimal<'de, D>(deserializer: D) -> Result<BigDecimal, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = <String as Deserialize>::deserialize(deserializer)?;
-    value.parse().map_err(serde::de::Error::custom)
-}
-
-struct Request {
-    token_in: AssetId,
-    token_out: AssetId,
-    amount: QuoteAmount,
-    max_hops: MaxHops,
-    slippage_bp: u128,
-}
-
-fn parse_request(query: FindPathQuery) -> Result<Request, (i32, String)> {
-    let amount = match (query.amount_in, query.amount_out) {
-        (Some(amount_in), None) => QuoteAmount::ExactIn(amount_in),
-        (None, Some(amount_out)) => QuoteAmount::ExactOut(amount_out),
-        _ => {
-            return Err((
-                RC_ROUTE_ERROR,
-                "Provide either amountIn or amountOut".into(),
-            ));
-        }
-    };
-
-    if query.slippage < 0 || query.slippage > 1 {
-        return Err((RC_INVALID_SLIPPAGE, "Invalid slippage".into()));
-    }
-    let slippage_bp = (query.slippage * BigDecimal::from_u32(10_000).unwrap())
-        .with_scale_round(0, RoundingMode::Down)
-        .to_u128()
-        .unwrap();
-    Ok(Request {
-        token_in: query.token_in,
-        token_out: query.token_out,
-        amount,
-        max_hops: query.max_hops,
-        slippage_bp,
-    })
-}
-
-/// CPU-bound, emulates swaps
-fn find_path(
-    pools: &Pools,
-    request: Request,
-    request_id: u32,
-) -> Result<SplitRouteApiResponse, (i32, String)> {
-    let split_route = route(
+    let response = to_api_response(
+        &split_route,
+        graph,
         &request.token_in,
         &request.token_out,
         request.amount,
-        pools,
-        request.max_hops,
-    )
-    .map_err(|e| (RC_ROUTE_ERROR, e.to_string()))?;
-    let estimated_amount = split_route
-        .emulate_swap(
-            &request.token_in,
-            &request.token_out,
-            request.amount,
-            &mut PoolsDelta::default(),
-        )
-        .unwrap_or(0);
-    match request.amount {
-        QuoteAmount::ExactIn(_) => {
-            info!(
-                "Request id: {:06}, Estimated amount out: {}, block: {}",
-                request_id, estimated_amount, pools.block_height
-            );
-        }
-        QuoteAmount::ExactOut(_) => {
-            info!(
-                "Request id: {:06}, Estimated amount in: {}, block: {}",
-                request_id, estimated_amount, pools.block_height
-            );
-        }
+        slippage_bp,
+    )?;
+    match &response {
+        SplitRouteApiResponse::ExactIn { amount_out, .. } => info!(
+            "Plach route from {} to {}: {} out, block {}",
+            request.token_in, request.token_out, amount_out.0, pools.block_height
+        ),
+        SplitRouteApiResponse::ExactOut { amount_in, .. } => info!(
+            "Plach route from {} to {}: {} in, block {}",
+            request.token_in, request.token_out, amount_in.0, pools.block_height
+        ),
     }
-
-    split_route
-        .to_api_response(
-            &request.token_in,
-            &request.token_out,
-            request.amount,
-            request.slippage_bp,
-        )
-        .map_err(|e| (RC_RESPONSE_BUILD_ERROR, e.to_string()))
-}
-
-fn api_response<T>(result: Result<T, (i32, String)>) -> ApiResponse<T> {
-    match result {
-        Ok(data) => ApiResponse {
-            result_code: RC_SUCCESS,
-            result_message: "".into(),
-            result_data: Some(data),
-        },
-        Err((result_code, result_message)) => ApiResponse {
-            result_code,
-            result_message,
-            result_data: None,
-        },
-    }
-}
-
-async fn handle_find_path(query: FindPathQuery) -> Result<impl warp::Reply, warp::Rejection> {
-    let request_id = rand::thread_rng().gen_range(1..1000000);
-    info!(
-        "Received request: request_id={:06}, amount_in={:?}, amount_out={:?}, token_in={}, token_out={}, max_hops={:?}, slippage={:?}",
-        request_id,
-        query.amount_in,
-        query.amount_out,
-        query.token_in,
-        query.token_out,
-        query.max_hops,
-        query.slippage
-    );
-
-    let result = match parse_request(query) {
-        Ok(request) => match get_pools().await {
-            Ok(pools) => {
-                tokio::task::spawn_blocking(move || find_path(&pools, request, request_id))
-                    .await
-                    .unwrap_or_else(|e| Err((RC_ROUTE_ERROR, e.to_string())))
-            }
-            Err(e) => Err((RC_POOL_FETCH_ERROR, e.to_string())),
-        },
-        Err(e) => Err(e),
-    };
-    Ok(warp::reply::json(&api_response(result)))
+    Ok(response)
 }

@@ -25,9 +25,10 @@ borsh = "1.6.0"
 base64 = "0.21.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate", "chrono"] }
+pathfinder = { path = "pathfinder" }
 
 [profile.release]
 overflow-checks = true
 
 [workspace]
-members = ["pathfinder", "rhea-dcl-math", "pool-indexer"]
+members = ["pathfinder", "rhea-dcl-math", "pool-indexer", "shadow-proxy"]

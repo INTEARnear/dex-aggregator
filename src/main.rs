@@ -15,10 +15,11 @@ use std::{
     net::SocketAddr,
     panic::AssertUnwindSafe,
     pin::Pin,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::{
@@ -108,8 +109,7 @@ async fn route_handler(
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
         &providers::wrap::WrapProvider,
-        // &providers::rhea_dcl::RheaDclProvider,
-        &providers::rhea_dcl_v2::RheaDclProvider,
+        &providers::rhea_dcl::RheaDclProvider,
         &providers::metapool::MetapoolProvider,
         &providers::linear::LinearProvider,
         &providers::xrhea::XRheaProvider,
@@ -270,10 +270,15 @@ async fn main() {
 
     info!("Server running on http://{}", bind_address);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    // dexes need the indexer to run, and indexer without http does nothing, so stop when first one crashes
+    tokio::select! {
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => result.unwrap(),
+        error = pathfinder::run(Arc::new(shared_utils::RPC_CLIENT.clone())) => {
+            error!("Pool indexing stopped: {error:#}");
+            std::process::exit(1);
+        }
+    }
 }
