@@ -50,6 +50,12 @@ Some DEXes (such as Rhea) only support NEP-141 tokens, but the user might want t
 
 As a post-processing step, chained transactions to the same contract are merged into one (e.g. `storage_deposit` + `near_deposit` + `ft_transfer_call` for `wrap.near`) to optimize transaction count. When ordering of transactions doesn't matter (e.g. storage deposit needed for output token & location conversion needed for input token), DEX Aggregator tries to arrange them in a way that is more likely to be optimizable this way.
 
+## Route subscriptions
+
+Instead of polling `/route`, clients can open a WebSocket to `/route/subscribe` with the same query parameters. The server sends the routes (same JSON as `/route` returns) as soon as they're found, then again every time they change: when the quote of the current route changes, or another pool / DEX becomes the better one.
+
+Routes are found again once every DEX has rebuilt its pools for a newer block, but not sooner than 10x the time the previous routing took (at most 3 seconds), so a subscription keeps routing busy at most 1/10 of the time. Typical routes are found again after every block, slow ones every few blocks. Clients aren't expected to send anything, close the socket to unsubscribe. A subscription counts as one request for rate limiting.
+
 ## Rate limiting
 
 Requests without an API key are rate limited per client IP. Configured with environment variables (`.env` works too):

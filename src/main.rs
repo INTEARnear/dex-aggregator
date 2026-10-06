@@ -7,12 +7,12 @@ use axum::{
     routing::get,
     Extension, Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use std::{
     env,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::Arc,
@@ -33,6 +33,7 @@ mod providers;
 mod rate_limit;
 mod shared_utils;
 mod stats;
+mod subscription;
 mod types;
 
 pub trait Provider: Sync {
@@ -50,6 +51,42 @@ async fn route_handler(
     let timestamp = Utc::now();
     info!("Received route request: {:?}", request);
 
+    validate_request(&request)?;
+    let (routes, route_stats) = find_routes(&request).await;
+    record_stats(
+        &stats,
+        ip,
+        timestamp,
+        &request,
+        started_at.elapsed(),
+        route_stats,
+    );
+
+    Ok(Json(routes))
+}
+
+fn record_stats(
+    stats: &Stats,
+    ip: IpAddr,
+    timestamp: DateTime<Utc>,
+    request: &SwapRequest,
+    duration: Duration,
+    routes: Vec<RouteStats>,
+) {
+    stats.record(QueryStats {
+        timestamp,
+        ip,
+        token_in: request.token_in.clone(),
+        token_out: request.token_out.clone(),
+        amount: request.amount,
+        referrer_id: request.referrer_id.clone(),
+        trader_account_id: request.trader_account_id.clone(),
+        duration,
+        routes,
+    });
+}
+
+fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
     match &request.slippage {
         Slippage::Auto {
             max_slippage,
@@ -105,6 +142,11 @@ async fn route_handler(
         ));
     }
 
+    Ok(())
+}
+
+/// Routes of every requested DEX, best first
+async fn find_routes(request: &SwapRequest) -> (Vec<Route>, Vec<RouteStats>) {
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
@@ -215,19 +257,7 @@ async fn route_handler(
 
     tracing::info!("Found {} routes: {:?}", routes.len(), routes);
 
-    stats.record(QueryStats {
-        timestamp,
-        ip,
-        token_in: request.token_in,
-        token_out: request.token_out,
-        amount: request.amount,
-        referrer_id: request.referrer_id,
-        trader_account_id: request.trader_account_id,
-        duration: started_at.elapsed(),
-        routes: route_stats,
-    });
-
-    Ok(Json(routes))
+    (routes, route_stats)
 }
 
 #[tokio::main]
@@ -253,6 +283,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/route", get(route_handler))
+        .route("/route/subscribe", get(subscription::subscribe_handler))
         .with_state(stats)
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),

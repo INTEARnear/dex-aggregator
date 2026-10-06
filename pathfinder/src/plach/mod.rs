@@ -530,7 +530,10 @@ pub async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
         let height = state.block.height;
         let pools = tokio::task::spawn_blocking(move || build_indexed_pools(&state)).await;
         match pools {
-            Ok(Ok(pools)) => *POOLS_CACHE.write().await = Some(Arc::new(pools)),
+            Ok(Ok(pools)) => {
+                *POOLS_CACHE.write().await = Some(Arc::new(pools));
+                crate::pools_built(crate::PoolsDex::Plach, height);
+            }
             Ok(Err(e)) => {
                 return e.context(format!("Failed to build Plach pools at block {height}"));
             }
