@@ -76,6 +76,12 @@ enum StoredPool {
         _user_shares_prefix: Vec<u8>,
         total_shares: Option<u128>,
     },
+    LaunchV2 {
+        quote_asset: AssetWithBalance,
+        launched_asset: AssetWithBalance,
+        fees: StoredFeeConfiguration,
+        phantom_liquidity: U128,
+    },
 }
 
 #[derive(BorshDeserialize, Clone)]
@@ -214,6 +220,22 @@ fn pool_data(pool: StoredPool, timestamp: Timestamp) -> Result<PoolData, anyhow:
             fee_configuration: fee_configuration(fees),
             assets,
             total_shares: total_shares.map(U128),
+        },
+        StoredPool::LaunchV2 {
+            quote_asset,
+            launched_asset,
+            fees,
+            phantom_liquidity,
+        } => PoolData::LaunchV2 {
+            fees: current_fees(
+                &fees,
+                [&quote_asset.asset_id, &launched_asset.asset_id],
+                timestamp,
+            )?,
+            fee_configuration: fee_configuration(fees),
+            quote_asset,
+            launched_asset,
+            phantom_liquidity,
         },
     })
 }

@@ -101,8 +101,8 @@ pub struct Pool {
 struct PoolInfo {
     tokens: [AssetId; 2],
     fees: CurrentFees,
-    /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom NEAR
-    /// liquidity.
+    /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom
+    /// liquidity of the quote token.
     min_reserves: [Balance; 2],
 }
 
@@ -126,6 +126,18 @@ impl Pool {
                 [near_amount.0, launched_asset.balance.0],
                 fees,
                 [phantom_liquidity_near.0, 0],
+            ),
+            PoolData::LaunchV2 {
+                quote_asset,
+                launched_asset,
+                fees,
+                phantom_liquidity,
+                ..
+            } => (
+                [quote_asset.asset_id, launched_asset.asset_id],
+                [quote_asset.balance.0, launched_asset.balance.0],
+                fees,
+                [phantom_liquidity.0, 0],
             ),
         };
         Self {
@@ -161,6 +173,13 @@ pub enum PoolData {
         fees: CurrentFees,
         fee_configuration: FeeConfiguration,
         phantom_liquidity_near: U128,
+    },
+    LaunchV2 {
+        quote_asset: AssetWithBalance,
+        launched_asset: AssetWithBalance,
+        fees: CurrentFees,
+        fee_configuration: FeeConfiguration,
+        phantom_liquidity: U128,
     },
 }
 
