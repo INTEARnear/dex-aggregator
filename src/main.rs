@@ -192,6 +192,9 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Route>, Vec<RouteStats>) {
                 dex_id: provider.dex_id(),
                 duration: started_at.elapsed(),
                 outcome,
+                estimated_amount: route.as_ref().map(|route| match route.estimated_amount {
+                    Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
+                }),
             };
             (route_stats, route)
         }));

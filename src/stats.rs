@@ -1,7 +1,7 @@
 use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use chrono::{DateTime, Utc};
-use near_min_api::types::AccountId;
+use near_min_api::types::{AccountId, Balance};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool},
     SqliteConnection,
@@ -34,6 +34,7 @@ pub struct RouteStats {
     pub dex_id: DexId,
     pub duration: Duration,
     pub outcome: RouteOutcome,
+    pub estimated_amount: Option<Balance>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,12 +118,13 @@ async fn insert_query(
 
     for route in &query.routes {
         sqlx::query(
-            "INSERT INTO query_routes (query_id, dex_id, duration_ms, outcome) VALUES (?, ?, ?, ?)",
+            "INSERT INTO query_routes (query_id, dex_id, duration_ms, outcome, estimated_amount) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(query_id)
         .bind(route.dex_id.to_string())
         .bind(route.duration.as_millis() as i64)
         .bind(route.outcome.as_str())
+        .bind(route.estimated_amount.map(|amount| amount.to_string()))
         .execute(&mut *connection)
         .await?;
     }
