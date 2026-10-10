@@ -1322,7 +1322,9 @@ pub fn storage_deposits_net(execution_instructions: &[ExecutionInstruction]) -> 
 
 /// NEAR the execution instructions attach to storage deposits, also what they withdraw right after.
 /// The trader's wallet needs to have it even though it's refunded right after.
-pub fn storage_deposits_max_at_any_point(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+pub fn storage_deposits_max_at_any_point(
+    execution_instructions: &[ExecutionInstruction],
+) -> NearToken {
     storage_deposits_and_withdrawals(execution_instructions).0
 }
 

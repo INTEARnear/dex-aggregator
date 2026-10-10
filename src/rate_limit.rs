@@ -327,6 +327,14 @@ impl RateLimiter {
         }
     }
 
+    /// Records a request from `ip` if it made fewer than the limit allows,
+    /// otherwise returns how long until it can retry.
+    fn check(&self, ip: IpAddr) -> Result<(), Duration> {
+        let mut history = self.history.lock().unwrap();
+        let client_history = history.entry(client_key(ip)).or_default();
+        self.limit.check(client_history, Instant::now())
+    }
+
     async fn refresh_cloudflare_ranges_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(CLOUDFLARE_IPS_REFRESH_INTERVAL).await;
@@ -367,6 +375,37 @@ pub async fn validate_source(
     }
 }
 
+fn retry_after_seconds(retry_after: Duration) -> u64 {
+    retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0)
+}
+
+fn rate_limit_exceeded_message(seconds: u64) -> String {
+    format!("Rate limit exceeded, retry in {seconds}s or use an API key")
+}
+
+/// Limits requests made after the connection is accepted, like route requests
+/// sent over a route subscription socket.
+#[derive(Clone)]
+pub enum RequestLimit {
+    Unlimited,
+    PerClient {
+        limiter: Arc<RateLimiter>,
+        ip: IpAddr,
+    },
+}
+
+impl RequestLimit {
+    /// Records a request, or returns why it's over the limit.
+    pub fn check(&self) -> Result<(), String> {
+        match self {
+            Self::Unlimited => Ok(()),
+            Self::PerClient { limiter, ip } => limiter.check(*ip).map_err(|retry_after| {
+                rate_limit_exceeded_message(retry_after_seconds(retry_after))
+            }),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct KeyQuery {
     key: Option<String>,
@@ -377,7 +416,7 @@ pub async fn limit_unauthorized(
     State(limiter): State<Arc<RateLimiter>>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Query(KeyQuery { key }): Query<KeyQuery>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if let Some(key) = key {
@@ -385,22 +424,23 @@ pub async fn limit_unauthorized(
             warn!("Rejected request from {ip}: invalid API key");
             return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
         }
+        request.extensions_mut().insert(RequestLimit::Unlimited);
         return next.run(request).await;
     }
 
-    let result = {
-        let mut history = limiter.history.lock().unwrap();
-        let client_history = history.entry(client_key(ip)).or_default();
-        limiter.limit.check(client_history, Instant::now())
-    };
-    match result {
-        Ok(()) => next.run(request).await,
+    match limiter.check(ip) {
+        Ok(()) => {
+            request
+                .extensions_mut()
+                .insert(RequestLimit::PerClient { limiter, ip });
+            next.run(request).await
+        }
         Err(retry_after) => {
-            let seconds = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+            let seconds = retry_after_seconds(retry_after);
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(RETRY_AFTER, seconds.to_string())],
-                format!("Rate limit exceeded, retry in {seconds}s or use an API key"),
+                rate_limit_exceeded_message(seconds),
             )
                 .into_response()
         }

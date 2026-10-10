@@ -26,8 +26,8 @@ use tracing_subscriber::FmtSubscriber;
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
-        convert_to, estimated_gas_usage, max_gas_cost, storage_deposits_max_at_any_point,
-        optimize_execution_instructions, price_raw, storage_deposits_net, Mainnet,
+        convert_to, estimated_gas_usage, max_gas_cost, optimize_execution_instructions, price_raw,
+        storage_deposits_max_at_any_point, storage_deposits_net, Mainnet,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{Amount, DexId, Quote, Route, Slippage, SwapRequest, TokenId},
