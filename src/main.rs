@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use std::{
@@ -24,9 +25,12 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
-    shared_utils::{convert_to, optimize_execution_instructions, Mainnet},
+    shared_utils::{
+        convert_to, max_gas_cost, optimize_execution_instructions, price_raw, storage_deposits,
+        Mainnet,
+    },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
-    types::{Amount, DexId, Route, Slippage, SwapRequest},
+    types::{Amount, DexId, Quote, Route, Slippage, SwapRequest, TokenId},
 };
 
 mod providers;
@@ -46,13 +50,13 @@ async fn route_handler(
     State(stats): State<Stats>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Query(request): Query<SwapRequest>,
-) -> Result<Json<Vec<Route>>, (StatusCode, String)> {
+) -> Result<Json<Vec<Quote>>, (StatusCode, String)> {
     let started_at = Instant::now();
     let timestamp = Utc::now();
     info!("Received route request: {:?}", request);
 
     validate_request(&request)?;
-    let (routes, route_stats) = find_routes(&request).await;
+    let (quotes, route_stats) = find_routes(&request).await;
     record_stats(
         &stats,
         ip,
@@ -62,7 +66,7 @@ async fn route_handler(
         route_stats,
     );
 
-    Ok(Json(routes))
+    Ok(Json(quotes))
 }
 
 fn record_stats(
@@ -145,8 +149,8 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
-/// Routes of every requested DEX, best first
-async fn find_routes(request: &SwapRequest) -> (Vec<Route>, Vec<RouteStats>) {
+/// Quotes of every requested DEX, best first
+async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::aidols::AidolsProvider,
@@ -207,16 +211,6 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Route>, Vec<RouteStats>) {
         .unzip();
     let mut routes = routes.into_iter().flatten().collect::<Vec<_>>();
 
-    routes.sort_by_key(|route| {
-        match route.estimated_amount {
-            // If 2 or more dexes return amount more than i128::MAX, don't care about these
-            // stupidly large token amounts, usually normal tokens don't go so close to
-            // limits of u128.
-            Amount::AmountIn(amount) => amount.try_into().unwrap_or(i128::MAX),
-            Amount::AmountOut(amount) => -(amount.try_into().unwrap_or(i128::MAX)),
-        }
-    });
-
     for route in routes.iter_mut() {
         if !route.deprecated_needs_unwrap_always_false {
             let amount_out = match (
@@ -258,9 +252,52 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Route>, Vec<RouteStats>) {
             optimize_execution_instructions(route.execution_instructions.clone());
     }
 
-    tracing::info!("Found {} routes: {:?}", routes.len(), routes);
+    let mut quotes = routes
+        .into_iter()
+        .map(|route| Quote {
+            estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
+            storage_deposits: storage_deposits(&route.execution_instructions),
+            route,
+        })
+        .collect::<Vec<_>>();
+    // Costs are in NEAR, the amounts in the token whose amount is quoted
+    let quoted_token = match request.amount {
+        Amount::AmountIn(_) => &request.token_out,
+        Amount::AmountOut(_) => &request.token_in,
+    };
+    let prices_raw = price_raw(&Mainnet, &TokenId::Near).zip(price_raw(&Mainnet, quoted_token));
+    if prices_raw.is_none() {
+        info!(
+            "No price to weigh the costs of routes against their amounts, comparing amounts only"
+        );
+    }
+    quotes.sort_by_cached_key(|quote| std::cmp::Reverse(net_amount(quote, prices_raw.as_ref())));
 
-    (routes, route_stats)
+    tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
+
+    (quotes, route_stats)
+}
+
+/// What a quote gets net of its costs, higher is better: the output minus the costs for exact-in,
+/// minus the input and the costs for exact-out. Costs count only with `prices_raw`, the USD prices
+/// of a yoctoNEAR and of a raw unit of the quoted token.
+fn net_amount(quote: &Quote, prices_raw: Option<&(BigDecimal, BigDecimal)>) -> BigDecimal {
+    let cost = prices_raw.map_or_else(
+        BigDecimal::zero,
+        |(near_price_raw, quoted_token_price_raw)| {
+            BigDecimal::from(
+                quote
+                    .estimated_max_gas_cost
+                    .saturating_add(quote.storage_deposits)
+                    .as_yoctonear(),
+            ) * near_price_raw
+                / quoted_token_price_raw
+        },
+    );
+    match quote.route.estimated_amount {
+        Amount::AmountOut(amount_out) => BigDecimal::from(amount_out) - cost,
+        Amount::AmountIn(amount_in) => -(BigDecimal::from(amount_in) + cost),
+    }
 }
 
 #[tokio::main]

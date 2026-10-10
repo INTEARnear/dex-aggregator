@@ -3,7 +3,7 @@ use std::{fmt::Display, str::FromStr};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use near_min_api::{
-    types::{near_crypto::PublicKey, AccountId, Action, Balance},
+    types::{near_crypto::PublicKey, AccountId, Action, Balance, NearToken},
     utils::dec_format,
 };
 use serde::de::Error;
@@ -217,6 +217,18 @@ pub struct Route {
     /// request a second quote, converting this token_output to your desired token output,
     /// after the received amount is known.
     pub token_output: TokenId,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct Quote {
+    #[serde(flatten)]
+    pub route: Route,
+    /// What the execution instructions cost in gas at most, if all gas attached to them is burnt,
+    /// with the fees of their transactions.
+    pub estimated_max_gas_cost: NearToken,
+    /// NEAR the execution instructions attach to storage deposits, usually only needed for the
+    /// first swap of a token.
+    pub storage_deposits: NearToken,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

@@ -10,7 +10,7 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage, swap_call_gas, Mainnet, NetworkView,
+        get_slippage, price_raw, swap_call_gas, Mainnet, NetworkView,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -78,6 +78,14 @@ async fn route(
             },
             max_hops: MaxHops::Four,
             slippage,
+            near_price_raw: price_raw(network, &TokenId::Near)?,
+            quoted_token_price_raw: price_raw(
+                network,
+                match request.amount {
+                    Amount::AmountIn(_) => &request.token_out,
+                    Amount::AmountOut(_) => &request.token_in,
+                },
+            )?,
         })
         .await?;
 
@@ -284,7 +292,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
             )
             .await,
@@ -366,7 +374,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
             )
             .await,
@@ -437,7 +445,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
             )
             .await,
@@ -519,7 +527,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
             )
             .await,
@@ -544,7 +552,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::none(),
             )
             .await,
@@ -569,7 +577,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
             )
             .await,

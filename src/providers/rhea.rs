@@ -10,7 +10,8 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_nep141, create_storage_deposit_action_for_contract, deposit_storage_if_needed,
-        get_slippage, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
+        get_slippage, price_raw, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID,
+        STORAGE_BYTE_COST,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -134,6 +135,8 @@ async fn route(
             amount_in: exact_amount_in,
             max_hops: MaxHops::Four,
             slippage,
+            near_price_raw: price_raw(network, &TokenId::Near)?,
+            token_out_price_raw: price_raw(network, &request.token_out)?,
         })
         .await?;
 
@@ -385,7 +388,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -438,7 +441,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -466,7 +469,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -515,7 +518,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -543,7 +546,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -600,7 +603,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -628,7 +631,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -685,7 +688,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -714,6 +717,7 @@ mod tests {
                     referrer_id: None,
                 },
                 &TestNetworkView::default()
+                    .with_test_prices()
                     .with_storage(
                         RHEA_CONTRACT_ID,
                         "trader.near",
@@ -766,7 +770,7 @@ mod tests {
                                 "skip_degen_price_sync": true,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(37)),
+                            gas: Gas(NearGas::from_ggas(36_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -794,7 +798,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -836,7 +840,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -864,7 +868,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -914,7 +918,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -942,7 +946,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -991,7 +995,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1019,7 +1023,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -1044,7 +1048,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -1069,7 +1073,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::none(),
             )
             .await,
@@ -1094,8 +1098,33 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::empty_routes(),
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unpriced_token_out_has_no_route() {
+        assert_eq!(
+            route(
+                SwapRequest {
+                    token_in: TokenId::Near,
+                    token_out: TokenId::Nep141("unpriced".parse().unwrap()),
+                    amount: Amount::AmountIn(100),
+                    max_wait_ms: 1_000,
+                    slippage: Slippage::Fixed {
+                        slippage: "0.01".parse().unwrap(),
+                    },
+                    dexes: None,
+                    trader_account_id: None,
+                    signing_public_key: None,
+                    referrer_id: None,
+                },
+                &TestNetworkView::default().with_test_prices(),
+                &TestRheaQuotes::default(),
             )
             .await,
             None
@@ -1119,7 +1148,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -1158,7 +1187,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1186,7 +1215,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: Some("ref.near".parse().unwrap()),
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
             )
             .await,
@@ -1225,7 +1254,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(94)),
+                            gas: Gas(NearGas::from_ggas(93_050)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },

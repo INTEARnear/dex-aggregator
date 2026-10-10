@@ -13,7 +13,7 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage, is_near,
-        swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
+        price_raw, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -297,6 +297,14 @@ async fn route(
             },
             max_hops,
             slippage,
+            near_price_raw: price_raw(network, &TokenId::Near)?,
+            quoted_token_price_raw: price_raw(
+                network,
+                match request.amount {
+                    Amount::AmountIn(_) => &request.token_out,
+                    Amount::AmountOut(_) => &request.token_in,
+                },
+            )?,
         })
         .await?;
 
@@ -717,7 +725,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -782,7 +790,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -812,7 +820,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -881,7 +889,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -911,7 +919,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -984,7 +992,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1014,7 +1022,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1061,7 +1069,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1091,7 +1099,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1159,7 +1167,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(104)),
+                            gas: Gas(NearGas::from_ggas(103_400)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1189,7 +1197,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1265,7 +1273,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(104)),
+                            gas: Gas(NearGas::from_ggas(103_400)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1295,7 +1303,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1366,7 +1374,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(101),
                         }))],
                     },
@@ -1396,7 +1404,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1451,7 +1459,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1481,7 +1489,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1528,7 +1536,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(75)),
+                            gas: Gas(NearGas::from_ggas(74_400)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1556,7 +1564,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1581,7 +1589,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::none(),
             )
             .await,
@@ -1606,7 +1614,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::empty_routes(),
             )
             .await,
@@ -1631,7 +1639,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: None,
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1669,7 +1677,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(75)),
+                        gas: Gas(NearGas::from_ggas(74_400)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],
@@ -1696,7 +1704,7 @@ mod tests {
                     signing_public_key: None,
                     referrer_id: Some("ref.near".parse().unwrap()),
                 },
-                &TestNetworkView::default(),
+                &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
             )
             .await,
@@ -1734,7 +1742,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(75)),
+                        gas: Gas(NearGas::from_ggas(74_400)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],

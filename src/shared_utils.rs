@@ -20,7 +20,7 @@ use near_min_api::{
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     providers::intear_plach::AssetId,
@@ -31,6 +31,19 @@ pub const WRAP_NEAR: &str = "wrap.near";
 pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
 pub const STORAGE_BYTE_COST: NearToken = NearToken::from_yoctonear(10u128.pow(19));
 
+// Fees burnt on top of the gas attached to actions, `send_not_sir` + `execution` of mainnet's
+// runtime config, since a trader's transactions are received by other accounts
+
+/// Fee for the receipt of a transaction
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L43-L47
+const TRANSACTION_FEE_GAS: NearGas = NearGas::from_gas(108_059_500_000 + 108_059_500_000);
+/// Fee for a function call action
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/66.yaml#L3-L14
+const FUNCTION_CALL_FEE_GAS: NearGas = NearGas::from_gas(200_000_000_000 + 780_000_000_000);
+/// Fee for each byte of a function call's method name and arguments
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/69.yaml#L34-L45
+const FUNCTION_CALL_BYTE_FEE_GAS: NearGas = NearGas::from_gas(47_683_715 + 2_235_934);
+
 const MAX_SWAP_GAS: NearGas = NearGas::from_tgas(900);
 const FT_TRANSFER_CALL_GAS: NearGas = NearGas::from_tgas(10);
 const SWAP_GAS_MARGIN_FIXED_PART: NearGas = NearGas::from_tgas(20);
@@ -38,7 +51,7 @@ const SWAP_GAS_MARGIN_PERCENT_PART: u64 = 10;
 
 /// Gas to attach to a call that swaps: the gas the DEX is predicted to burn for the swaps with a
 /// margin, `reserved` for everything else the DEX needs in the call, its callbacks and transfers,
-/// and `FT_TRANSFER_CALL_GAS` if it's `ft_transfer_call`. Rounded up to a TGas.
+/// and `FT_TRANSFER_CALL_GAS` if it's `ft_transfer_call`.
 pub fn swap_call_gas(swap_gas: NearGas, reserved: NearGas, ft_transfer_call: bool) -> Gas {
     let gas = swap_gas.as_gas() * (100 + SWAP_GAS_MARGIN_PERCENT_PART) / 100
         + SWAP_GAS_MARGIN_FIXED_PART.as_gas()
@@ -335,6 +348,32 @@ impl TestNetworkView {
 
     pub(crate) fn with_tokens(mut self, tokens: HashMap<TokenId, TokenInfo>) -> Self {
         self.tokens = Ok(Arc::new(tokens));
+        self
+    }
+
+    /// Prices NEAR, wNEAR and the `ft` and `other` tokens the provider tests swap, which DEXes
+    /// with routes need to weigh gas against amounts
+    pub(crate) fn with_test_prices(self) -> Self {
+        [TokenId::Near, TokenId::Nep141(WRAP_NEAR.parse().unwrap())]
+            .into_iter()
+            .chain(["ft", "other"].map(|token| TokenId::Nep141(token.parse().unwrap())))
+            .fold(self, |network, token_id| {
+                network.with_price(token_id, BigDecimal::from_str("1e-20").unwrap())
+            })
+    }
+
+    pub(crate) fn with_price(mut self, token_id: TokenId, price_usd_raw: BigDecimal) -> Self {
+        Arc::make_mut(self.tokens.as_mut().unwrap()).insert(
+            token_id,
+            TokenInfo {
+                price_usd_raw_24h_ago: price_usd_raw.clone(),
+                price_usd_raw,
+                circulating_supply: 0,
+                liquidity_usd: BigDecimal::zero(),
+                volume_usd_24h: BigDecimal::zero(),
+                created_at: 0,
+            },
+        );
         self
     }
 
@@ -1183,6 +1222,66 @@ pub async fn convert_to(
     };
 
     [register, withdraw, convert, deposit].concat()
+}
+
+/// What the execution instructions cost in gas if all gas attached to them is burnt, with the fees
+/// of their transactions and actions. Most of the attached gas is usually refunded.
+pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    let gas = execution_instructions
+        .iter()
+        .map(|instruction| match instruction {
+            ExecutionInstruction::NearTransaction { actions, .. } => {
+                TRANSACTION_FEE_GAS.as_gas()
+                    + actions
+                        .iter()
+                        .map(|action| match action {
+                            Action::FunctionCall(call) => {
+                                FUNCTION_CALL_FEE_GAS.as_gas()
+                                    + FUNCTION_CALL_BYTE_FEE_GAS.as_gas()
+                                        * (call.method_name.len() + call.args.len()) as u64
+                                    + call.gas.as_gas()
+                            }
+                            _ => 0,
+                        })
+                        .sum::<u64>()
+            }
+        })
+        .sum::<u64>();
+    pathfinder::MIN_GAS_PRICE.saturating_mul(gas as u128)
+}
+
+/// NEAR the execution instructions attach to storage deposits
+pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    execution_instructions
+        .iter()
+        .flat_map(|instruction| match instruction {
+            ExecutionInstruction::NearTransaction { actions, .. } => actions,
+        })
+        .filter_map(|action| match action {
+            Action::FunctionCall(call) if call.method_name == "storage_deposit" => {
+                Some(call.deposit)
+            }
+            _ => None,
+        })
+        .fold(NearToken::from_yoctonear(0), NearToken::saturating_add)
+}
+
+/// Current USD price of a raw unit of `token_id` (a yoctoNEAR for NEAR), `None` if it has no price
+pub fn price_raw(network: &impl NetworkView, token_id: &TokenId) -> Option<BigDecimal> {
+    let token_id = match base_token(token_id)? {
+        BaseTokenId::Near => TokenId::Near,
+        BaseTokenId::Nep141(account_id) => TokenId::Nep141(account_id),
+    };
+    network
+        .token_infos()
+        .ok()?
+        .get(&token_id)
+        .map(|info| info.price_usd_raw.clone())
+        .filter(|price| !price.is_zero())
+        .or_else(|| {
+            info!("No price of {token_id}");
+            None
+        })
 }
 
 #[cfg(test)]

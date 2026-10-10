@@ -314,6 +314,8 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     )?)
 }
 
+const HOP_GAS: NearGas = NearGas::from_ggas(273 + 2_855);
+
 /// Gas the contract burns for the swaps of a route in the receipt that swaps, from the steps the
 /// swaps take. Fitted to fuzzing of random quotes on mainnet state.
 fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> NearGas {
@@ -408,6 +410,8 @@ pub struct Request {
     pub max_hops: MaxHops,
     /// 0.005 is 0.5%
     pub slippage: BigDecimal,
+    pub near_price_raw: BigDecimal,
+    pub quoted_token_price_raw: BigDecimal,
 }
 
 /// Finds a route on the newest pools
@@ -437,6 +441,11 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         request.amount,
         request.max_hops,
         SETTINGS,
+        crate::gas_cost(
+            HOP_GAS,
+            &request.near_price_raw,
+            &request.quoted_token_price_raw,
+        )?,
     )?;
     let data = to_api_response(
         &split_route.parts[0].route,

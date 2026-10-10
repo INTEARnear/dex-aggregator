@@ -489,13 +489,12 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
+const HOP_GAS: NearGas = NearGas::from_ggas(2_500);
+
 fn swap_gas(split_route: &SplitRoute) -> NearGas {
-    let pools = split_route
-        .parts
-        .iter()
-        .map(|part| part.route.hops.len() as u64)
-        .sum::<u64>();
-    NearGas::from_ggas(3_000 + 2_500 * pools)
+    NearGas::from_gas(
+        NearGas::from_ggas(3_000).as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64,
+    )
 }
 
 fn exact_in_response(
@@ -562,6 +561,8 @@ pub struct Request {
     pub max_hops: MaxHops,
     /// 0.005 is 0.5%
     pub slippage: BigDecimal,
+    pub near_price_raw: BigDecimal,
+    pub token_out_price_raw: BigDecimal,
 }
 
 /// Finds a route on the newest pools
@@ -591,6 +592,11 @@ pub fn find_path_in(
         amount,
         request.max_hops,
         SETTINGS,
+        crate::gas_cost(
+            HOP_GAS,
+            &request.near_price_raw,
+            &request.token_out_price_raw,
+        )?,
     )?;
     let response = exact_in_response(
         &split_route,

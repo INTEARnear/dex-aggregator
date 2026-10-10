@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
 use lazy_static::lazy_static;
 use near_min_api::RpcClient;
-use near_min_api::types::BlockHeight;
+use near_min_api::types::{Balance, BlockHeight, NearGas, NearToken};
 use pool_indexer::PoolIndexer;
 use tokio::sync::watch;
 
@@ -18,6 +18,8 @@ pub mod rhea;
 mod search;
 
 pub use search::{MaxHops, QuoteAmount};
+
+pub const MIN_GAS_PRICE: NearToken = NearToken::from_yoctonear(100_000_000);
 
 /// Indexes the pools of every DEX and keeps their snapshots up to date, returns why it stopped
 pub async fn run(rpc: Arc<RpcClient>) -> anyhow::Error {
@@ -75,4 +77,22 @@ fn slippage_bp(slippage: &BigDecimal) -> Result<u128, anyhow::Error> {
         .with_scale_round(0, RoundingMode::Down)
         .to_u128()
         .unwrap())
+}
+
+/// What `gas` costs in raw units of a token
+fn gas_cost(
+    gas: NearGas,
+    near_price_raw: &BigDecimal,
+    token_price_raw: &BigDecimal,
+) -> Result<Balance, anyhow::Error> {
+    if *near_price_raw <= 0 || *token_price_raw <= 0 {
+        anyhow::bail!("Prices must be positive, NEAR {near_price_raw}, token {token_price_raw}");
+    }
+    let cost = MIN_GAS_PRICE
+        .saturating_mul(gas.as_gas().into())
+        .as_yoctonear();
+    Ok((BigDecimal::from(cost) * near_price_raw / token_price_raw)
+        .with_scale_round(0, RoundingMode::Up)
+        .to_u128()
+        .unwrap_or(Balance::MAX))
 }

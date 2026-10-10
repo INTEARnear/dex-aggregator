@@ -584,13 +584,10 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
+const HOP_GAS: NearGas = NearGas::from_tgas(26);
+
 fn swap_gas(split_route: &SplitRoute) -> NearGas {
-    let pools = split_route
-        .parts
-        .iter()
-        .map(|part| part.route.hops.len() as u64)
-        .sum::<u64>();
-    NearGas::from_tgas(8 + 26 * pools)
+    NearGas::from_gas(NearGas::from_tgas(8).as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64)
 }
 
 fn to_api_response(
@@ -728,6 +725,8 @@ pub struct Request {
     pub max_hops: MaxHops,
     /// 0.005 is 0.5%
     pub slippage: BigDecimal,
+    pub near_price_raw: BigDecimal,
+    pub quoted_token_price_raw: BigDecimal,
 }
 
 pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
@@ -754,6 +753,11 @@ pub fn find_path_in(
         request.amount,
         request.max_hops,
         SETTINGS,
+        crate::gas_cost(
+            HOP_GAS,
+            &request.near_price_raw,
+            &request.quoted_token_price_raw,
+        )?,
     )?;
     let response = to_api_response(
         &split_route,

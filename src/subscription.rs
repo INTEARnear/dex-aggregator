@@ -35,24 +35,24 @@ pub async fn subscribe_handler(
 
 async fn subscribe(mut socket: WebSocket, request: SwapRequest, stats: Stats, ip: IpAddr) {
     let mut pools_updated = pathfinder::pools_updated();
-    let mut sent_routes = None;
+    let mut sent_quotes = None;
     loop {
         // Routes found below use pools at least this new, so only newer ones reroute
         pools_updated.borrow_and_update();
         let started_at = Instant::now();
         let timestamp = Utc::now();
-        let (routes, route_stats) = find_routes(&request).await;
+        let (quotes, route_stats) = find_routes(&request).await;
         let duration = started_at.elapsed();
 
-        if sent_routes.is_none() {
+        if sent_quotes.is_none() {
             record_stats(&stats, ip, timestamp, &request, duration, route_stats);
         }
-        if sent_routes.as_ref() != Some(&routes) {
-            let message = serde_json::to_string(&routes).expect("Routes are serializable");
+        if sent_quotes.as_ref() != Some(&quotes) {
+            let message = serde_json::to_string(&quotes).expect("Quotes are serializable");
             if socket.send(Message::text(message)).await.is_err() {
                 return;
             }
-            sent_routes = Some(routes);
+            sent_quotes = Some(quotes);
         }
 
         let cooldown = (duration * REROUTE_COOLDOWN_FACTOR).min(MAX_REROUTE_COOLDOWN);

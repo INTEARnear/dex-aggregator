@@ -59,6 +59,16 @@ impl QuoteAmount {
             Self::ExactOut(_) => metric.map(|metric| -metric).unwrap_or(i128::MIN),
         }
     }
+
+    /// Like `key`, net of `hops` that cost `hop_cost` each in the metric's token
+    fn net_key(self, metric: Option<Balance>, hops: usize, hop_cost: Balance) -> i128 {
+        if metric.is_none() {
+            return i128::MIN;
+        }
+        let cost = hop_cost.saturating_mul(hops as Balance);
+        self.key(metric)
+            .saturating_sub(i128::try_from(cost).unwrap_or(i128::MAX))
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -478,6 +488,11 @@ impl SplitRoute {
         parts.sort_by_key(|part| std::cmp::Reverse(part.weight));
         Self { parts }
     }
+
+    /// Sum of hops of all parts
+    pub fn hops(&self) -> usize {
+        self.parts.iter().map(|part| part.route.hops.len()).sum()
+    }
 }
 
 /// The amount of each part of a split route that adds up to the parts' total weight of `amount`
@@ -649,6 +664,7 @@ pub fn route<P: Pool>(
     amount: QuoteAmount,
     max_hops: MaxHops,
     settings: Settings,
+    hop_cost: Balance,
 ) -> Result<SplitRoute, anyhow::Error> {
     let started = Instant::now();
     let mut search = Search {
@@ -656,7 +672,20 @@ pub fn route<P: Pool>(
         settings,
         best_routes: FxHashMap::default(),
     };
-    let candidates = search.candidates(amount, token_in, token_out, max_hops);
+    let mut candidates = search.candidates(amount, token_in, token_out, max_hops);
+    for kind in [
+        &mut candidates.paired,
+        &mut candidates.shorter,
+        &mut candidates.unpaired,
+    ] {
+        kind.sort_by_key(|candidate| {
+            std::cmp::Reverse(amount.net_key(
+                candidate.metric,
+                candidate.route.hops.len(),
+                hop_cost,
+            ))
+        });
+    }
     let mut set = RouteSet::new(graph, amount);
     let mut best_routes = |count| {
         Search::<P>::best(&candidates, count, amount)
@@ -676,34 +705,39 @@ pub fn route<P: Pool>(
     }
 
     let mut best: Option<(SplitRoute, Balance)> = None;
-    // Splitting can only be worse than a single route because of its 1% steps
-    for &route in &routes {
-        let Some(metric) = set.metric(route, 100) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(_, best_metric)| amount.is_better(metric, *best_metric))
-        {
-            best = Some((set.split(&[(route, 100)]), metric));
+    fn consider(
+        split: SplitRoute,
+        metric: Balance,
+        amount: QuoteAmount,
+        hop_cost: Balance,
+        best: &mut Option<(SplitRoute, Balance)>,
+    ) {
+        let net_key =
+            |split: &SplitRoute, metric| amount.net_key(Some(metric), split.hops(), hop_cost);
+        if best.as_ref().is_none_or(|(best_split, best_metric)| {
+            net_key(&split, metric) > net_key(best_split, *best_metric)
+        }) {
+            *best = Some((split, metric));
         }
     }
-    if settings.max_splits > 1
-        && let Some((split, metric)) = best_pair_split(&mut set, &routes)
-        && best
-            .as_ref()
-            .is_none_or(|(_, best_metric)| amount.is_better(metric, *best_metric))
-    {
-        best = Some((split, metric));
+    // Splitting can only get less than a single route because of its 1% steps, and costs more hops
+    for &route in &routes {
+        if let Some(metric) = set.metric(route, 100) {
+            consider(
+                set.split(&[(route, 100)]),
+                metric,
+                amount,
+                hop_cost,
+                &mut best,
+            );
+        }
     }
     if settings.max_splits > 1 {
+        if let Some((split, metric)) = best_pair_split(&mut set, &routes) {
+            consider(split, metric, amount, hop_cost, &mut best);
+        }
         for (split, metric) in fill_splits(&mut set, &fill_routes, settings) {
-            if best
-                .as_ref()
-                .is_none_or(|(_, best_metric)| amount.is_better(metric, *best_metric))
-            {
-                best = Some((split, metric));
-            }
+            consider(split, metric, amount, hop_cost, &mut best);
         }
     }
     let Some((best, metric)) = best else {
