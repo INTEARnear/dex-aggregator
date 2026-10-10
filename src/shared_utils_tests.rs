@@ -1732,7 +1732,64 @@ fn storage_deposits_subtract_withdrawals() {
         },
     ];
     assert_eq!(
-        storage_deposits(&execution_instructions),
+        storage_deposits_net(&execution_instructions),
         NearToken::from_micronear(101_250)
+    );
+}
+
+#[test]
+fn max_storage_deposits_keep_withdrawals() {
+    let execution_instructions = vec![ExecutionInstruction::NearTransaction {
+        receiver_id: account("dclv2.ref-labs.near"),
+        actions: vec![
+            create_storage_deposit_action_for_contract(NearToken::from_millinear(500), true),
+            create_storage_withdraw_action(NearToken::from_millinear(400)),
+        ],
+    }];
+    assert_eq!(
+        storage_deposits_max_at_any_point(&execution_instructions),
+        NearToken::from_millinear(500)
+    );
+    assert_eq!(
+        storage_deposits_net(&execution_instructions),
+        NearToken::from_millinear(100)
+    );
+}
+
+#[test]
+fn estimated_gas_usage_excludes_swap_margin() {
+    let call = |gas: NearGas| {
+        Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "swap".to_string(),
+            args: vec![],
+            gas: Gas(gas),
+            deposit: NearToken::from_yoctonear(1),
+        }))
+    };
+    let transaction = |gas: NearGas| {
+        vec![ExecutionInstruction::NearTransaction {
+            receiver_id: account("v2.ref-finance.near"),
+            actions: vec![call(gas)],
+        }]
+    };
+    let fees = TRANSACTION_FEE_GAS.as_gas()
+        + FUNCTION_CALL_FEE_GAS.as_gas()
+        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * "swap".len() as u64;
+    let cost = |gas: u64| pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into());
+
+    // 5.5 TGas predicted for a swap, attached as swap_call_gas does with 10 TGas reserved
+    let attached = swap_call_gas(NearGas::from_ggas(5_500), NearGas::from_tgas(10), false).0;
+    assert_eq!(
+        estimated_gas_usage(&transaction(attached)),
+        cost(fees + (attached.as_gas() - NearGas::from_tgas(20).as_gas()) * 100 / 110)
+    );
+    assert_eq!(
+        max_gas_cost(&transaction(attached)),
+        cost(fees + attached.as_gas())
+    );
+    // Less gas than the margin burns only fees
+    assert_eq!(
+        estimated_gas_usage(&transaction(NearGas::from_tgas(10))),
+        cost(fees)
     );
 }

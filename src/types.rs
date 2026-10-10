@@ -226,9 +226,14 @@ pub struct Quote {
     /// What the execution instructions cost in gas at most, if all gas attached to them is burnt,
     /// with the fees of their transactions.
     pub estimated_max_gas_cost: NearToken,
+    /// What the execution instructions are expected to cost in gas, the gas fee to show
+    pub estimated_gas_usage: NearToken,
     /// NEAR the execution instructions attach to storage deposits, usually only needed for the
     /// first swap of a token.
     pub storage_deposits: NearToken,
+    /// NEAR the execution instructions attach to storage deposits, without what they withdraw right
+    /// after. The trader's wallet needs to have it, Rhea DCL takes 0.5 NEAR and gives 0.4 NEAR back.
+    pub max_storage_deposits: NearToken,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

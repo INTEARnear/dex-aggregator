@@ -1236,10 +1236,13 @@ pub async fn convert_to(
     [register, withdraw, convert, deposit].concat()
 }
 
-/// What the execution instructions cost in gas if all gas attached to them is burnt, with the fees
-/// of their transactions and actions. Most of the attached gas is usually refunded.
-pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToken {
-    let gas = execution_instructions
+/// Gas of the execution instructions: the fees of their transactions and function calls, and
+/// `execution_gas` of each function call
+fn total_gas(
+    execution_instructions: &[ExecutionInstruction],
+    execution_gas: impl Fn(&FunctionCallAction) -> u64,
+) -> u64 {
+    execution_instructions
         .iter()
         .map(|instruction| match instruction {
             ExecutionInstruction::NearTransaction { actions, .. } => {
@@ -1251,20 +1254,40 @@ pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToke
                                 FUNCTION_CALL_FEE_GAS.as_gas()
                                     + FUNCTION_CALL_BYTE_FEE_GAS.as_gas()
                                         * (call.method_name.len() + call.args.len()) as u64
-                                    + call.gas.as_gas()
+                                    + execution_gas(call)
                             }
                             _ => 0,
                         })
                         .sum::<u64>()
             }
         })
-        .sum::<u64>();
-    pathfinder::MIN_GAS_PRICE.saturating_mul(gas as u128)
+        .sum()
 }
 
-/// NEAR the execution instructions attach to storage deposits, less what they withdraw from storage
+/// What the execution instructions cost in gas if all gas attached to them is burnt, with the fees
+/// of transactions and actions
+pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    let gas = total_gas(execution_instructions, |call| call.gas.as_gas());
+    pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
+}
+
+/// What the execution instructions are expected to cost in gas, with unused margin refunded
+pub fn estimated_gas_usage(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    let gas = total_gas(execution_instructions, |call| {
+        call.gas
+            .as_gas()
+            .saturating_sub(SWAP_GAS_MARGIN_FIXED_PART.as_gas())
+            * 100
+            / (100 + SWAP_GAS_MARGIN_PERCENT_PART)
+    });
+    pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
+}
+
+/// NEAR the execution instructions attach to storage deposits, and what they withdraw from storage
 /// deposits
-pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+fn storage_deposits_and_withdrawals(
+    execution_instructions: &[ExecutionInstruction],
+) -> (NearToken, NearToken) {
     let calls = execution_instructions
         .iter()
         .flat_map(|instruction| match instruction {
@@ -1289,7 +1312,18 @@ pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> Near
             _ => {}
         }
     }
+    (deposited, withdrawn)
+}
+
+pub fn storage_deposits_net(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    let (deposited, withdrawn) = storage_deposits_and_withdrawals(execution_instructions);
     deposited.saturating_sub(withdrawn)
+}
+
+/// NEAR the execution instructions attach to storage deposits, also what they withdraw right after.
+/// The trader's wallet needs to have it even though it's refunded right after.
+pub fn storage_deposits_max_at_any_point(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    storage_deposits_and_withdrawals(execution_instructions).0
 }
 
 /// Current USD price of a raw unit of `token_id` (a yoctoNEAR for NEAR), `None` if it has no price
