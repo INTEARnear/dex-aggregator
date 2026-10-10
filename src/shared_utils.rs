@@ -605,6 +605,18 @@ pub async fn create_nep141_storage_deposit_action(
     }
 }
 
+pub fn create_storage_withdraw_action(amount: NearToken) -> Action {
+    Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "storage_withdraw".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({
+            "amount": amount,
+        }))
+        .unwrap(),
+        gas: Gas(NearGas::from_tgas(10)),
+        deposit: NearToken::from_yoctonear(1),
+    }))
+}
+
 pub fn create_storage_deposit_action_for_contract(
     amount: NearToken,
     registration_only: bool,
@@ -1250,20 +1262,34 @@ pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToke
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas as u128)
 }
 
-/// NEAR the execution instructions attach to storage deposits
+/// NEAR the execution instructions attach to storage deposits, less what they withdraw from storage
+/// deposits
 pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> NearToken {
-    execution_instructions
+    let calls = execution_instructions
         .iter()
         .flat_map(|instruction| match instruction {
             ExecutionInstruction::NearTransaction { actions, .. } => actions,
         })
         .filter_map(|action| match action {
-            Action::FunctionCall(call) if call.method_name == "storage_deposit" => {
-                Some(call.deposit)
-            }
+            Action::FunctionCall(call) => Some(call),
             _ => None,
-        })
-        .fold(NearToken::from_yoctonear(0), NearToken::saturating_add)
+        });
+    let (mut deposited, mut withdrawn) =
+        (NearToken::from_yoctonear(0), NearToken::from_yoctonear(0));
+    for call in calls {
+        match call.method_name.as_str() {
+            "storage_deposit" => deposited = deposited.saturating_add(call.deposit),
+            "storage_withdraw" => {
+                let args: serde_json::Value = serde_json::from_slice(&call.args)
+                    .expect("storage_withdraw arguments are created as JSON");
+                let amount = serde_json::from_value::<NearToken>(args["amount"].clone())
+                    .expect("storage_withdraw is created with an amount");
+                withdrawn = withdrawn.saturating_add(amount);
+            }
+            _ => {}
+        }
+    }
+    deposited.saturating_sub(withdrawn)
 }
 
 /// Current USD price of a raw unit of `token_id` (a yoctoNEAR for NEAR), `None` if it has no price

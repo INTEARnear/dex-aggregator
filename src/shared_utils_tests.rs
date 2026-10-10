@@ -1712,3 +1712,27 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.05).unwrap())
     );
 }
+
+#[test]
+fn storage_deposits_subtract_withdrawals() {
+    let execution_instructions = vec![
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("dclv2.ref-labs.near"),
+            actions: vec![
+                create_storage_deposit_action_for_contract(NearToken::from_millinear(500), true),
+                create_storage_withdraw_action(NearToken::from_millinear(400)),
+            ],
+        },
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("ft"),
+            actions: vec![create_storage_deposit_action_for_contract(
+                NearToken::from_micronear(1_250),
+                true,
+            )],
+        },
+    ];
+    assert_eq!(
+        storage_deposits(&execution_instructions),
+        NearToken::from_micronear(101_250)
+    );
+}
