@@ -8,6 +8,7 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
+use intear_dex_types::DirectWithdrawAmount;
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
@@ -115,9 +116,7 @@ pub fn create_intear_dex_withdraw_action(asset_id: &AssetId, amount: Balance) ->
         method_name: "withdraw".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
             "asset_id": asset_id,
-            "amount": {
-                "Exact": amount.to_string(),
-            },
+            "amount": DirectWithdrawAmount::Exact(near_sdk::json_types::U128(amount)),
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(50)),

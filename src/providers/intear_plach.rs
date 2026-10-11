@@ -1,14 +1,14 @@
-use std::{collections::HashMap, future::Future, pin::Pin, str::FromStr};
+use std::{future::Future, pin::Pin};
 
-use base64::{prelude::BASE64_STANDARD, Engine};
-use borsh::BorshSerialize;
-use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken, U128};
+use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, WithdrawAmount};
+use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken};
+use near_sdk::json_types::{Base64VecU8, U128};
 use pathfinder::{
     plach::{self, SplitRouteApiResponse},
     MaxHops, QuoteAmount,
 };
-use serde::{ser::SerializeMap, Serialize, Serializer};
 use tracing::info;
+use xyk_dex_types::{SwapArgs, SwapRoute};
 
 use crate::{
     shared_utils::{
@@ -27,112 +27,7 @@ const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(36);
 const DEPOSIT_NEAR_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 const EXECUTE_OPERATIONS_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 
-pub use pathfinder::plach::AssetId;
-
-#[derive(BorshSerialize, Serialize, Clone, Debug)]
-enum SwapRequestAmount {
-    ExactIn(U128),
-    ExactOut(U128),
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[allow(dead_code)]
-enum Operation {
-    RegisterAssets {
-        asset_ids: Vec<AssetId>,
-        r#for: Option<AccountOrDexId>,
-    },
-    Withdraw {
-        asset_id: AssetId,
-        amount: WithdrawAmount,
-        to: Option<AccountId>,
-        rescue_address: Option<AccountId>,
-    },
-    SwapSimple {
-        dex_id: String,
-        message: String,
-        asset_in: AssetId,
-        asset_out: AssetId,
-        amount: SwapOperationAmount,
-        constraint: Option<U128>,
-    },
-    DexCall {
-        dex_id: String,
-        method: String,
-        args: String,
-        attached_assets: HashMap<AssetId, U128>,
-    },
-    TransferAsset {
-        to: AccountOrDexId,
-        asset_id: AssetId,
-        amount: U128,
-    },
-    StorageDeposit {
-        amount: U128,
-        r#for: Option<AccountOrDexId>,
-    },
-}
-#[derive(Clone, Debug)]
-enum AccountOrDexId {
-    Account(AccountId),
-    Dex(String),
-}
-
-impl FromStr for AccountOrDexId {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(account) = s.strip_prefix("account:") {
-            Ok(Self::Account(
-                account
-                    .parse()
-                    .map_err(|e| format!("Invalid account id: {e}"))?,
-            ))
-        } else if let Some(dex) = s.strip_prefix("dex:") {
-            Ok(Self::Dex(dex.to_string()))
-        } else {
-            Err(
-                "Invalid format. Use 'account:<account_id>' or 'dex:<deployer>/<dex_name>'"
-                    .to_string(),
-            )
-        }
-    }
-}
-
-impl Serialize for AccountOrDexId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Account(account_id) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("Account", account_id)?;
-                map.end()
-            }
-            Self::Dex(dex_id) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("Dex", dex_id)?;
-                map.end()
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[allow(dead_code)]
-enum SwapOperationAmount {
-    Amount(SwapRequestAmount),
-    OutputOfLastIn,
-    EntireBalanceIn,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[allow(dead_code)]
-enum WithdrawAmount {
-    Full { at_least: Option<U128> },
-    Exact(U128),
-    PreviousSwapOutput,
-}
+pub use intear_dex_types::AssetId;
 
 trait PlachQuotes: Send + Sync {
     fn find_path(
@@ -282,11 +177,6 @@ async fn route(
         return None;
     }
 
-    let max_hops = match request.amount {
-        Amount::AmountIn(_) => MaxHops::Four,
-        // Intear dex doesn't support multi-step routing with AmountOut yet
-        Amount::AmountOut(_) => MaxHops::DirectOnly,
-    };
     let response = quotes
         .find_path(plach::Request {
             token_in: token_in.clone(),
@@ -295,7 +185,7 @@ async fn route(
                 Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
                 Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
             },
-            max_hops,
+            max_hops: MaxHops::Four,
             slippage,
             near_price_raw: price_raw(network, &TokenId::Near)?,
             quoted_token_price_raw: price_raw(
@@ -312,77 +202,70 @@ async fn route(
         SplitRouteApiResponse::ExactIn { swap_gas, .. }
         | SplitRouteApiResponse::ExactOut { swap_gas, .. } => swap_gas,
     };
-    let (swaps, total_min_amount_out, total_max_amount_in, estimated_amount, worst_case_amount) =
-        match response {
-            SplitRouteApiResponse::ExactIn {
-                routes, amount_out, ..
-            } => {
-                if routes.is_empty() {
-                    return None;
-                }
-                let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
-                let steps = routes
-                    .into_iter()
-                    .flat_map(|route| route.pools)
-                    .collect::<Vec<_>>();
-                let swaps = steps
-                    .iter()
-                    .map(|step| Operation::SwapSimple {
-                        dex_id: PLACH_DEX_ID.to_string(),
-                        message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
-                        asset_in: step.token_in.clone(),
-                        asset_out: step.token_out.clone(),
-                        amount: if step.amount_in.0 > 0 {
-                            SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(step.amount_in))
-                        } else {
-                            SwapOperationAmount::OutputOfLastIn
-                        },
-                        constraint: (step.min_amount_out.0 > 0).then_some(step.min_amount_out),
-                    })
-                    .collect::<Vec<_>>();
-                (
-                    swaps,
-                    total_min_amount_out,
-                    0,
-                    Amount::AmountOut(amount_out.0),
-                    Amount::AmountOut(total_min_amount_out),
-                )
-            }
-            SplitRouteApiResponse::ExactOut {
-                routes,
-                amount_in,
-                max_amount_in,
-                ..
-            } => {
-                if routes.is_empty() {
-                    return None;
-                }
-                let steps = routes
-                    .into_iter()
-                    .flat_map(|route| route.pools)
-                    .collect::<Vec<_>>();
-                let swaps = steps
-                    .iter()
-                    .map(|step| Operation::SwapSimple {
-                        dex_id: PLACH_DEX_ID.to_string(),
-                        message: BASE64_STANDARD.encode(borsh::to_vec(&step.pool_id).unwrap()),
-                        asset_in: step.token_in.clone(),
-                        asset_out: step.token_out.clone(),
-                        amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(
-                            step.amount_out,
-                        )),
-                        constraint: (step.max_amount_in.0 > 0).then_some(step.max_amount_in),
-                    })
-                    .collect::<Vec<_>>();
-                (
-                    swaps,
-                    0,
-                    max_amount_in.0,
-                    Amount::AmountIn(amount_in.0),
-                    Amount::AmountIn(max_amount_in.0),
-                )
-            }
-        };
+    let (swap_routes, swap_amount, constraint, estimated_amount, worst_case_amount) = match response
+    {
+        SplitRouteApiResponse::ExactIn {
+            routes,
+            amount_in,
+            amount_out,
+            ..
+        } => {
+            let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
+            let swap_routes = routes
+                .into_iter()
+                .map(|route| SwapRoute {
+                    fraction: route.split_fraction,
+                    pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
+                })
+                .collect::<Vec<_>>();
+            (
+                swap_routes,
+                SwapRequestAmount::ExactIn(U128(amount_in.0)),
+                total_min_amount_out,
+                Amount::AmountOut(amount_out.0),
+                Amount::AmountOut(total_min_amount_out),
+            )
+        }
+        SplitRouteApiResponse::ExactOut {
+            routes,
+            amount_in,
+            max_amount_in,
+            amount_out,
+            ..
+        } => {
+            let swap_routes = routes
+                .into_iter()
+                .map(|route| SwapRoute {
+                    fraction: route.split_fraction,
+                    pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
+                })
+                .collect::<Vec<_>>();
+            (
+                swap_routes,
+                SwapRequestAmount::ExactOut(U128(amount_out.0)),
+                max_amount_in.0,
+                Amount::AmountIn(amount_in.0),
+                Amount::AmountIn(max_amount_in.0),
+            )
+        }
+    };
+    if swap_routes.is_empty() {
+        return None;
+    }
+    let swaps = vec![Operation::SwapSimple {
+        dex_id: PLACH_DEX_ID.parse().unwrap(),
+        message: Base64VecU8(
+            borsh::to_vec(&SwapArgs {
+                routes: swap_routes,
+                fee_discount: None,
+            })
+            .unwrap(),
+        ),
+        asset_in: token_in.clone(),
+        asset_out: token_out.clone(),
+        amount: SwapOperationAmount::Amount(swap_amount),
+        constraint: Some(U128(constraint)),
+    }];
 
     let use_fast_path = matches!(request.token_in, TokenId::TokenOnIntearDex(_));
 
@@ -414,7 +297,7 @@ async fn route(
             asset_id: token_out.clone(),
             amount: WithdrawAmount::Full {
                 at_least: Some(match request.amount {
-                    Amount::AmountIn(_) => U128::from(total_min_amount_out),
+                    Amount::AmountIn(_) => U128::from(constraint),
                     Amount::AmountOut(amount_out) => U128::from(amount_out),
                 }),
             },
@@ -432,30 +315,16 @@ async fn route(
         true
     };
 
-    let route_assets = if use_fast_path {
-        operations
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::SwapSimple {
-                    asset_in,
-                    asset_out,
-                    ..
-                } => Some([asset_in, asset_out]),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    } else {
-        vec![&token_in, &token_out]
-    };
     let registration_transactions = match request.trader_account_id.as_ref() {
-        Some(trader_account_id) => registration(network, trader_account_id, &route_assets).await?,
+        Some(trader_account_id) => {
+            registration(network, trader_account_id, &[&token_in, &token_out]).await?
+        }
         None => vec![],
     };
 
     let input_amount = match request.amount {
         Amount::AmountIn(amount_in) => amount_in,
-        Amount::AmountOut(_) => total_max_amount_in,
+        Amount::AmountOut(_) => constraint,
     };
 
     let transactions = if use_fast_path {
@@ -605,7 +474,7 @@ mod tests {
         ((77 + 11) + (69 + 3 * 11) + (142 + 11 + 1) + (142 + 11 + 7)) * 10u128.pow(19),
     );
 
-    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken, U128};
+    use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken};
 
     use super::*;
     use crate::shared_utils::{
@@ -656,54 +525,116 @@ mod tests {
                     routes: vec![],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: U128(100),
-                    amount_out: U128(80),
+                    amount_in: near_min_api::types::U128(100),
+                    amount_out: near_min_api::types::U128(80),
                     swap_gas: NearGas::from_tgas(34),
                 });
             }
             match request.amount {
                 QuoteAmount::ExactIn(_) => Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![plach::ExactInRoute {
+                        split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
                         pools: vec![plach::ExactInPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
                             token_out: token_out.clone(),
-                            amount_in: U128(100),
-                            min_amount_out: U128(79),
+                            amount_in: near_min_api::types::U128(100),
+                            min_amount_out: near_min_api::types::U128(79),
                         }],
-                        amount_in: U128(100),
-                        min_amount_out: U128(79),
-                        amount_out: U128(80),
+                        amount_in: near_min_api::types::U128(100),
+                        min_amount_out: near_min_api::types::U128(79),
+                        amount_out: near_min_api::types::U128(80),
                     }],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: U128(100),
-                    amount_out: U128(80),
+                    amount_in: near_min_api::types::U128(100),
+                    amount_out: near_min_api::types::U128(80),
                     swap_gas: NearGas::from_tgas(34),
                 }),
                 QuoteAmount::ExactOut(_) => Some(SplitRouteApiResponse::ExactOut {
                     routes: vec![plach::ExactOutRoute {
+                        split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
                         pools: vec![plach::ExactOutPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
                             token_out: token_out.clone(),
-                            amount_in: U128(100),
-                            amount_out: U128(80),
-                            max_amount_in: U128(101),
+                            amount_in: near_min_api::types::U128(100),
+                            amount_out: near_min_api::types::U128(80),
+                            max_amount_in: near_min_api::types::U128(101),
                         }],
-                        amount_in: U128(100),
-                        max_amount_in: U128(101),
-                        amount_out: U128(80),
+                        amount_in: near_min_api::types::U128(100),
+                        max_amount_in: near_min_api::types::U128(101),
+                        amount_out: near_min_api::types::U128(80),
                     }],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: U128(100),
-                    max_amount_in: U128(101),
-                    amount_out: U128(80),
+                    amount_in: near_min_api::types::U128(100),
+                    max_amount_in: near_min_api::types::U128(101),
+                    amount_out: near_min_api::types::U128(80),
                     swap_gas: NearGas::from_tgas(34),
                 }),
             }
         }
+    }
+
+    /// Operations are typed with the engine's own types, so this pins the JSON the engine reads
+    #[tokio::test]
+    async fn operations_json_matches_engine_format() {
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountIn(100),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: None,
+                signing_public_key: None,
+                referrer_id: None,
+            },
+            &TestNetworkView::default().with_test_prices(),
+            &TestPlachQuotes::default(),
+        )
+        .await
+        .unwrap();
+        let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
+            route.execution_instructions.last()
+        else {
+            panic!("No swap transaction");
+        };
+        let [Action::FunctionCall(deposit_near)] = actions.as_slice() else {
+            panic!("Swap transaction isn't a single function call");
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&deposit_near.args).unwrap(),
+            serde_json::json!({
+                "operations": {
+                    "operations": [
+                        {
+                            "SwapSimple": {
+                                "dex_id": "slimedragon.near/xyk",
+                                "message": "AQAAAA==",
+                                "asset_in": "near",
+                                "asset_out": "nep141:ft",
+                                "amount": { "Amount": { "ExactIn": "100" } },
+                                "constraint": "79",
+                            },
+                        },
+                        {
+                            "Withdraw": {
+                                "asset_id": "nep141:ft",
+                                "amount": { "Full": { "at_least": "79" } },
+                                "to": null,
+                                "rescue_address": null,
+                            },
+                        },
+                    ],
+                    "referrer": DEFAULT_REFERRER_ID,
+                },
+            })
+        );
     }
 
     #[tokio::test]
@@ -770,8 +701,8 @@ mod tests {
                                 "operations": {
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -869,8 +800,8 @@ mod tests {
                                 "operations": {
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -972,8 +903,8 @@ mod tests {
                                 "operations": {
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -1059,8 +990,8 @@ mod tests {
                             method_name: "execute_operations".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "operations": vec![Operation::SwapSimple {
-                                    dex_id: PLACH_DEX_ID.to_string(),
-                                    message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                    dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                    message: Base64VecU8(vec![1, 0, 0, 0]),
                                     asset_in: token_in.clone(),
                                     asset_out: token_out.clone(),
                                     amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -1146,8 +1077,8 @@ mod tests {
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -1252,8 +1183,8 @@ mod tests {
                                 "msg": serde_json::to_string(&serde_json::json!({
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -1348,8 +1279,8 @@ mod tests {
                                 "operations": {
                                     "operations": vec![
                                         Operation::SwapSimple {
-                                            dex_id: PLACH_DEX_ID.to_string(),
-                                            message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                            message: Base64VecU8(vec![1, 0, 0, 0]),
                                             asset_in: token_in.clone(),
                                             asset_out: token_out.clone(),
                                             amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(U128::from(80))),
@@ -1442,8 +1373,8 @@ mod tests {
                             args: serde_json::to_vec(&serde_json::json!({
                                 "operations": vec![
                                     Operation::SwapSimple {
-                                        dex_id: PLACH_DEX_ID.to_string(),
-                                        message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                        dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                        message: Base64VecU8(vec![1, 0, 0, 0]),
                                         asset_in: token_in.clone(),
                                         asset_out: token_out.clone(),
                                         amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(U128::from(80))),
@@ -1526,8 +1457,8 @@ mod tests {
                             method_name: "execute_operations".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "operations": vec![Operation::SwapSimple {
-                                    dex_id: PLACH_DEX_ID.to_string(),
-                                    message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                    dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                    message: Base64VecU8(vec![1, 0, 0, 0]),
                                     asset_in: token_in.clone(),
                                     asset_out: token_out.clone(),
                                     amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactOut(U128::from(80))),
@@ -1657,8 +1588,8 @@ mod tests {
                             "operations": {
                                 "operations": vec![
                                     Operation::SwapSimple {
-                                        dex_id: PLACH_DEX_ID.to_string(),
-                                        message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                        dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                        message: Base64VecU8(vec![1, 0, 0, 0]),
                                         asset_in: AssetId::Near,
                                         asset_out: AssetId::Nep141("ft".parse().unwrap()),
                                         amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),
@@ -1722,8 +1653,8 @@ mod tests {
                             "operations": {
                                 "operations": vec![
                                     Operation::SwapSimple {
-                                        dex_id: PLACH_DEX_ID.to_string(),
-                                        message: BASE64_STANDARD.encode(borsh::to_vec(&1u32).unwrap()),
+                                        dex_id: PLACH_DEX_ID.parse().unwrap(),
+                                        message: Base64VecU8(vec![1, 0, 0, 0]),
                                         asset_in: AssetId::Near,
                                         asset_out: AssetId::Nep141("ft".parse().unwrap()),
                                         amount: SwapOperationAmount::Amount(SwapRequestAmount::ExactIn(U128::from(100))),

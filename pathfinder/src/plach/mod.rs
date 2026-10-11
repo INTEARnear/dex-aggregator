@@ -3,20 +3,20 @@ mod storage;
 pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use lazy_static::lazy_static;
 use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
 
-use std::fmt::{self, Display};
 use std::panic::AssertUnwindSafe;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
+pub use intear_dex_types::AssetId;
 use pool_indexer::{AccountState, PoolIndexer};
+use xyk_dex_types::{FULL_SPLIT_FRACTION, SplitFraction};
 
 use crate::search::{
     self, Graph, MaxHops, PoolsDelta, QuoteAmount, Settings, SplitRoute, split_exactly,
@@ -49,6 +49,7 @@ pub enum SplitRouteApiResponse {
 #[derive(Serialize, Debug, Clone)]
 pub struct ExactInRoute {
     pub pools: Vec<ExactInPoolStep>,
+    pub split_fraction: SplitFraction,
     pub amount_in: U128,
     pub min_amount_out: U128,
     pub amount_out: U128,
@@ -57,6 +58,7 @@ pub struct ExactInRoute {
 #[derive(Serialize, Debug, Clone)]
 pub struct ExactOutRoute {
     pub pools: Vec<ExactOutPoolStep>,
+    pub split_fraction: SplitFraction,
     pub amount_in: U128,
     pub max_amount_in: U128,
     pub amount_out: U128,
@@ -284,85 +286,6 @@ pub struct AssetWithBalance {
     pub balance: U128,
 }
 
-#[derive(Debug, PartialEq, BorshSerialize, BorshDeserialize, Clone, PartialOrd, Eq, Ord, Hash)]
-pub enum AssetId {
-    Near,
-    Nep141(AccountId),
-    Nep245(AccountId, String),
-    Nep171(AccountId, String),
-}
-
-impl Display for AssetId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Near => write!(f, "near"),
-            Self::Nep141(contract_id) => write!(f, "nep141:{contract_id}"),
-            Self::Nep245(contract_id, token_id) => write!(f, "nep245:{contract_id}:{token_id}"),
-            Self::Nep171(contract_id, token_id) => write!(f, "nep171:{contract_id}:{token_id}"),
-        }
-    }
-}
-
-impl FromStr for AssetId {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "near" => Ok(Self::Near),
-            _ => match s.split_once(':') {
-                Some(("nep141", contract_id)) => {
-                    Ok(Self::Nep141(contract_id.parse().map_err(|e| {
-                        format!("Invalid account id {contract_id}: {e}")
-                    })?))
-                }
-                Some(("nep245", rest)) => {
-                    if let Some((contract_id, token_id)) = rest.split_once(':') {
-                        Ok(Self::Nep245(
-                            contract_id
-                                .parse()
-                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
-                            token_id.to_string(),
-                        ))
-                    } else {
-                        Err(format!("Invalid asset id: {s}"))
-                    }
-                }
-                Some(("nep171", rest)) => {
-                    if let Some((contract_id, token_id)) = rest.split_once(':') {
-                        Ok(Self::Nep171(
-                            contract_id
-                                .parse()
-                                .map_err(|e| format!("Invalid account id {contract_id}: {e}"))?,
-                            token_id.to_string(),
-                        ))
-                    } else {
-                        Err(format!("Invalid asset id: {s}"))
-                    }
-                }
-                _ => Err(format!("Invalid asset id: {s}")),
-            },
-        }
-    }
-}
-
-impl Serialize for AssetId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        Serialize::serialize(&self.to_string(), serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for AssetId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = <String as Deserialize<'de>>::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
 fn u128_to_u256(value: u128) -> U256 {
     U256::from(value)
 }
@@ -584,10 +507,11 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-const HOP_GAS: NearGas = NearGas::from_tgas(26);
+const SWAP_BASE_GAS: NearGas = NearGas::from_tgas(26);
+const HOP_GAS: NearGas = NearGas::from_ggas(4_500);
 
 fn swap_gas(split_route: &SplitRoute) -> NearGas {
-    NearGas::from_gas(NearGas::from_tgas(8).as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64)
+    NearGas::from_gas(SWAP_BASE_GAS.as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64)
 }
 
 fn to_api_response(
@@ -634,6 +558,7 @@ fn to_api_response(
 
                 routes_resp.push(ExactInRoute {
                     pools: pools_resp,
+                    split_fraction: part.weight_percentage * (FULL_SPLIT_FRACTION / 100),
                     amount_in: U128(amount_part),
                     min_amount_out: U128(min_amount_out),
                     amount_out: U128(estimated_out),
@@ -694,6 +619,7 @@ fn to_api_response(
 
                 routes_resp.push(ExactOutRoute {
                     pools: pools_resp,
+                    split_fraction: part.weight_percentage * (FULL_SPLIT_FRACTION / 100),
                     amount_in: U128(amount_in),
                     max_amount_in: U128(max_amount_in),
                     amount_out: U128(amount_out_part),

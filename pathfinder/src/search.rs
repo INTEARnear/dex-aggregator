@@ -470,8 +470,7 @@ impl Route {
 #[derive(Debug, Clone)]
 pub struct SplitRoutePart {
     pub route: Route,
-    /// Percentage of the amount
-    pub weight: u32,
+    pub weight_percentage: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -488,10 +487,10 @@ impl SplitRoute {
             .filter(|(_, weight)| **weight > 0)
             .map(|(route, &weight)| SplitRoutePart {
                 route: route.clone(),
-                weight,
+                weight_percentage: weight,
             })
             .collect::<Vec<_>>();
-        parts.sort_by_key(|part| std::cmp::Reverse(part.weight));
+        parts.sort_by_key(|part| std::cmp::Reverse(part.weight_percentage));
         Self { parts }
     }
 
@@ -507,9 +506,9 @@ impl SplitRoute {
 pub fn split_exactly(amount: Balance, parts: &[SplitRoutePart]) -> Vec<Balance> {
     let mut amounts = parts
         .iter()
-        .map(|part| split_amount(amount, part.weight))
+        .map(|part| split_amount(amount, part.weight_percentage))
         .collect::<Vec<_>>();
-    let total_weight = parts.iter().map(|part| part.weight).sum();
+    let total_weight = parts.iter().map(|part| part.weight_percentage).sum();
     amounts[0] += split_amount(amount, total_weight) - amounts.iter().sum::<Balance>();
     amounts
 }
@@ -758,7 +757,9 @@ pub fn route<P: Pool>(
             let repicked_routes = best_split
                 .parts
                 .iter()
-                .filter_map(|part| search.repick(&part.route, set.part_amount(part.weight)))
+                .filter_map(|part| {
+                    search.repick(&part.route, set.part_amount(part.weight_percentage))
+                })
                 .collect::<Vec<_>>()
                 .iter()
                 .map(|route| set.add(route))
@@ -784,7 +785,7 @@ pub fn route<P: Pool>(
         let parts = best_split
             .parts
             .iter()
-            .map(|part| (set.add(&part.route), part.weight))
+            .map(|part| (set.add(&part.route), part.weight_percentage))
             .collect::<Vec<_>>();
         if let Some((split, metric)) = shifted_split(&mut set, parts, hop_cost) {
             consider(split, metric, amount, hop_cost, &mut best);

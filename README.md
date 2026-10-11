@@ -22,7 +22,7 @@ Routing is deterministic, so running `quote` again on the same block heights and
 - `Rhea`: uses `pathfinder`
 - `Aidols`: calls `emulate_swap` or `emulate_swap_by_out` for *.aidols.near tokens. Fails if the token has already bonded to Rhea
 - `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different-output-token-locations))
-- `RheaDcl`: uses `pathfinder`. Finds the best route through up to 4 DCL pools.
+- `RheaDcl`: uses `pathfinder`
 - `MetaPool`: staking NEAR into STNEAR & liquid withdrawal. Slippage is only ever possible between epoch boundaries, so API assumes there's no slippage
 - `Linear`: staking NEAR into LiNEAR. Doesn't implement liquid withdrawal (official way is to sell on Rhea). Slippage is only ever possible between epoch boundaries, so API assumes there's no slippage
 - `XRhea`: staking RHEA into xRHEA & unstaking. There's no staking lock or fee.
