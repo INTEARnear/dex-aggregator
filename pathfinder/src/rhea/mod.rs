@@ -70,7 +70,7 @@ const FEE_DIVISOR: u32 = 10_000;
 
 const SETTINGS: Settings = Settings {
     top_routes: 10,
-    max_splits: 2,
+    max_splits: 8,
     allow_unused_input: true,
     keep_shorter_routes: true,
 };

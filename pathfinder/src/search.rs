@@ -1,8 +1,12 @@
 //! Route search shared by all DEXes. Candidate paths of up to four hops take the best pool for each
 //! hop for the amount it gets. The answer is the best of single routes and splits in 1% steps: the
 //! best split between each two of the best `Settings::top_routes` routes, and the routes that get
-//! the most when the amount is filled a step at a time into more of the best routes. A DEX provides
-//! pool simulation (`Pool`) and turns the found `SplitRoute` into its own response.
+//! the most when the amount is filled a step at a time into more of the best routes, filled again
+//! with their variants through the other best pools of each hop. Then each route of the best split
+//! takes the best pool for each hop for its part of the amount instead, and the splits are searched
+//! again with those routes. Shares of the amount are moved between the parts of the found splits
+//! while that gets more. A DEX provides pool simulation (`Pool`) and turns the found `SplitRoute`
+//! into its own response.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -25,6 +29,8 @@ const DIRECT_ROUTES_COUNT: usize = 3;
 const FILL_ROUTES_FACTOR: usize = 4;
 /// Routes that got the most of the filled amount, paired with each other
 const FILLED_ROUTES_PAIRED: usize = 4;
+/// Shares of the amount moved between the parts of a split, in split steps
+const SHIFT_STEPS: [u32; 5] = [16, 8, 4, 2, 1];
 /// Four-hop routes whose two intermediate tokens share no pool go through this many of the input's
 /// and the output's neighbors with the most pools, since trying all of them between tokens with
 /// hundreds of neighbors takes too long
@@ -736,7 +742,51 @@ pub fn route<P: Pool>(
         if let Some((split, metric)) = best_pair_split(&mut set, &routes) {
             consider(split, metric, amount, hop_cost, &mut best);
         }
-        for (split, metric) in fill_splits(&mut set, &fill_routes, settings) {
+        for (split, metric) in fill_splits(&mut set, &mut search, &fill_routes, settings, hop_cost)
+        {
+            consider(split, metric, amount, hop_cost, &mut best);
+        }
+        // Each hop's pool was chosen for the whole amount, a part of it can do better elsewhere
+        if let Some((best_split, _)) = &best
+            && best_split.parts.len() > 1
+        {
+            let split_routes = best_split
+                .parts
+                .iter()
+                .map(|part| set.add(&part.route))
+                .collect::<Vec<_>>();
+            let repicked_routes = best_split
+                .parts
+                .iter()
+                .filter_map(|part| search.repick(&part.route, set.part_amount(part.weight)))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|route| set.add(route))
+                .filter(|route| !fill_routes.contains(route) && !routes.contains(route))
+                .collect::<Vec<_>>();
+            if !repicked_routes.is_empty() {
+                let paired_routes = [split_routes, repicked_routes.clone()].concat();
+                if let Some((split, metric)) = best_pair_split(&mut set, &paired_routes) {
+                    consider(split, metric, amount, hop_cost, &mut best);
+                }
+                let fill_routes = [fill_routes, repicked_routes].concat();
+                for (split, metric) in
+                    fill_splits(&mut set, &mut search, &fill_routes, settings, hop_cost)
+                {
+                    consider(split, metric, amount, hop_cost, &mut best);
+                }
+            }
+        }
+    }
+    if let Some((best_split, _)) = &best
+        && best_split.parts.len() > 1
+    {
+        let parts = best_split
+            .parts
+            .iter()
+            .map(|part| (set.add(&part.route), part.weight))
+            .collect::<Vec<_>>();
+        if let Some((split, metric)) = shifted_split(&mut set, parts, hop_cost) {
             consider(split, metric, amount, hop_cost, &mut best);
         }
     }
@@ -753,36 +803,45 @@ pub fn route<P: Pool>(
     Ok(best)
 }
 
-/// Splits from filling the amount into the routes: the filled split itself if it uses few enough
-/// routes, and the best split between two of the routes that got the most
+/// Splits from filling the amount into the routes, and again into those that got some of it and
+/// their variants through other pools: each filled split, refilled into the routes that got the
+/// most if it uses too many, and the best split between two of the routes that got the most
 fn fill_splits<P: Pool>(
     set: &mut RouteSet<P>,
+    search: &mut Search<P>,
     routes: &[usize],
     settings: Settings,
+    hop_cost: Balance,
 ) -> Vec<(SplitRoute, Balance)> {
-    let amount = set.amount;
     let step = split_step(set, routes);
-    let weights = fill(set, routes, step);
-    let total_weight = weights.iter().sum::<u32>();
-    if total_weight == 0
-        || total_weight != 100
-            && !(settings.allow_unused_input && matches!(amount, QuoteAmount::ExactIn(_)))
-    {
+    let Some(filled) = filled_routes(set, routes, step, settings) else {
         return Vec::new();
+    };
+    let mut variant_routes = filled.iter().map(|(route, _)| *route).collect::<Vec<_>>();
+    for &(route, weight) in &filled {
+        let route = set.routes[route].clone();
+        for variant in search.pool_variants(&route, set.part_amount(weight)) {
+            let variant = set.add(&variant);
+            if !variant_routes.contains(&variant) {
+                variant_routes.push(variant);
+            }
+        }
     }
-    let mut filled = routes
-        .iter()
-        .copied()
-        .zip(weights)
-        .filter(|(_, weight)| *weight > 0)
-        .collect::<Vec<_>>();
-    filled.sort_by_key(|(_, weight)| std::cmp::Reverse(*weight));
+    let refilled = filled_routes(set, &variant_routes, step, settings);
 
     let mut splits = Vec::new();
-    if filled.len() <= settings.max_splits
-        && let Some(metric) = set.split_metric(&filled)
-    {
-        splits.push((set.split(&filled), metric));
+    for filled in [Some(filled.clone()), refilled].into_iter().flatten() {
+        let limited = if filled.len() <= settings.max_splits {
+            Some(filled)
+        } else {
+            let heaviest = filled
+                .iter()
+                .take(settings.max_splits)
+                .map(|(route, _)| *route)
+                .collect::<Vec<_>>();
+            filled_routes(set, &heaviest, step, settings)
+        };
+        splits.extend(limited.and_then(|limited| shifted_split(set, limited, hop_cost)));
     }
     let paired = filled
         .iter()
@@ -793,6 +852,85 @@ fn fill_splits<P: Pool>(
         splits.extend(best_pair_split(set, &paired));
     }
     splits
+}
+
+/// The split with shares of the amount moved from one part to another as long as that gets more net
+/// of hops, largest shares first, since `fill` never takes back a step and `best_pair_split` only
+/// gets close to the best weights. A part's whole share is tried too, since its hops only stop
+/// costing once all of it is moved. A part that loses all of its share is left out.
+fn shifted_split<P: Pool>(
+    set: &mut RouteSet<P>,
+    mut parts: Vec<(usize, u32)>,
+    hop_cost: Balance,
+) -> Option<(SplitRoute, Balance)> {
+    let routes = parts.iter().map(|(route, _)| *route).collect::<Vec<_>>();
+    let step = split_step(set, &routes);
+    let net_key = |set: &RouteSet<P>, parts: &[(usize, u32)], metric| {
+        let hops = parts
+            .iter()
+            .filter(|(_, weight)| *weight > 0)
+            .map(|(route, _)| set.routes[*route].hops.len())
+            .sum();
+        set.amount.net_key(Some(metric), hops, hop_cost)
+    };
+    let mut metric = set.split_metric(&parts)?;
+    for shift in SHIFT_STEPS
+        .map(|steps| steps * step)
+        .into_iter()
+        .filter(|&shift| shift < 100)
+    {
+        let mut shifted = true;
+        while shifted {
+            shifted = false;
+            for from in 0..parts.len() {
+                for to in 0..parts.len() {
+                    for moved in [shift, parts[from].1] {
+                        if from == to || moved == 0 || parts[from].1 < moved {
+                            continue;
+                        }
+                        let mut candidate = parts.clone();
+                        candidate[from].1 -= moved;
+                        candidate[to].1 += moved;
+                        if let Some(candidate_metric) = set.split_metric(&candidate)
+                            && net_key(set, &candidate, candidate_metric)
+                                > net_key(set, &parts, metric)
+                        {
+                            (parts, metric) = (candidate, candidate_metric);
+                            shifted = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.retain(|(_, weight)| *weight > 0);
+    Some((set.split(&parts), metric))
+}
+
+/// The routes that got some of the amount filled into them and their weights, heaviest first.
+/// `None` if nothing could be filled, or not all of it when all of it has to be used.
+fn filled_routes<P: Pool>(
+    set: &mut RouteSet<P>,
+    routes: &[usize],
+    step: u32,
+    settings: Settings,
+) -> Option<Vec<(usize, u32)>> {
+    let weights = fill(set, routes, step);
+    let total_weight = weights.iter().sum::<u32>();
+    if total_weight == 0
+        || total_weight != 100
+            && !(settings.allow_unused_input && matches!(set.amount, QuoteAmount::ExactIn(_)))
+    {
+        return None;
+    }
+    let mut filled = routes
+        .iter()
+        .copied()
+        .zip(weights)
+        .filter(|(_, weight)| *weight > 0)
+        .collect::<Vec<_>>();
+    filled.sort_by_key(|(_, weight)| std::cmp::Reverse(*weight));
+    Some(filled)
 }
 
 /// Fills the amount into the routes a step at a time, each step into the route that gains the
@@ -1201,6 +1339,51 @@ impl<P: Pool> Search<'_, P> {
             leg_amount
         };
         Some(Candidate { route, metric })
+    }
+
+    /// Routes that go through another of the best pools of a hop's pair for the amount the hop
+    /// gets, one hop changed in each
+    fn pool_variants(&mut self, route: &Route, amount: QuoteAmount) -> Vec<Route> {
+        let hop_indices = match amount {
+            QuoteAmount::ExactIn(_) => (0..route.hops.len()).collect::<SmallVec<[usize; 4]>>(),
+            QuoteAmount::ExactOut(_) => (0..route.hops.len()).rev().collect(),
+        };
+        let mut variants = Vec::new();
+        let mut hop_amount = amount;
+        for hop_index in hop_indices {
+            let hop = route.hops[hop_index];
+            let pair_routes = self
+                .candidates(hop_amount, hop.token_in, hop.token_out, MaxHops::DirectOnly)
+                .paired;
+            for pair_route in pair_routes {
+                if pair_route.route.hops[0].pool != hop.pool {
+                    let mut variant = route.clone();
+                    variant.hops[hop_index] = pair_route.route.hops[0];
+                    variants.push(variant);
+                }
+            }
+            let hop_route = Route {
+                hops: smallvec![hop],
+            };
+            let Some(next_amount) = hop_route.quote(self.graph, hop_amount) else {
+                break;
+            };
+            hop_amount = match amount {
+                QuoteAmount::ExactIn(_) => QuoteAmount::ExactIn(next_amount),
+                QuoteAmount::ExactOut(_) => QuoteAmount::ExactOut(next_amount),
+            };
+        }
+        variants
+    }
+
+    /// The route through the same tokens, each hop through the best pool for the amount it gets
+    fn repick(&mut self, route: &Route, amount: QuoteAmount) -> Option<Route> {
+        let tokens = std::iter::once(route.hops[0].token_in)
+            .chain(route.hops.iter().map(|hop| hop.token_out))
+            .collect::<SmallVec<[usize; 5]>>();
+        let hops = vec![MaxHops::DirectOnly; route.hops.len()];
+        self.through(amount, &tokens, &hops)
+            .map(|candidate| candidate.route)
     }
 
     /// The best leg between each two of `tokens` in path order, and the metric of the leg

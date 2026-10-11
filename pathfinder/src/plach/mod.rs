@@ -578,8 +578,8 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
 }
 
 const SETTINGS: Settings = Settings {
-    top_routes: 5,
-    max_splits: 2,
+    top_routes: 10,
+    max_splits: 8,
     allow_unused_input: false,
     keep_shorter_routes: true,
 };
