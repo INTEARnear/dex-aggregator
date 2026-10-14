@@ -195,6 +195,10 @@ async fn route(
                     Amount::AmountOut(_) => &request.token_in,
                 },
             )?,
+            referrer: request
+                .referrer_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap()),
         })
         .await?;
 

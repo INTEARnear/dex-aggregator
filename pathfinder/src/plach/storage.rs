@@ -2,7 +2,7 @@
 //! `get_pools` view builds it. Mirrors the storage types and fee logic of the xyk DEX in
 //! https://github.com/INTEARnear/dex
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, U128};
@@ -10,14 +10,19 @@ use pool_indexer::{AccountState, Watch};
 
 use super::{
     AssetId, AssetWithBalance, CurrentFees, FeeAmount, FeeConfiguration, FeeFraction, FeeReceiver,
-    INTEAR_DEX_CONTRACT_ID, MAX_FEE_FRACTION, PLACH_DEX_ID, PoolData, PoolsSource, Timestamp,
-    V1FeeConfiguration,
+    INTEAR_DEX_CONTRACT_ID, MAX_FEE_FRACTION, PLACH_DEX_ID, PoolData, PoolsSource, Referrer,
+    Timestamp, V1FeeConfiguration,
 };
 
 /// `dex_storage: LookupMap<(DexId, Vec<u8>), Vec<u8>>` of the DEX engine
 const DEX_STORAGE_PREFIX: u8 = 1;
 /// `pools: Vector<Pool>` of the xyk DEX, keys are the prefix and u32 index
 const POOLS_PREFIX: u8 = 0;
+/// `fees_collected_by_users: LookupMap<(AccountId, AssetId), U128>` of the xyk DEX: an account
+/// only collects fees in the assets it has an entry for
+const FEES_COLLECTED_BY_USERS_PREFIX: u8 = 2;
+/// `referral_settings: LookupMap<AccountId, ReferralSettings>` of the xyk DEX
+const REFERRAL_SETTINGS_PREFIX: u8 = 3;
 const PROTOCOL_FEE: FeeFraction = MAX_FEE_FRACTION / 1000;
 const PROTOCOL_FEE_REDUCED: FeeFraction = 1;
 const PROTOCOL_FEE_RECEIVER_ID: &str = "plach.intear.near";
@@ -97,6 +102,14 @@ enum StoredFeeConfiguration {
     },
 }
 
+#[derive(BorshDeserialize)]
+enum StoredReferralSettings {
+    V1 {
+        fee_fraction: FeeFraction,
+        fee_fraction_reduced: FeeFraction,
+    },
+}
+
 #[derive(BorshDeserialize, Clone)]
 enum StoredFeeReceiver {
     Account(AccountId),
@@ -153,7 +166,44 @@ pub(super) fn pools_source(state: &AccountState) -> Result<PoolsSource, anyhow::
     Ok(PoolsSource {
         block_height: state.block.height,
         pools,
+        referrers: referrers(&storage)?,
     })
+}
+
+/// Referrers with settings, and the assets each collects fees in
+fn referrers(
+    storage: &HashMap<Vec<u8>, Vec<u8>>,
+) -> Result<HashMap<AccountId, Referrer>, anyhow::Error> {
+    let mut referrers = HashMap::new();
+    for (key, value) in storage {
+        if let Some((&REFERRAL_SETTINGS_PREFIX, account_id)) = key.split_first() {
+            let account_id = borsh::from_slice::<AccountId>(account_id)
+                .map_err(|e| anyhow::anyhow!("Invalid referrer {key:02x?}: {e}"))?;
+            let StoredReferralSettings::V1 {
+                fee_fraction,
+                fee_fraction_reduced,
+            } = borsh::from_slice(value)
+                .map_err(|e| anyhow::anyhow!("Invalid referral settings of {account_id}: {e}"))?;
+            referrers.insert(
+                account_id,
+                Referrer {
+                    fee_fraction,
+                    fee_fraction_reduced,
+                    fee_assets: HashSet::new(),
+                },
+            );
+        }
+    }
+    for key in storage.keys() {
+        if let Some((&FEES_COLLECTED_BY_USERS_PREFIX, entry)) = key.split_first() {
+            let (account_id, asset_id) = borsh::from_slice::<(AccountId, AssetId)>(entry)
+                .map_err(|e| anyhow::anyhow!("Invalid collected fees key {key:02x?}: {e}"))?;
+            if let Some(referrer) = referrers.get_mut(&account_id) {
+                referrer.fee_assets.insert(asset_id);
+            }
+        }
+    }
+    Ok(referrers)
 }
 
 fn pool_data(pool: StoredPool, timestamp: Timestamp) -> Result<PoolData, anyhow::Error> {
@@ -315,8 +365,8 @@ fn current_fees(
     Ok(CurrentFees { receivers })
 }
 
-/// Whether both assets are stable assets, which pay a reduced protocol fee
-fn should_reduce_fee(assets: [&AssetId; 2]) -> Result<bool, anyhow::Error> {
+/// Whether both assets are stable assets, which pay a reduced protocol fee and referral fee
+pub(super) fn should_reduce_fee(assets: [&AssetId; 2]) -> Result<bool, anyhow::Error> {
     for asset in assets {
         let account_id = match asset {
             AssetId::Near => "near",
@@ -340,4 +390,55 @@ fn is_direct_sub_account(account_id: &str, parent: &str) -> bool {
         .strip_suffix(parent)
         .and_then(|rest| rest.strip_suffix('.'))
         .is_some_and(|name| !name.is_empty() && !name.contains('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(prefix: u8, entry: impl borsh::BorshSerialize) -> Vec<u8> {
+        [vec![prefix], borsh::to_vec(&entry).unwrap()].concat()
+    }
+
+    #[test]
+    fn referrers_come_with_the_assets_they_collect_fees_in() {
+        let referrer: AccountId = "ref.near".parse().unwrap();
+        let other: AccountId = "pool-owner.near".parse().unwrap();
+        let usdt = AssetId::Nep141("usdt.tether-token.near".parse().unwrap());
+        // ReferralSettings::V1 { fee_fraction: 10_000, fee_fraction_reduced: 1_000 }
+        let settings = [
+            vec![0],
+            10_000u32.to_le_bytes().to_vec(),
+            1_000u32.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let storage = HashMap::from([
+            (key(REFERRAL_SETTINGS_PREFIX, &referrer), settings),
+            (
+                key(FEES_COLLECTED_BY_USERS_PREFIX, (&referrer, &AssetId::Near)),
+                borsh::to_vec(&0u128).unwrap(),
+            ),
+            (
+                key(FEES_COLLECTED_BY_USERS_PREFIX, (&referrer, &usdt)),
+                borsh::to_vec(&5u128).unwrap(),
+            ),
+            // Collects fees, but isn't a referrer
+            (
+                key(FEES_COLLECTED_BY_USERS_PREFIX, (&other, &usdt)),
+                borsh::to_vec(&5u128).unwrap(),
+            ),
+        ]);
+        let referrers = referrers(&storage).unwrap();
+        assert_eq!(
+            referrers,
+            HashMap::from([(
+                referrer,
+                Referrer {
+                    fee_fraction: 10_000,
+                    fee_fraction_reduced: 1_000,
+                    fee_assets: HashSet::from([AssetId::Near, usdt]),
+                }
+            )])
+        );
+    }
 }

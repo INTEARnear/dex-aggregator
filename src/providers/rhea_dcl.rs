@@ -9,9 +9,8 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed,
-        deposit_storage_on_contract_if_needed, get_slippage, price_raw, swap_call_gas, Mainnet,
-        NetworkView,
+        convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
+        get_slippage, price_raw, swap_call_gas, Mainnet, NetworkView,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,

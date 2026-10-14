@@ -205,6 +205,27 @@ pub struct Graph<P: Pool> {
 }
 
 impl<P: Pool> Graph<P> {
+    /// The same graph with each pool replaced by what `f` makes of it, which has to keep the
+    /// pool's tokens. Cheaper than [`Graph::new`], which works out which pools connect what.
+    pub fn map_pools(&self, f: impl FnMut(&P) -> P) -> Self {
+        let pools = self.pools.iter().map(f).collect::<Vec<_>>();
+        debug_assert!(
+            pools
+                .iter()
+                .zip(&self.pools)
+                .all(|(new, old)| new.tokens() == old.tokens()),
+            "map_pools changed a pool's tokens"
+        );
+        Self {
+            pools,
+            pool_tokens: self.pool_tokens.clone(),
+            tokens: self.tokens.clone(),
+            token_indices: self.token_indices.clone(),
+            pair_pools: self.pair_pools.clone(),
+            neighbors: self.neighbors.clone(),
+        }
+    }
+
     pub fn new(pools: Vec<P>) -> Self {
         let mut tokens = Vec::new();
         let mut token_indices = HashMap::new();

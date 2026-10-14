@@ -8,8 +8,9 @@ use lazy_static::lazy_static;
 use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
 
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -95,6 +96,9 @@ type U256 = ruint::aliases::U256;
 pub struct Pool {
     id: u32,
     reserves: [Balance; 2],
+    /// The referrer's fee on swaps that put in token 0 and token 1, on top of `info.fees`. 0
+    /// without a referrer, or for one that isn't charged on the swap.
+    referral_fees: [FeeFraction; 2],
     /// What swaps don't change, shared so simulations clone pools without allocating
     info: Arc<PoolInfo>,
 }
@@ -106,10 +110,30 @@ struct PoolInfo {
     /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom
     /// liquidity of the quote token.
     min_reserves: [Balance; 2],
+    /// Which token a launch pool converts its fees to
+    launch_quote_token: Option<usize>,
+    /// Whether both tokens are stable assets, which pay reduced protocol and referral fees.
+    /// `None` when the contract can't tell, for NEP-171 tokens, which makes it panic on swaps.
+    stable_pair: Option<bool>,
+}
+
+/// A referrer's fee on Plach swaps, as the xyk DEX charges it
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Referrer {
+    pub fee_fraction: FeeFraction,
+    /// Instead of `fee_fraction` on swaps between two stable assets
+    pub fee_fraction_reduced: FeeFraction,
+    /// The assets the referrer collects fees in. A swap whose fee would be in another asset
+    /// doesn't charge one.
+    pub fee_assets: HashSet<AssetId>,
 }
 
 impl Pool {
     fn new(id: u32, data: PoolData) -> Self {
+        let launch_quote_token = match &data {
+            PoolData::Launch { .. } | PoolData::LaunchV2 { .. } => Some(0),
+            PoolData::Private { .. } | PoolData::Public { .. } => None,
+        };
         let (tokens, reserves, fees, min_reserves) = match data {
             PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => (
                 [assets.0.asset_id, assets.1.asset_id],
@@ -142,14 +166,50 @@ impl Pool {
                 [phantom_liquidity.0, 0],
             ),
         };
+        let stable_pair = storage::should_reduce_fee([&tokens[0], &tokens[1]]).ok();
         Self {
             id,
             reserves,
+            referral_fees: [0, 0],
             info: Arc::new(PoolInfo {
                 tokens,
                 fees,
                 min_reserves,
+                launch_quote_token,
+                stable_pair,
             }),
+        }
+    }
+
+    /// The pool with the fee `referrer` is charged on each swap through it, as the xyk DEX's
+    /// `with_referral_fee` adds it: the reduced fee between two stable assets, and only when the
+    /// referrer collects fees in the asset they're paid in. That's the asset put in, but for a
+    /// launch pool selling into its quote token, which converts fees to it.
+    fn with_referrer(&self, referrer: &Referrer) -> Self {
+        let Some(stable_pair) = self.info.stable_pair else {
+            return self.clone();
+        };
+        let fee_fraction = if stable_pair {
+            referrer.fee_fraction_reduced
+        } else {
+            referrer.fee_fraction
+        };
+        let referral_fees = [0, 1].map(|token_in| {
+            let token_out = 1 - token_in;
+            let fee_token = if self.info.launch_quote_token == Some(token_out) {
+                token_out
+            } else {
+                token_in
+            };
+            if referrer.fee_assets.contains(&self.info.tokens[fee_token]) {
+                fee_fraction
+            } else {
+                0
+            }
+        });
+        Self {
+            referral_fees,
+            ..self.clone()
         }
     }
 }
@@ -294,35 +354,121 @@ fn u256_to_u128(value: U256) -> u128 {
     u128::try_from(value).expect("Value must be less than 128 bits")
 }
 
-fn total_fee_fraction(fees: &CurrentFees) -> u128 {
+/// Fractions of every fee receiver and whether the pool keeps it, the referrer's last as the
+/// contract adds it
+fn fee_fractions(
+    fees: &CurrentFees,
+    referral_fee: FeeFraction,
+) -> impl Iterator<Item = (bool, FeeFraction)> + '_ {
     fees.receivers
         .iter()
-        .map(|(_, fee)| *fee as u128)
+        .map(|(receiver, fee)| (matches!(receiver, FeeReceiver::Pool), *fee))
+        .chain((referral_fee > 0).then_some((false, referral_fee)))
+}
+
+fn total_fee_fraction(fees: &CurrentFees, referral_fee: FeeFraction) -> u128 {
+    fee_fractions(fees, referral_fee)
+        .map(|(_, fee)| u128::from(fee))
         .sum::<u128>()
 }
 
-fn collect_fees(amount_in: u128, fees: &CurrentFees) -> u128 {
-    let mut total_fees = 0u128;
-    for (_, fee_fraction) in fees.receivers.iter() {
-        let fee_amount = u256_to_u128(
-            u128_to_u256(amount_in) * u128_to_u256(*fee_fraction as u128)
-                / u128_to_u256(MAX_FEE_FRACTION as u128),
-        );
-        total_fees = total_fees.checked_add(fee_amount).expect("Overflow");
+fn fee_amount(amount_in: u128, fee_fraction: FeeFraction) -> u128 {
+    u256_to_u128(
+        u128_to_u256(amount_in) * u128_to_u256(fee_fraction as u128)
+            / u128_to_u256(MAX_FEE_FRACTION as u128),
+    )
+}
+
+struct CollectedFees {
+    amount_in_after_fees: u128,
+    /// What the pool keeps of the fees, added to its input reserve
+    pool_fee: u128,
+}
+
+/// One side of a pool swap: input and output reserves and the fees on it
+struct Swap<'a> {
+    in_balance: &'a mut Balance,
+    out_balance: &'a mut Balance,
+    fees: &'a CurrentFees,
+    referral_fee: FeeFraction,
+    /// Swaps fail if they leave less than this of the output token
+    min_out_balance: Balance,
+    /// Whether it's a launch pool selling into its quote token, which converts the fees it
+    /// doesn't keep to it
+    converts_fees: bool,
+}
+
+impl Swap<'_> {
+    fn collect_fees(&self, amount_in: u128) -> CollectedFees {
+        let mut total_fees = 0u128;
+        let mut pool_fee = 0u128;
+        for (kept_by_pool, fee_fraction) in fee_fractions(self.fees, self.referral_fee) {
+            let fee_amount = fee_amount(amount_in, fee_fraction);
+            total_fees = total_fees.checked_add(fee_amount).expect("Overflow");
+            if kept_by_pool {
+                pool_fee = pool_fee.checked_add(fee_amount).expect("Overflow");
+            }
+        }
+        CollectedFees {
+            amount_in_after_fees: amount_in.checked_sub(total_fees).expect("Fee exceeds 100%"),
+            pool_fee,
+        }
     }
-    amount_in.checked_sub(total_fees).expect("Fee exceeds 100%")
+
+    /// Moves the reserves like the contract after a swap: the pool keeps its fee, and a launch
+    /// pool selling into its quote token then swaps each other fee to it, in receiver order.
+    /// `None` if that leaves too little of the output token.
+    fn settle(self, amount_in: u128, fees: CollectedFees, amount_out: u128) -> Option<()> {
+        *self.in_balance = self
+            .in_balance
+            .checked_add(fees.amount_in_after_fees)
+            .expect("Overflow")
+            .checked_add(fees.pool_fee)
+            .expect("Overflow");
+        *self.out_balance = self.out_balance.checked_sub(amount_out).expect("Underflow");
+        if self.converts_fees {
+            for (kept_by_pool, fee_fraction) in fee_fractions(self.fees, self.referral_fee) {
+                if kept_by_pool {
+                    continue;
+                }
+                let fee_amount = fee_amount(amount_in, fee_fraction);
+                // in_balance is positive after the swap, u128 + u128 can't overflow u256
+                #[allow(clippy::arithmetic_side_effects)]
+                let fee_amount_out = u256_to_u128(
+                    u128_to_u256(fee_amount) * u128_to_u256(*self.out_balance)
+                        / (u128_to_u256(*self.in_balance) + u128_to_u256(fee_amount)),
+                );
+                *self.in_balance = self.in_balance.checked_add(fee_amount).expect("Overflow");
+                *self.out_balance = self
+                    .out_balance
+                    .checked_sub(fee_amount_out)
+                    .expect("Underflow");
+            }
+        }
+        (*self.out_balance >= self.min_out_balance).then_some(())
+    }
 }
 
 impl Pool {
-    /// Input and output reserves, the fees, and the least the output reserve can be left with
-    fn reserves(&mut self, first_in: bool) -> (&mut Balance, &mut Balance, &CurrentFees, Balance) {
+    /// The swap putting in token 0 if `first_in`, else token 1. `None` for a pool the contract
+    /// can't swap in.
+    fn swap(&mut self, first_in: bool) -> Option<Swap<'_>> {
+        self.info.stable_pair?;
+        let token_out = if first_in { 1 } else { 0 };
         let [balance0, balance1] = &mut self.reserves;
-        let [min0, min1] = self.info.min_reserves;
-        if first_in {
-            (balance0, balance1, &self.info.fees, min1)
+        let (in_balance, out_balance) = if first_in {
+            (balance0, balance1)
         } else {
-            (balance1, balance0, &self.info.fees, min0)
-        }
+            (balance1, balance0)
+        };
+        Some(Swap {
+            in_balance,
+            out_balance,
+            fees: &self.info.fees,
+            referral_fee: self.referral_fees[1 - token_out],
+            min_out_balance: self.info.min_reserves[token_out],
+            converts_fees: self.info.launch_quote_token == Some(token_out),
+        })
     }
 
     /// Simulations panic on overflows like the contract
@@ -352,24 +498,18 @@ impl search::Pool for Pool {
         amount_in: Balance,
     ) -> Option<Balance> {
         self.unless_panicked(|pool| {
-            let (in_balance, out_balance, fees, min_out_balance) = pool.reserves(token_in == 0);
-            if *in_balance == 0 {
+            let swap = pool.swap(token_in == 0)?;
+            if *swap.in_balance == 0 {
                 return None;
             }
-            let amount_in_after_fees = collect_fees(amount_in, fees);
+            let fees = swap.collect_fees(amount_in);
             // u128 * u128 or u128 + u128 can't overflow u256; in_balance was checked to be positive
             #[allow(clippy::arithmetic_side_effects)]
             let amount_out = u256_to_u128(
-                u128_to_u256(amount_in_after_fees) * u128_to_u256(*out_balance)
-                    / (u128_to_u256(*in_balance) + u128_to_u256(amount_in_after_fees)),
+                u128_to_u256(fees.amount_in_after_fees) * u128_to_u256(*swap.out_balance)
+                    / (u128_to_u256(*swap.in_balance) + u128_to_u256(fees.amount_in_after_fees)),
             );
-            *in_balance = in_balance
-                .checked_add(amount_in_after_fees)
-                .expect("Overflow");
-            *out_balance = out_balance.checked_sub(amount_out).expect("Underflow");
-            if *out_balance < min_out_balance {
-                return None;
-            }
+            swap.settle(amount_in, fees, amount_out)?;
             Some(amount_out)
         })
     }
@@ -384,19 +524,20 @@ impl search::Pool for Pool {
             if amount_out == 0 {
                 return None;
             }
-            let (in_balance, out_balance, fees, min_out_balance) = pool.reserves(token_in == 0);
-            if amount_out >= *out_balance || *out_balance - amount_out < min_out_balance {
+            let swap = pool.swap(token_in == 0)?;
+            let (in_balance, out_balance) = (*swap.in_balance, *swap.out_balance);
+            if amount_out >= out_balance || out_balance - amount_out < swap.min_out_balance {
                 return None;
             }
 
             #[allow(clippy::arithmetic_side_effects)]
             let amount_in_without_fees = u256_to_u128(
-                (u128_to_u256(*in_balance) * u128_to_u256(amount_out))
-                    / (u128_to_u256(*out_balance) - u128_to_u256(amount_out)),
+                (u128_to_u256(in_balance) * u128_to_u256(amount_out))
+                    / (u128_to_u256(out_balance) - u128_to_u256(amount_out)),
             )
             .checked_add(1)
             .expect("Overflow");
-            let total_fee_fraction = total_fee_fraction(fees);
+            let total_fee_fraction = total_fee_fraction(swap.fees, swap.referral_fee);
             let fee_denominator = (MAX_FEE_FRACTION as u128)
                 .checked_sub(total_fee_fraction)
                 .expect("Fee fraction somehow above 100%");
@@ -409,11 +550,8 @@ impl search::Pool for Pool {
                     + u128_to_u256(fee_denominator_minus_one))
                     / u128_to_u256(fee_denominator),
             );
-            let amount_in_after_fees = collect_fees(amount_in, fees);
-            *in_balance = in_balance
-                .checked_add(amount_in_after_fees)
-                .expect("Overflow");
-            *out_balance = out_balance.checked_sub(amount_out).expect("Underflow");
+            let fees = swap.collect_fees(amount_in);
+            swap.settle(amount_in, fees, amount_out)?;
             Some(amount_in)
         })
     }
@@ -426,7 +564,26 @@ lazy_static! {
 pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
-    graph: Graph<Pool>,
+    /// Pools without referral fees
+    graph: Arc<Graph<Pool>>,
+    referrers: HashMap<AccountId, Referrer>,
+    /// Pools with the referral fees of a referrer, made the first time it asks for a route
+    referrer_graphs: Mutex<HashMap<AccountId, Arc<Graph<Pool>>>>,
+}
+
+impl Pools {
+    /// Pools as `referrer` swaps through them, with its referral fees
+    fn graph_for(&self, referrer: &AccountId) -> Arc<Graph<Pool>> {
+        let Some(settings) = self.referrers.get(referrer) else {
+            return self.graph.clone();
+        };
+        self.referrer_graphs
+            .lock()
+            .unwrap()
+            .entry(referrer.clone())
+            .or_insert_with(|| Arc::new(self.graph.map_pools(|pool| pool.with_referrer(settings))))
+            .clone()
+    }
 }
 
 /// Everything a pools snapshot is built from, as returned by RPC at one block
@@ -434,12 +591,14 @@ pub struct Pools {
 struct PoolsSource {
     block_height: BlockHeight,
     pools: Vec<PoolData>,
+    referrers: HashMap<AccountId, Referrer>,
 }
 
 fn build_pools(source: PoolsSource) -> Pools {
     let PoolsSource {
         block_height,
         pools,
+        referrers,
     } = source;
     let pools = pools
         .into_iter()
@@ -449,7 +608,9 @@ fn build_pools(source: PoolsSource) -> Pools {
     Pools {
         block_height,
         updated_at: Instant::now(),
-        graph: Graph::new(pools),
+        graph: Arc::new(Graph::new(pools)),
+        referrers,
+        referrer_graphs: Mutex::default(),
     }
 }
 
@@ -653,6 +814,8 @@ pub struct Request {
     pub slippage: BigDecimal,
     pub near_price_raw: BigDecimal,
     pub quoted_token_price_raw: BigDecimal,
+    /// The swap's referrer: its referral fee, if it charges one, is taken out of every pool
+    pub referrer: AccountId,
 }
 
 pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
@@ -665,7 +828,7 @@ pub fn find_path_in(
     request: &Request,
 ) -> Result<SplitRouteApiResponse, anyhow::Error> {
     let slippage_bp = crate::slippage_bp(&request.slippage)?;
-    let graph = &pools.graph;
+    let graph = &*pools.graph_for(&request.referrer);
     let (Some(token_in), Some(token_out)) = (
         graph.token_index(&request.token_in),
         graph.token_index(&request.token_out),
@@ -704,4 +867,252 @@ pub fn find_path_in(
         ),
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::Pool as _;
+
+    const POOL_FEE: FeeFraction = 3_000; // 0.3%
+    const PROTOCOL_FEE: FeeFraction = 1_000; // 0.1%
+    const REFERRAL_FEE: FeeFraction = 10_000; // 1%
+    const REFERRAL_FEE_REDUCED: FeeFraction = 500; // 0.05%
+
+    fn nep141(account_id: &str) -> AssetId {
+        AssetId::Nep141(account_id.parse().unwrap())
+    }
+
+    fn fees() -> CurrentFees {
+        CurrentFees {
+            receivers: vec![
+                (FeeReceiver::Pool, POOL_FEE),
+                (
+                    FeeReceiver::Account("plach.intear.near".parse().unwrap()),
+                    PROTOCOL_FEE,
+                ),
+            ],
+        }
+    }
+
+    fn asset(asset_id: AssetId, balance: Balance) -> AssetWithBalance {
+        AssetWithBalance {
+            asset_id,
+            balance: U128(balance),
+        }
+    }
+
+    fn public_pool(token0: AssetId, token1: AssetId) -> Pool {
+        Pool::new(
+            0,
+            PoolData::Public {
+                assets: (
+                    asset(token0, 10u128.pow(24)),
+                    asset(token1, 2 * 10u128.pow(24)),
+                ),
+                fees: fees(),
+                fee_configuration: FeeConfiguration::V1(fees()),
+                total_shares: None,
+            },
+        )
+    }
+
+    fn launch_pool(launched: AssetId) -> Pool {
+        launch_pool_with_phantom_liquidity(launched, 0)
+    }
+
+    fn launch_pool_with_phantom_liquidity(launched: AssetId, phantom_liquidity: Balance) -> Pool {
+        Pool::new(
+            0,
+            PoolData::Launch {
+                near_amount: U128(10u128.pow(24)),
+                launched_asset: asset(launched, 2 * 10u128.pow(24)),
+                fees: fees(),
+                fee_configuration: FeeConfiguration::V1(fees()),
+                phantom_liquidity_near: U128(phantom_liquidity),
+            },
+        )
+    }
+
+    fn referrer(fee_assets: &[AssetId]) -> Referrer {
+        Referrer {
+            fee_fraction: REFERRAL_FEE,
+            fee_fraction_reduced: REFERRAL_FEE_REDUCED,
+            fee_assets: fee_assets.iter().cloned().collect(),
+        }
+    }
+
+    /// What the contract's x*y=k swap gives for `amount_in` after taking each fee, rounded down
+    fn contract_exact_in(
+        pool: &Pool,
+        token_in: usize,
+        amount_in: u128,
+        fees: &[FeeFraction],
+    ) -> u128 {
+        let taken: u128 = fees
+            .iter()
+            .map(|&fee| amount_in * fee as u128 / MAX_FEE_FRACTION as u128)
+            .sum();
+        let after_fees = amount_in - taken;
+        let (in_balance, out_balance) = (pool.reserves[token_in], pool.reserves[1 - token_in]);
+        u256_to_u128(
+            u128_to_u256(after_fees) * u128_to_u256(out_balance)
+                / (u128_to_u256(in_balance) + u128_to_u256(after_fees)),
+        )
+    }
+
+    #[test]
+    fn referral_fee_is_taken_from_the_input_it_collects_in() {
+        let pool = public_pool(nep141("a.near"), nep141("b.near"));
+        let referred = pool.with_referrer(&referrer(&[nep141("a.near")]));
+        assert_eq!(referred.referral_fees, [REFERRAL_FEE, 0]);
+
+        let amount = 10u128.pow(22);
+        assert_eq!(
+            referred.quote_exact_in(0, 1, amount),
+            Some(contract_exact_in(
+                &pool,
+                0,
+                amount,
+                &[POOL_FEE, PROTOCOL_FEE, REFERRAL_FEE]
+            ))
+        );
+        // b.near isn't an asset the referrer collects fees in, so swaps putting it in don't pay one
+        assert_eq!(
+            referred.quote_exact_in(1, 0, amount),
+            pool.quote_exact_in(1, 0, amount)
+        );
+        assert!(referred.quote_exact_in(0, 1, amount) < pool.quote_exact_in(0, 1, amount));
+    }
+
+    #[test]
+    fn referral_fee_is_reduced_between_stable_assets() {
+        let usdt = nep141("usdt.tether-token.near");
+        let usdc = nep141("17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
+        let pool = public_pool(usdt.clone(), usdc.clone()).with_referrer(&referrer(&[usdt, usdc]));
+        assert_eq!(
+            pool.referral_fees,
+            [REFERRAL_FEE_REDUCED, REFERRAL_FEE_REDUCED]
+        );
+    }
+
+    #[test]
+    fn launch_pools_take_referral_fees_in_their_quote_token() {
+        let launched = nep141("meme.near");
+        let pool = launch_pool(launched.clone());
+        // Buying puts the quote token in, selling converts the fee to it, so only it counts
+        assert_eq!(
+            pool.with_referrer(&referrer(&[AssetId::Near]))
+                .referral_fees,
+            [REFERRAL_FEE, REFERRAL_FEE]
+        );
+        assert_eq!(
+            pool.with_referrer(&referrer(&[launched])).referral_fees,
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn exact_out_with_a_referral_fee_pays_enough_for_the_output() {
+        let pool = public_pool(nep141("a.near"), nep141("b.near"))
+            .with_referrer(&referrer(&[nep141("a.near")]));
+        let amount_out = 10u128.pow(22);
+        let amount_in = pool.quote_exact_out(0, 1, amount_out).unwrap();
+        let without_referral = public_pool(nep141("a.near"), nep141("b.near"))
+            .quote_exact_out(0, 1, amount_out)
+            .unwrap();
+        assert!(amount_in > without_referral);
+        assert!(pool.quote_exact_in(0, 1, amount_in).unwrap() >= amount_out);
+        assert!(pool.quote_exact_in(0, 1, amount_in - 2).unwrap() < amount_out);
+    }
+
+    /// `a * b / (c + d)`, rounded down, like the contract's `mul_div_sum`
+    fn mul_div_sum(a: u128, b: u128, c: u128, d: u128) -> u128 {
+        u256_to_u128(u128_to_u256(a) * u128_to_u256(b) / (u128_to_u256(c) + u128_to_u256(d)))
+    }
+
+    #[test]
+    fn pool_fee_stays_in_the_pool() {
+        let mut pool = public_pool(nep141("a.near"), nep141("b.near"));
+        let [in_before, out_before] = pool.reserves;
+        let amount_in = 10u128.pow(22);
+        let amount_out = pool.swap_exact_in(0, 1, amount_in).unwrap();
+        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / MAX_FEE_FRACTION as u128;
+        assert_eq!(
+            pool.reserves,
+            [
+                in_before + amount_in - protocol_fee,
+                out_before - amount_out
+            ]
+        );
+
+        let mut pool = public_pool(nep141("a.near"), nep141("b.near"));
+        let amount_in = pool.swap_exact_out(0, 1, amount_out).unwrap();
+        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / MAX_FEE_FRACTION as u128;
+        assert_eq!(
+            pool.reserves,
+            [
+                in_before + amount_in - protocol_fee,
+                out_before - amount_out
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_pools_convert_fees_when_selling_into_their_quote_token() {
+        let launched = nep141("meme.near");
+        let mut pool = launch_pool(launched).with_referrer(&referrer(&[AssetId::Near]));
+        let [mut near, mut tokens] = pool.reserves;
+        let amount_in = 10u128.pow(22);
+        let fee = |fraction: FeeFraction| amount_in * fraction as u128 / MAX_FEE_FRACTION as u128;
+        let after_fees = amount_in - fee(POOL_FEE) - fee(PROTOCOL_FEE) - fee(REFERRAL_FEE);
+        let amount_out = mul_div_sum(after_fees, near, tokens, after_fees);
+        tokens += after_fees + fee(POOL_FEE);
+        near -= amount_out;
+        // The protocol fee, then the referral fee, each swapped to NEAR on the moved reserves
+        for fraction in [PROTOCOL_FEE, REFERRAL_FEE] {
+            near -= mul_div_sum(fee(fraction), near, tokens, fee(fraction));
+            tokens += fee(fraction);
+        }
+
+        assert_eq!(pool.swap_exact_in(1, 0, amount_in), Some(amount_out));
+        assert_eq!(pool.reserves, [near, tokens]);
+    }
+
+    #[test]
+    fn launch_pools_keep_phantom_liquidity_after_converting_fees() {
+        let phantom_liquidity = 10u128.pow(23);
+        let pool = launch_pool_with_phantom_liquidity(nep141("meme.near"), phantom_liquidity);
+        // Leaves 1 more than the phantom liquidity, but converting the fees takes more than that
+        let amount_out = pool.reserves[0] - phantom_liquidity - 1;
+        assert_eq!(pool.quote_exact_out(1, 0, amount_out), None);
+        assert!(pool.quote_exact_out(1, 0, amount_out / 2).is_some());
+        // Buying doesn't convert fees, and only grows NEAR
+        assert!(pool.quote_exact_in(0, 1, 10u128.pow(24)).is_some());
+    }
+
+    #[test]
+    fn each_referrer_gets_its_own_graph_once() {
+        let referrer_id: AccountId = "ref.near".parse().unwrap();
+        let pools = build_pools(PoolsSource {
+            block_height: 1,
+            pools: vec![PoolData::Public {
+                assets: (
+                    asset(nep141("a.near"), 10u128.pow(24)),
+                    asset(nep141("b.near"), 10u128.pow(24)),
+                ),
+                fees: fees(),
+                fee_configuration: FeeConfiguration::V1(fees()),
+                total_shares: None,
+            }],
+            referrers: HashMap::from([(referrer_id.clone(), referrer(&[nep141("a.near")]))]),
+        });
+        let without_settings = pools.graph_for(&"other.near".parse().unwrap());
+        assert!(Arc::ptr_eq(&without_settings, &pools.graph));
+        let referred = pools.graph_for(&referrer_id);
+        assert!(!Arc::ptr_eq(&referred, &pools.graph));
+        assert!(Arc::ptr_eq(&referred, &pools.graph_for(&referrer_id)));
+        assert_eq!(referred.pools()[0].referral_fees, [REFERRAL_FEE, 0]);
+        assert_eq!(pools.graph.pools()[0].referral_fees, [0, 0]);
+    }
 }
