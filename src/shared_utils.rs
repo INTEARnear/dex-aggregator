@@ -604,18 +604,6 @@ pub async fn create_nep141_storage_deposit_action(
     }
 }
 
-pub fn create_storage_withdraw_action(amount: NearToken) -> Action {
-    Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "storage_withdraw".to_string(),
-        args: serde_json::to_vec(&serde_json::json!({
-            "amount": amount,
-        }))
-        .unwrap(),
-        gas: Gas(NearGas::from_tgas(10)),
-        deposit: NearToken::from_yoctonear(1),
-    }))
-}
-
 pub fn create_storage_deposit_action_for_contract(
     amount: NearToken,
     registration_only: bool,
@@ -1282,49 +1270,20 @@ pub fn estimated_gas_usage(execution_instructions: &[ExecutionInstruction]) -> N
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
 }
 
-/// NEAR the execution instructions attach to storage deposits, and what they withdraw from storage
-/// deposits
-fn storage_deposits_and_withdrawals(
-    execution_instructions: &[ExecutionInstruction],
-) -> (NearToken, NearToken) {
-    let calls = execution_instructions
+/// NEAR the execution instructions attach to storage deposits
+pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> NearToken {
+    execution_instructions
         .iter()
         .flat_map(|instruction| match instruction {
             ExecutionInstruction::NearTransaction { actions, .. } => actions,
         })
         .filter_map(|action| match action {
-            Action::FunctionCall(call) => Some(call),
-            _ => None,
-        });
-    let (mut deposited, mut withdrawn) =
-        (NearToken::from_yoctonear(0), NearToken::from_yoctonear(0));
-    for call in calls {
-        match call.method_name.as_str() {
-            "storage_deposit" => deposited = deposited.saturating_add(call.deposit),
-            "storage_withdraw" => {
-                let args: serde_json::Value = serde_json::from_slice(&call.args)
-                    .expect("storage_withdraw arguments are created as JSON");
-                let amount = serde_json::from_value::<NearToken>(args["amount"].clone())
-                    .expect("storage_withdraw is created with an amount");
-                withdrawn = withdrawn.saturating_add(amount);
+            Action::FunctionCall(call) if call.method_name == "storage_deposit" => {
+                Some(call.deposit)
             }
-            _ => {}
-        }
-    }
-    (deposited, withdrawn)
-}
-
-pub fn storage_deposits_net(execution_instructions: &[ExecutionInstruction]) -> NearToken {
-    let (deposited, withdrawn) = storage_deposits_and_withdrawals(execution_instructions);
-    deposited.saturating_sub(withdrawn)
-}
-
-/// NEAR the execution instructions attach to storage deposits, also what they withdraw right after.
-/// The trader's wallet needs to have it even though it's refunded right after.
-pub fn storage_deposits_max_at_any_point(
-    execution_instructions: &[ExecutionInstruction],
-) -> NearToken {
-    storage_deposits_and_withdrawals(execution_instructions).0
+            _ => None,
+        })
+        .fold(NearToken::from_yoctonear(0), NearToken::saturating_add)
 }
 
 /// Current USD price of a raw unit of `token_id` (a yoctoNEAR for NEAR), `None` if it has no price

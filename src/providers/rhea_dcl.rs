@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, create_storage_withdraw_action, deposit_storage_if_needed,
+        convert_to_nep141, deposit_storage_if_needed,
         deposit_storage_on_contract_if_needed, get_slippage, price_raw, swap_call_gas, Mainnet,
         NetworkView,
     },
@@ -23,8 +23,6 @@ const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 const RESERVED_GAS: NearGas = NearGas::from_tgas(62);
 /// The contract takes no less storage deposit than this
 const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(500);
-/// Rhea DCL doesn't let you deposit 0.1 NEAR, but it lets you withdraw 0.4 after depositing 0.5
-const STORAGE_WITHDRAWN: NearToken = NearToken::from_millinear(400);
 
 trait RheaDclQuotes: Send + Sync {
     fn find_path(
@@ -171,17 +169,13 @@ async fn route(
     } else {
         TokenId::Nep141(token_out)
     };
-    let mut storage_deposit = deposit_storage_on_contract_if_needed(
+    let storage_deposit = deposit_storage_on_contract_if_needed(
         network,
         &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
         request.trader_account_id.clone(),
         STORAGE_DEPOSIT,
     )
     .await;
-    if let [ExecutionInstruction::NearTransaction { actions, .. }] = storage_deposit.as_mut_slice()
-    {
-        actions.push(create_storage_withdraw_action(STORAGE_WITHDRAWN));
-    }
     let transactions = [
         storage_deposit,
         deposit_storage_if_needed(network, &token_output, request.trader_account_id.clone()).await,
@@ -315,13 +309,10 @@ mod tests {
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![
-                            create_storage_deposit_action_for_contract(
-                                NearToken::from_millinear(500),
-                                true
-                            ),
-                            create_storage_withdraw_action(NearToken::from_millinear(400)),
-                        ],
+                        actions: vec![create_storage_deposit_action_for_contract(
+                            NearToken::from_millinear(500),
+                            true
+                        )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -400,13 +391,10 @@ mod tests {
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![
-                            create_storage_deposit_action_for_contract(
-                                NearToken::from_millinear(500),
-                                true
-                            ),
-                            create_storage_withdraw_action(NearToken::from_millinear(400)),
-                        ],
+                        actions: vec![create_storage_deposit_action_for_contract(
+                            NearToken::from_millinear(500),
+                            true
+                        )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -474,13 +462,10 @@ mod tests {
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![
-                            create_storage_deposit_action_for_contract(
-                                NearToken::from_millinear(500),
-                                true
-                            ),
-                            create_storage_withdraw_action(NearToken::from_millinear(400)),
-                        ],
+                        actions: vec![create_storage_deposit_action_for_contract(
+                            NearToken::from_millinear(500),
+                            true
+                        )],
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),

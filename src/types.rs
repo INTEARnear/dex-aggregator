@@ -231,8 +231,8 @@ pub struct Quote {
     /// NEAR the execution instructions attach to storage deposits, usually only needed for the
     /// first swap of a token.
     pub storage_deposits: NearToken,
-    /// NEAR the execution instructions attach to storage deposits, without what they withdraw right
-    /// after. The trader's wallet needs to have it, Rhea DCL takes 0.5 NEAR and gives 0.4 NEAR back.
+    /// Same as `storage_deposits`, since no route withdraws storage deposits anymore. Kept so
+    /// integrations that read it don't break.
     pub max_storage_deposits: NearToken,
 }
 

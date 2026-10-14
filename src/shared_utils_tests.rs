@@ -1714,14 +1714,14 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
 }
 
 #[test]
-fn storage_deposits_subtract_withdrawals() {
+fn storage_deposits_add_up_every_deposit() {
     let execution_instructions = vec![
         ExecutionInstruction::NearTransaction {
             receiver_id: account("dclv2.ref-labs.near"),
-            actions: vec![
-                create_storage_deposit_action_for_contract(NearToken::from_millinear(500), true),
-                create_storage_withdraw_action(NearToken::from_millinear(400)),
-            ],
+            actions: vec![create_storage_deposit_action_for_contract(
+                NearToken::from_millinear(500),
+                true,
+            )],
         },
         ExecutionInstruction::NearTransaction {
             receiver_id: account("ft"),
@@ -1732,27 +1732,8 @@ fn storage_deposits_subtract_withdrawals() {
         },
     ];
     assert_eq!(
-        storage_deposits_net(&execution_instructions),
-        NearToken::from_micronear(101_250)
-    );
-}
-
-#[test]
-fn max_storage_deposits_keep_withdrawals() {
-    let execution_instructions = vec![ExecutionInstruction::NearTransaction {
-        receiver_id: account("dclv2.ref-labs.near"),
-        actions: vec![
-            create_storage_deposit_action_for_contract(NearToken::from_millinear(500), true),
-            create_storage_withdraw_action(NearToken::from_millinear(400)),
-        ],
-    }];
-    assert_eq!(
-        storage_deposits_max_at_any_point(&execution_instructions),
-        NearToken::from_millinear(500)
-    );
-    assert_eq!(
-        storage_deposits_net(&execution_instructions),
-        NearToken::from_millinear(100)
+        storage_deposits(&execution_instructions),
+        NearToken::from_micronear(501_250)
     );
 }
 

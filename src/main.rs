@@ -27,7 +27,7 @@ use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
         convert_to, estimated_gas_usage, max_gas_cost, optimize_execution_instructions, price_raw,
-        storage_deposits_max_at_any_point, storage_deposits_net, Mainnet,
+        storage_deposits, Mainnet,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{Amount, DexId, Quote, Route, Slippage, SwapRequest, TokenId},
@@ -257,8 +257,8 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         .map(|route| Quote {
             estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
             estimated_gas_usage: estimated_gas_usage(&route.execution_instructions),
-            storage_deposits: storage_deposits_net(&route.execution_instructions),
-            max_storage_deposits: storage_deposits_max_at_any_point(&route.execution_instructions),
+            storage_deposits: storage_deposits(&route.execution_instructions),
+            max_storage_deposits: storage_deposits(&route.execution_instructions),
             route,
         })
         .collect::<Vec<_>>();
