@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
-rhea-dcl-math = { path = "../rhea-dcl-math" }
 pool-indexer = { path = "../pool-indexer" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }

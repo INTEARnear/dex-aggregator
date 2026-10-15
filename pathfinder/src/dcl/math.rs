@@ -1,25 +1,11 @@
-// Port of iZiSwap-core's discretized-liquidity math (GPL-2.0-or-later), with the behavior of the
-// deployed dclv2.ref-labs.near binary where the two differ. `file.rs:line` point at its sources.
-
 use lazy_static::lazy_static;
 use near_min_api::types::Balance;
-use uint::construct_uint;
-
-construct_uint! {
-    /// Wide enough for every intermediate product. Values the contract keeps in U256 are
-    /// range-checked, so a product of two of them never overflows.
-    pub struct U512(8);
-}
-
-construct_uint! {
-    struct U256(4);
-}
+use ruint::aliases::{U256, U512};
 
 pub const LEFT_MOST_POINT: i32 = -800_000;
 pub const RIGHT_MOST_POINT: i32 = 800_000;
 
-pub const POW96: U512 = U512([0, 1 << 32, 0, 0, 0, 0, 0, 0]);
-const U256_MAX: U512 = U512([u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, 0, 0, 0]);
+pub const POW96: U256 = U256::from_limbs([0, 1 << 32, 0, 0]);
 
 /// sqrt(1.0001^(2^i)) * 2^128 for i in 1..=19, `LogPowMath.getSqrtPrice`
 const SQRT_PRICE_FACTORS: [u128; 19] = [
@@ -45,9 +31,9 @@ const SQRT_PRICE_FACTORS: [u128; 19] = [
 ];
 
 lazy_static! {
-    pub static ref SQRT_RATE_96: U512 = get_sqrt_price(1).unwrap();
-    static ref MIN_SQRT_PRICE: U512 = get_sqrt_price(LEFT_MOST_POINT).unwrap();
-    static ref MAX_SQRT_PRICE: U512 = get_sqrt_price(RIGHT_MOST_POINT).unwrap();
+    pub static ref SQRT_RATE_96: U256 = get_sqrt_price(1).unwrap();
+    static ref MIN_SQRT_PRICE: U256 = get_sqrt_price(LEFT_MOST_POINT).unwrap();
+    static ref MAX_SQRT_PRICE: U256 = get_sqrt_price(RIGHT_MOST_POINT).unwrap();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,19 +60,9 @@ impl std::error::Error for SwapError {}
 
 pub type SwapResult<T> = Result<T, SwapError>;
 
-fn fits_u256(value: U512) -> SwapResult<U512> {
-    if value > U256_MAX {
-        return Err(SwapError::Panic("U256 overflow"));
-    }
-    Ok(value)
-}
-
 /// utils.rs:45: U256 -> u128 narrowing panics on overflow
-pub fn as_u128(value: U512) -> SwapResult<Balance> {
-    if value.0[2..].iter().any(|&word| word != 0) {
-        return Err(SwapError::Panic("u128 overflow"));
-    }
-    Ok(value.0[0] as u128 | (value.0[1] as u128) << 64)
+pub fn as_u128(value: U256) -> SwapResult<Balance> {
+    u128::try_from(&value).map_err(|_| SwapError::Panic("u128 overflow"))
 }
 
 pub fn checked_add(a: Balance, b: Balance) -> SwapResult<Balance> {
@@ -99,36 +75,42 @@ pub fn checked_sub(a: Balance, b: Balance) -> SwapResult<Balance> {
         .ok_or(SwapError::Panic("attempt to subtract with overflow"))
 }
 
-fn add(a: U512, b: U512) -> SwapResult<U512> {
-    fits_u256(a + b)
+fn add(a: U256, b: U256) -> SwapResult<U256> {
+    a.checked_add(b).ok_or(SwapError::Panic("U256 overflow"))
 }
 
-fn sub(a: U512, b: U512) -> SwapResult<U512> {
+fn sub(a: U256, b: U256) -> SwapResult<U256> {
     a.checked_sub(b).ok_or(SwapError::Panic("U256 underflow"))
 }
 
+fn narrow(value: U512) -> SwapResult<U256> {
+    U256::checked_from_limbs_slice(value.as_limbs()).ok_or(SwapError::Panic("U256 overflow"))
+}
+
 /// common_math.rs:29: exact floor(a * b / c)
-pub fn mul_div_floor(a: U512, b: U512, c: U512) -> SwapResult<U512> {
+pub fn mul_div_floor(a: U256, b: U256, c: U256) -> SwapResult<U256> {
     if c.is_zero() {
         return Err(SwapError::Panic("division by zero"));
     }
-    fits_u256(a * b / c)
+    let product: U512 = a.widening_mul(b);
+    narrow(product / U512::from(c))
 }
 
 /// common_math.rs:41: exact ceil(a * b / c)
-pub fn mul_div_ceil(a: U512, b: U512, c: U512) -> SwapResult<U512> {
+pub fn mul_div_ceil(a: U256, b: U256, c: U256) -> SwapResult<U256> {
     if c.is_zero() {
         return Err(SwapError::Panic("division by zero"));
     }
-    let (quotient, remainder) = (a * b).div_mod(c);
-    fits_u256(if remainder.is_zero() {
+    let product: U512 = a.widening_mul(b);
+    let (quotient, remainder) = product.div_rem(U512::from(c));
+    narrow(if remainder.is_zero() {
         quotient
     } else {
-        quotient + 1
+        quotient + U512::ONE
     })
 }
 
-fn mul_div(a: U512, b: U512, c: U512, round_up: bool) -> SwapResult<U512> {
+fn mul_div(a: U256, b: U256, c: U256, round_up: bool) -> SwapResult<U256> {
     if round_up {
         mul_div_ceil(a, b, c)
     } else {
@@ -137,16 +119,16 @@ fn mul_div(a: U512, b: U512, c: U512, round_up: bool) -> SwapResult<U512> {
 }
 
 /// common_math.rs:63 (`LogPowMath.getSqrtPrice`): sqrt(1.0001^point) * 2^96
-pub fn get_sqrt_price(point: i32) -> SwapResult<U512> {
+pub fn get_sqrt_price(point: i32) -> SwapResult<U256> {
     if !(LEFT_MOST_POINT..=RIGHT_MOST_POINT).contains(&point) {
         return Err(SwapError::Panic("E202: illegal point"));
     }
     let abs_point = point.unsigned_abs();
-    // The value stays below 2^129 and every factor is below 2^128, so U256 products never overflow
+    // The value stays below 2^129 and every factor is below 2^128, so products never overflow
     let mut value = if abs_point & 1 != 0 {
         U256::from(0xfffcb933bd6fad37aa2d162d1a594001u128)
     } else {
-        U256::one() << 128
+        U256::ONE << 128
     };
     for (bit, factor) in SQRT_PRICE_FACTORS.iter().enumerate() {
         if abs_point & (2 << bit) != 0 {
@@ -157,25 +139,16 @@ pub fn get_sqrt_price(point: i32) -> SwapResult<U512> {
         value = U256::MAX / value;
     }
     let mut sqrt_price = value >> 32;
-    if value.0[0] & 0xffff_ffff != 0 {
-        sqrt_price += U256::one();
+    if value.as_limbs()[0] & 0xffff_ffff != 0 {
+        sqrt_price += U256::ONE;
     }
-    Ok(U512([
-        sqrt_price.0[0],
-        sqrt_price.0[1],
-        sqrt_price.0[2],
-        sqrt_price.0[3],
-        0,
-        0,
-        0,
-        0,
-    ]))
+    Ok(sqrt_price)
 }
 
 /// common_math.rs:111 (`LogPowMath.getLogSqrtPriceFloor`): the greatest point whose sqrt price
 /// is <= `sqrt_price_96`. That's exactly what the log2-based original returns, so a binary
 /// search over `get_sqrt_price` gives the same result.
-pub fn get_log_sqrt_price_floor(sqrt_price_96: U512) -> SwapResult<i32> {
+pub fn get_log_sqrt_price_floor(sqrt_price_96: U256) -> SwapResult<i32> {
     if sqrt_price_96 < *MIN_SQRT_PRICE || sqrt_price_96 >= *MAX_SQRT_PRICE {
         return Err(SwapError::Panic("E201: invalid sqrt price"));
     }
@@ -193,7 +166,7 @@ pub fn get_log_sqrt_price_floor(sqrt_price_96: U512) -> SwapResult<i32> {
 }
 
 /// sqrt_price * sqrt(1.0001), as the contract steps one point to the right
-fn next_sqrt_price(sqrt_price: U512) -> SwapResult<U512> {
+fn next_sqrt_price(sqrt_price: U256) -> SwapResult<U256> {
     add(
         sqrt_price,
         mul_div_floor(sqrt_price, *SQRT_RATE_96 - POW96, POW96)?,
@@ -203,12 +176,12 @@ fn next_sqrt_price(sqrt_price: U512) -> SwapResult<U512> {
 /// `AmountMath.getAmountY`: token Y held by `liquidity` over the points [left, right)
 pub fn get_amount_y(
     liquidity: Balance,
-    sqrt_price_l: U512,
-    sqrt_price_r: U512,
+    sqrt_price_l: U256,
+    sqrt_price_r: U256,
     upper: bool,
-) -> SwapResult<U512> {
+) -> SwapResult<U256> {
     mul_div(
-        U512::from(liquidity),
+        U256::from(liquidity),
         sub(sqrt_price_r, sqrt_price_l)?,
         *SQRT_RATE_96 - POW96,
         upper,
@@ -222,13 +195,13 @@ pub fn get_amount_x(
     liquidity: Balance,
     left_point: i32,
     right_point: i32,
-    sqrt_price_r: U512,
+    sqrt_price_r: U256,
     upper: bool,
-) -> SwapResult<U512> {
+) -> SwapResult<U256> {
     let sqrt_price_pr_pl = get_sqrt_price(right_point - left_point)?;
     let sqrt_price_pr_m1 = mul_div_floor(sqrt_price_r, POW96, *SQRT_RATE_96)?;
     mul_div(
-        U512::from(liquidity),
+        U256::from(liquidity),
         sub(sqrt_price_pr_pl, POW96)?,
         sub(sqrt_price_r, sqrt_price_pr_m1)?,
         upper,
@@ -239,7 +212,7 @@ pub fn get_amount_x(
 #[derive(Debug, Clone, Copy)]
 pub struct CurrentState {
     pub point: i32,
-    pub sqrt_price: U512,
+    pub sqrt_price: U256,
     pub liquidity: Balance,
     pub liquidity_x: Balance,
 }
@@ -250,7 +223,7 @@ pub struct RangeRet<Cost, Acquire> {
     pub cost: Cost,
     pub acquire: Acquire,
     pub final_point: i32,
-    pub sqrt_final_price: U512,
+    pub sqrt_final_price: U256,
     pub liquidity_x: Balance,
 }
 
@@ -259,7 +232,7 @@ struct RangeComplete<Cost, Acquire> {
     acquire: Acquire,
     complete: bool,
     loc_point: i32,
-    sqrt_loc: U512,
+    sqrt_loc: U256,
 }
 
 impl<Cost, Acquire> RangeComplete<Cost, Acquire> {
@@ -269,11 +242,11 @@ impl<Cost, Acquire> RangeComplete<Cost, Acquire> {
             acquire,
             complete: true,
             loc_point: 0,
-            sqrt_loc: U512::zero(),
+            sqrt_loc: U256::ZERO,
         }
     }
 
-    fn partial(cost: Cost, acquire: Acquire, loc_point: i32, sqrt_loc: U512) -> Self {
+    fn partial(cost: Cost, acquire: Acquire, loc_point: i32, sqrt_loc: U256) -> Self {
         Self {
             cost,
             acquire,
@@ -290,13 +263,13 @@ impl<Cost, Acquire> RangeComplete<Cost, Acquire> {
 /// `SwapMathX2Y.x2YAtPrice`: fills a limit order selling `curr_y` at `sqrt_price`
 pub fn x2y_at_price(
     amount_x: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     curr_y: Balance,
 ) -> SwapResult<(Balance, Balance)> {
-    let l = mul_div_floor(U512::from(amount_x), sqrt_price, POW96)?;
+    let l = mul_div_floor(U256::from(amount_x), sqrt_price, POW96)?;
     // Narrowed before the min with the order size, so a huge amount panics even for a small order
     let acquire_y = as_u128(mul_div_floor(l, sqrt_price, POW96)?)?.min(curr_y);
-    let l = mul_div_ceil(U512::from(acquire_y), POW96, sqrt_price)?;
+    let l = mul_div_ceil(U256::from(acquire_y), POW96, sqrt_price)?;
     let cost_x = as_u128(mul_div_ceil(l, POW96, sqrt_price)?)?;
     Ok((cost_x, acquire_y))
 }
@@ -304,13 +277,13 @@ pub fn x2y_at_price(
 /// swap_math.rs:368 (`SwapMathX2Y.x2YAtPriceLiquidity`)
 fn x2y_at_price_liquidity(
     amount_x: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     liquidity: Balance,
     liquidity_x: Balance,
-) -> SwapResult<(Balance, U512, Balance)> {
+) -> SwapResult<(Balance, U256, Balance)> {
     let liquidity_y = checked_sub(liquidity, liquidity_x)?;
     let transform =
-        mul_div_floor(U512::from(amount_x), sqrt_price, POW96)?.min(U512::from(liquidity_y));
+        mul_div_floor(U256::from(amount_x), sqrt_price, POW96)?.min(U256::from(liquidity_y));
     let cost_x = as_u128(mul_div_ceil(transform, POW96, sqrt_price)?)?;
     let acquire_y = mul_div_floor(transform, sqrt_price, POW96)?;
     let new_liquidity_x = checked_add(liquidity_x, as_u128(transform)?)?;
@@ -323,12 +296,12 @@ fn x2y_at_price_liquidity(
 /// and an out-of-range location panics instead of being clamped.
 fn x2y_range_complete(
     liquidity: Balance,
-    sqrt_price_l: U512,
+    sqrt_price_l: U256,
     left_point: i32,
-    sqrt_price_r: U512,
+    sqrt_price_r: U256,
     right_point: i32,
     amount_x: Balance,
-) -> SwapResult<RangeComplete<Balance, U512>> {
+) -> SwapResult<RangeComplete<Balance, U256>> {
     let max_x = as_u128(get_amount_x(
         liquidity,
         left_point,
@@ -345,9 +318,9 @@ fn x2y_range_complete(
     let sqrt_price_pr_m1 = mul_div_ceil(sqrt_price_r, POW96, *SQRT_RATE_96)?;
     let sqrt_value = add(
         mul_div_floor(
-            U512::from(amount_x),
+            U256::from(amount_x),
             sub(sqrt_price_r, sqrt_price_pr_m1)?,
-            U512::from(liquidity),
+            U256::from(liquidity),
         )?,
         POW96,
     )?;
@@ -362,14 +335,14 @@ fn x2y_range_complete(
         let loc_point = loc_point - 1;
         return Ok(RangeComplete::partial(
             0,
-            U512::zero(),
+            U256::ZERO,
             loc_point,
             get_sqrt_price(loc_point)?,
         ));
     }
     let cost_x = as_u128(
         get_amount_x(liquidity, loc_point, right_point, sqrt_price_r, true)?
-            .min(U512::from(amount_x)),
+            .min(U256::from(amount_x)),
     )?;
     let loc_point = loc_point - 1;
     let sqrt_loc = get_sqrt_price(loc_point)?;
@@ -384,10 +357,10 @@ pub fn x2y_range(
     state: &CurrentState,
     left_point: i32,
     mut amount_x: Balance,
-) -> SwapResult<RangeRet<Balance, U512>> {
+) -> SwapResult<RangeRet<Balance, U256>> {
     let (mut point, mut sqrt_price) = (state.point, state.sqrt_price);
     let mut cost_x: Balance = 0;
-    let mut acquire_y = U512::zero();
+    let mut acquire_y = U256::ZERO;
     let mut liquidity_x = 0;
     let current_has_y = state.liquidity_x < state.liquidity;
     if current_has_y && (state.liquidity_x > 0 || left_point == point) {
@@ -462,12 +435,12 @@ pub fn x2y_range(
 /// `SwapMathY2X.y2XAtPrice`: fills a limit order selling `curr_x` at `sqrt_price`
 pub fn y2x_at_price(
     amount_y: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     curr_x: Balance,
 ) -> SwapResult<(Balance, Balance)> {
-    let l = mul_div_floor(U512::from(amount_y), POW96, sqrt_price)?;
-    let acquire_x = as_u128(mul_div_floor(l, POW96, sqrt_price)?.min(U512::from(curr_x)))?;
-    let l = mul_div_ceil(U512::from(acquire_x), sqrt_price, POW96)?;
+    let l = mul_div_floor(U256::from(amount_y), POW96, sqrt_price)?;
+    let acquire_x = as_u128(mul_div_floor(l, POW96, sqrt_price)?.min(U256::from(curr_x)))?;
+    let l = mul_div_ceil(U256::from(acquire_x), sqrt_price, POW96)?;
     let cost_y = as_u128(mul_div_ceil(l, sqrt_price, POW96)?)?;
     Ok((cost_y, acquire_x))
 }
@@ -475,11 +448,11 @@ pub fn y2x_at_price(
 /// `SwapMathY2X.y2XAtPriceLiquidity`
 fn y2x_at_price_liquidity(
     amount_y: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     liquidity_x: Balance,
-) -> SwapResult<(Balance, U512, Balance)> {
+) -> SwapResult<(Balance, U256, Balance)> {
     let transform =
-        mul_div_floor(U512::from(amount_y), POW96, sqrt_price)?.min(U512::from(liquidity_x));
+        mul_div_floor(U256::from(amount_y), POW96, sqrt_price)?.min(U256::from(liquidity_x));
     let cost_y = as_u128(mul_div_ceil(transform, sqrt_price, POW96)?)?;
     let acquire_x = mul_div_floor(transform, POW96, sqrt_price)?;
     let new_liquidity_x = checked_sub(liquidity_x, as_u128(transform)?)?;
@@ -490,14 +463,14 @@ fn y2x_at_price_liquidity(
 /// out-of-range location panics (E210/E211) instead of being clamped.
 fn y2x_range_complete(
     liquidity: Balance,
-    sqrt_price_l: U512,
+    sqrt_price_l: U256,
     left_point: i32,
-    sqrt_price_r: U512,
+    sqrt_price_r: U256,
     right_point: i32,
     amount_y: Balance,
-) -> SwapResult<RangeComplete<Balance, U512>> {
+) -> SwapResult<RangeComplete<Balance, U256>> {
     let max_y = get_amount_y(liquidity, sqrt_price_l, sqrt_price_r, true)?;
-    if max_y <= U512::from(amount_y) {
+    if max_y <= U256::from(amount_y) {
         return Ok(RangeComplete::complete(
             as_u128(max_y)?,
             get_amount_x(liquidity, left_point, right_point, sqrt_price_r, false)?,
@@ -505,9 +478,9 @@ fn y2x_range_complete(
     }
     let sqrt_loc = add(
         mul_div_floor(
-            U512::from(amount_y),
+            U256::from(amount_y),
             *SQRT_RATE_96 - POW96,
-            U512::from(liquidity),
+            U256::from(liquidity),
         )?,
         sqrt_price_l,
     )?;
@@ -520,10 +493,10 @@ fn y2x_range_complete(
     }
     let sqrt_loc = get_sqrt_price(loc_point)?;
     if loc_point == left_point {
-        return Ok(RangeComplete::partial(0, U512::zero(), loc_point, sqrt_loc));
+        return Ok(RangeComplete::partial(0, U256::ZERO, loc_point, sqrt_loc));
     }
     let cost_y =
-        as_u128(get_amount_y(liquidity, sqrt_price_l, sqrt_loc, true)?.min(U512::from(amount_y)))?;
+        as_u128(get_amount_y(liquidity, sqrt_price_l, sqrt_loc, true)?.min(U256::from(amount_y)))?;
     let acquire_x = get_amount_x(liquidity, left_point, loc_point, sqrt_loc, false)?;
     Ok(RangeComplete::partial(
         cost_y, acquire_x, loc_point, sqrt_loc,
@@ -535,10 +508,10 @@ pub fn y2x_range(
     state: &CurrentState,
     right_point: i32,
     mut amount_y: Balance,
-) -> SwapResult<RangeRet<Balance, U512>> {
+) -> SwapResult<RangeRet<Balance, U256>> {
     let (mut point, mut sqrt_price) = (state.point, state.sqrt_price);
     let mut cost_y: Balance = 0;
-    let mut acquire_x = U512::zero();
+    let mut acquire_x = U256::ZERO;
     if state.liquidity_x < state.liquidity {
         let (cost, acquire, new_liquidity_x) =
             y2x_at_price_liquidity(amount_y, sqrt_price, state.liquidity_x)?;
@@ -607,11 +580,11 @@ pub fn y2x_range(
 /// `SwapMathX2YDesire.x2YAtPrice`: fills a limit order selling `curr_y` at `sqrt_price`
 pub fn x2y_at_price_desire(
     desire_y: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     curr_y: Balance,
 ) -> SwapResult<(Balance, Balance)> {
     let acquire_y = desire_y.min(curr_y);
-    let l = mul_div_ceil(U512::from(acquire_y), POW96, sqrt_price)?;
+    let l = mul_div_ceil(U256::from(acquire_y), POW96, sqrt_price)?;
     let cost_x = as_u128(mul_div_ceil(l, POW96, sqrt_price)?)?;
     Ok((cost_x, acquire_y))
 }
@@ -619,13 +592,13 @@ pub fn x2y_at_price_desire(
 /// swap_math.rs:582 (`SwapMathX2YDesire.x2YAtPriceLiquidity`)
 fn x2y_at_price_liquidity_desire(
     desire_y: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     liquidity: Balance,
     liquidity_x: Balance,
-) -> SwapResult<(U512, Balance, Balance)> {
+) -> SwapResult<(U256, Balance, Balance)> {
     let liquidity_y = checked_sub(liquidity, liquidity_x)?;
     let transform =
-        mul_div_ceil(U512::from(desire_y), POW96, sqrt_price)?.min(U512::from(liquidity_y));
+        mul_div_ceil(U256::from(desire_y), POW96, sqrt_price)?.min(U256::from(liquidity_y));
     let cost_x = mul_div_ceil(transform, POW96, sqrt_price)?;
     let acquire_y = as_u128(mul_div_floor(transform, sqrt_price, POW96)?)?;
     let new_liquidity_x = checked_add(liquidity_x, as_u128(transform)?)?;
@@ -636,12 +609,12 @@ fn x2y_at_price_liquidity_desire(
 /// narrowing the whole-range max to u128.
 fn x2y_range_complete_desire(
     liquidity: Balance,
-    sqrt_price_l: U512,
+    sqrt_price_l: U256,
     left_point: i32,
-    sqrt_price_r: U512,
+    sqrt_price_r: U256,
     right_point: i32,
     desire_y: Balance,
-) -> SwapResult<RangeComplete<U512, Balance>> {
+) -> SwapResult<RangeComplete<U256, Balance>> {
     let max_y = as_u128(get_amount_y(liquidity, sqrt_price_l, sqrt_price_r, false)?)?;
     if max_y <= desire_y {
         return Ok(RangeComplete::complete(
@@ -652,9 +625,9 @@ fn x2y_range_complete_desire(
     let cl = sub(
         sqrt_price_r,
         mul_div_floor(
-            U512::from(desire_y),
+            U256::from(desire_y),
             *SQRT_RATE_96 - POW96,
-            U512::from(liquidity),
+            U256::from(liquidity),
         )?,
     )?;
     let loc_point = (get_log_sqrt_price_floor(cl)? + 1)
@@ -663,7 +636,7 @@ fn x2y_range_complete_desire(
     if loc_point == right_point {
         let loc_point = loc_point - 1;
         return Ok(RangeComplete::partial(
-            U512::zero(),
+            U256::ZERO,
             0,
             loc_point,
             get_sqrt_price(loc_point)?,
@@ -672,7 +645,7 @@ fn x2y_range_complete_desire(
     let sqrt_price_pr_mloc = get_sqrt_price(right_point - loc_point)?;
     let sqrt_price_pr_m1 = mul_div_ceil(sqrt_price_r, POW96, *SQRT_RATE_96)?;
     let cost_x = mul_div_ceil(
-        U512::from(liquidity),
+        U256::from(liquidity),
         sub(sqrt_price_pr_mloc, POW96)?,
         sub(sqrt_price_r, sqrt_price_pr_m1)?,
     )?;
@@ -695,9 +668,9 @@ pub fn x2y_range_desire(
     state: &CurrentState,
     left_point: i32,
     mut desire_y: Balance,
-) -> SwapResult<RangeRet<U512, Balance>> {
+) -> SwapResult<RangeRet<U256, Balance>> {
     let (mut point, mut sqrt_price) = (state.point, state.sqrt_price);
-    let mut cost_x = U512::zero();
+    let mut cost_x = U256::ZERO;
     let mut acquire_y: Balance = 0;
     let mut liquidity_x = 0;
     let current_has_y = state.liquidity_x < state.liquidity;
@@ -776,11 +749,11 @@ pub fn x2y_range_desire(
 /// `SwapMathY2XDesire.y2XAtPrice`: fills a limit order selling `curr_x` at `sqrt_price`
 pub fn y2x_at_price_desire(
     desire_x: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     curr_x: Balance,
 ) -> SwapResult<(Balance, Balance)> {
     let acquire_x = desire_x.min(curr_x);
-    let l = mul_div_ceil(U512::from(acquire_x), sqrt_price, POW96)?;
+    let l = mul_div_ceil(U256::from(acquire_x), sqrt_price, POW96)?;
     let cost_y = as_u128(mul_div_ceil(l, sqrt_price, POW96)?)?;
     Ok((cost_y, acquire_x))
 }
@@ -788,11 +761,11 @@ pub fn y2x_at_price_desire(
 /// swap_math.rs:605 (`SwapMathY2XDesire.y2XAtPriceLiquidity`)
 fn y2x_at_price_liquidity_desire(
     desire_x: Balance,
-    sqrt_price: U512,
+    sqrt_price: U256,
     liquidity_x: Balance,
-) -> SwapResult<(U512, Balance, Balance)> {
+) -> SwapResult<(U256, Balance, Balance)> {
     let transform =
-        mul_div_ceil(U512::from(desire_x), sqrt_price, POW96)?.min(U512::from(liquidity_x));
+        mul_div_ceil(U256::from(desire_x), sqrt_price, POW96)?.min(U256::from(liquidity_x));
     let cost_y = mul_div_ceil(transform, sqrt_price, POW96)?;
     let acquire_x = as_u128(mul_div_floor(transform, POW96, sqrt_price)?)?;
     let new_liquidity_x = checked_sub(liquidity_x, as_u128(transform)?)?;
@@ -803,12 +776,12 @@ fn y2x_at_price_liquidity_desire(
 /// narrowing the whole-range max to u128.
 fn y2x_range_complete_desire(
     liquidity: Balance,
-    sqrt_price_l: U512,
+    sqrt_price_l: U256,
     left_point: i32,
-    sqrt_price_r: U512,
+    sqrt_price_r: U256,
     right_point: i32,
     desire_x: Balance,
-) -> SwapResult<RangeComplete<U512, Balance>> {
+) -> SwapResult<RangeComplete<U256, Balance>> {
     let max_x = as_u128(get_amount_x(
         liquidity,
         left_point,
@@ -827,9 +800,9 @@ fn y2x_range_complete_desire(
     let div = sub(
         sqrt_price_pr_pl,
         mul_div_floor(
-            U512::from(desire_x),
+            U256::from(desire_x),
             sub(sqrt_price_r, sqrt_price_pr_m1)?,
-            U512::from(liquidity),
+            U256::from(liquidity),
         )?,
     )?;
     let loc_point = get_log_sqrt_price_floor(mul_div_floor(sqrt_price_r, POW96, div)?)?
@@ -837,7 +810,7 @@ fn y2x_range_complete_desire(
         .min(right_point - 1);
     let sqrt_loc = get_sqrt_price(loc_point)?;
     if loc_point == left_point {
-        return Ok(RangeComplete::partial(U512::zero(), 0, loc_point, sqrt_loc));
+        return Ok(RangeComplete::partial(U256::ZERO, 0, loc_point, sqrt_loc));
     }
     let acquire_x = as_u128(get_amount_x(
         liquidity, left_point, loc_point, sqrt_loc, false,
@@ -854,9 +827,9 @@ pub fn y2x_range_desire(
     state: &CurrentState,
     right_point: i32,
     mut desire_x: Balance,
-) -> SwapResult<RangeRet<U512, Balance>> {
+) -> SwapResult<RangeRet<U256, Balance>> {
     let (mut point, mut sqrt_price) = (state.point, state.sqrt_price);
-    let mut cost_y = U512::zero();
+    let mut cost_y = U256::ZERO;
     let mut acquire_x: Balance = 0;
     if state.liquidity_x < state.liquidity {
         let (cost, acquire, new_liquidity_x) =

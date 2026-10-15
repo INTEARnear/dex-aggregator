@@ -1,6 +1,3 @@
-//! Builds the pools source from raw v2.ref-finance.near storage, the same way `get_pools` and
-//! `get_pool_detail_infos` build it
-
 use std::collections::{BTreeMap, HashMap};
 
 use borsh::BorshDeserialize;

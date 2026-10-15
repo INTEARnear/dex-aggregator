@@ -1,10 +1,11 @@
 use near_min_api::types::{AccountId, Balance};
+use ruint::aliases::U256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::math::{
-    CurrentState, LEFT_MOST_POINT, RIGHT_MOST_POINT, RangeRet, SwapError, SwapResult, U512,
-    as_u128, checked_add, checked_sub, get_sqrt_price, mul_div_ceil, mul_div_floor, x2y_at_price,
+use super::math::{
+    CurrentState, LEFT_MOST_POINT, RIGHT_MOST_POINT, RangeRet, SwapError, SwapResult, as_u128,
+    checked_add, checked_sub, get_sqrt_price, mul_div_ceil, mul_div_floor, x2y_at_price,
     x2y_at_price_desire, x2y_range, x2y_range_desire, y2x_at_price, y2x_at_price_desire, y2x_range,
     y2x_range_desire,
 };
@@ -284,9 +285,9 @@ impl Pool {
 
     fn amount_no_fee(&self, amount: Balance) -> SwapResult<Balance> {
         as_u128(mul_div_floor(
-            U512::from(amount),
-            U512::from(checked_sub(FEE_DENOMINATOR, self.data.fee as u128)?),
-            U512::from(FEE_DENOMINATOR),
+            U256::from(amount),
+            U256::from(checked_sub(FEE_DENOMINATOR, self.data.fee as u128)?),
+            U256::from(FEE_DENOMINATOR),
         )?)
     }
 
@@ -299,15 +300,15 @@ impl Pool {
         if cost >= amount_no_fee {
             checked_sub(amount, cost)
         } else {
-            self.exact_out_fee(U512::from(cost))
+            self.exact_out_fee(U256::from(cost))
         }
     }
 
-    fn exact_out_fee(&self, cost: U512) -> SwapResult<Balance> {
+    fn exact_out_fee(&self, cost: U256) -> SwapResult<Balance> {
         as_u128(mul_div_ceil(
             cost,
-            U512::from(self.data.fee),
-            U512::from(checked_sub(FEE_DENOMINATOR, self.data.fee as u128)?),
+            U256::from(self.data.fee),
+            U256::from(checked_sub(FEE_DENOMINATOR, self.data.fee as u128)?),
         )?)
     }
 
@@ -530,7 +531,7 @@ impl Pool {
                 let (selling_x, selling_y) = self.order(point);
                 let (cost, acquire) =
                     x2y_at_price_desire(desire, self.state.sqrt_price, selling_y)?;
-                let fee = self.exact_out_fee(U512::from(cost))?;
+                let fee = self.exact_out_fee(U256::from(cost))?;
                 self.charge_fee(true, fee)?;
                 paid = checked_add(paid, checked_add(cost, fee)?)?;
                 let finished = acquire >= desire;
@@ -593,7 +594,7 @@ impl Pool {
                 let (selling_x, selling_y) = self.order(point);
                 let (cost, acquire) =
                     y2x_at_price_desire(desire, self.state.sqrt_price, selling_x)?;
-                let fee = self.exact_out_fee(U512::from(cost))?;
+                let fee = self.exact_out_fee(U256::from(cost))?;
                 self.charge_fee(false, fee)?;
                 paid = checked_add(paid, checked_add(cost, fee)?)?;
                 let finished = acquire >= desire;

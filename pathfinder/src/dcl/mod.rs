@@ -1,5 +1,5 @@
-#![allow(clippy::manual_div_ceil)]
-
+mod math;
+mod pool;
 mod storage;
 
 pub use self::storage::watch;
@@ -8,6 +8,7 @@ use bigdecimal::BigDecimal;
 use lazy_static::lazy_static;
 use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
+use ruint::aliases::U256;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +19,8 @@ use pool_indexer::{AccountState, PoolIndexer};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use rhea_dcl_math::math::{SwapResult, U512, as_u128, mul_div_floor};
-use rhea_dcl_math::pool::{Pool, PoolInit, Work};
+use self::math::{SwapResult, as_u128, mul_div_floor};
+use self::pool::{Pool, PoolInit, Work};
 
 use crate::search::{self, Graph, MaxHops, PoolsDelta, QuoteAmount, Route, Settings};
 
@@ -308,9 +309,9 @@ const SETTINGS: Settings = Settings {
 
 fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     as_u128(mul_div_floor(
-        U512::from(amount),
-        U512::from(numerator),
-        U512::from(SLIPPAGE_DENOMINATOR),
+        U256::from(amount),
+        U256::from(numerator),
+        U256::from(SLIPPAGE_DENOMINATOR),
     )?)
 }
 

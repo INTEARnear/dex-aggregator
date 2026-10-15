@@ -37,4 +37,4 @@ near-sdk = { version = "5.29", default-features = false, features = ["non-contra
 overflow-checks = true
 
 [workspace]
-members = ["pathfinder", "rhea-dcl-math", "pool-indexer", "shadow-proxy"]
+members = ["pathfinder", "pool-indexer", "shadow-proxy"]

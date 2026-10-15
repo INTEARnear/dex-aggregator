@@ -8,11 +8,10 @@ Refer to https://docs.intear.tech/docs/dex-aggregator/ for integration instructi
 
 ## Architecture
 
-It's separated into 4 crates:
+It's separated into 3 crates:
 
 - `swap-router`: the main aggregator crate, hosts the API and builds transactions. Example URL: https://router.intear.tech/route?token_in=rhea-nep141:wrap.near&token_out=juij.launch.intear.near&amount_in=1000000000000000000000000&max_wait_ms=2000&slippage_type=Fixed&slippage=0.01&dexes=Rhea%2CAidols%2CWrap%2CRheaDcl%2CMetaPool%2CLinear%2CXRhea%2CRNear%2CPlach&trader_account_id=intear.near&signing_public_key=ed25519%3A4WZAP6JoruNHR2W4mi9fM219viZKYskqLRDYkwBHCUY8&referrer_id=intear.near
-- `pathfinder`: library that indexes the pools of Rhea, Intear Plach and Rhea DCL and finds the best route within one of them. `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block and keeps each DEX's pool snapshot up to date, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread.
-- `rhea-dcl-math`: Rhea DCL swap math used by `pathfinder`, ported from iZiSwap (GPL-2.0-or-later)
+- `pathfinder`: library that indexes the pools of Rhea, Intear Plach and Rhea DCL and finds the best route within one of them. Rhea DCL swap math in `pathfinder::dcl` is ported from iZiSwap (GPL-2.0-or-later). `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block and keeps each DEX's pool snapshot up to date, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread.
 - `pool-indexer`: keeps a copy of the contract storage that pools are built from=
 
 Routing is deterministic, so running `quote` again on the same block heights and queries gives identical output.

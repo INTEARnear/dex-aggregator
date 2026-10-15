@@ -1,13 +1,10 @@
-//! Builds pools from raw dclv2.ref-labs.near storage. The contract is not open source, so the
-//! layout was worked out by comparing storage with view methods at the same block.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, Balance};
 use pool_indexer::{AccountState, Watch};
-use rhea_dcl_math::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT};
 
+use super::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT};
 use super::{Metadata, PoolInfo, RHEA_DCL_CONTRACT_ID};
 
 const STATE_KEY: &[u8] = b"STATE";
