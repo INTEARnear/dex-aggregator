@@ -1435,6 +1435,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethnum"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
+
+[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,7 +2223,7 @@ dependencies = [
 [[package]]
 name = "intear-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=e00cba0e0738bb651d0a412d0a5e7973ff414d77#e00cba0e0738bb651d0a412d0a5e7973ff414d77"
+source = "git+https://github.com/INTEARnear/dex?rev=22daf3c561a4bc2d824e532a718b9229b44dcd7c#22daf3c561a4bc2d824e532a718b9229b44dcd7c"
 dependencies = [
  "near-sdk",
 ]
@@ -5463,8 +5469,9 @@ dependencies = [
 [[package]]
 name = "xyk-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=e00cba0e0738bb651d0a412d0a5e7973ff414d77#e00cba0e0738bb651d0a412d0a5e7973ff414d77"
+source = "git+https://github.com/INTEARnear/dex?rev=22daf3c561a4bc2d824e532a718b9229b44dcd7c#22daf3c561a4bc2d824e532a718b9229b44dcd7c"
 dependencies = [
+ "ethnum",
  "intear-dex-types",
  "near-sdk",
 ]

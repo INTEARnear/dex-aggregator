@@ -1,14 +1,15 @@
 mod storage;
 
+use self::storage::StoredPool;
 pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
-use borsh::BorshDeserialize;
 use lazy_static::lazy_static;
 use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU128;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,13 +17,20 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 pub use intear_dex_types::AssetId;
+use near_sdk::Timestamp;
 use pool_indexer::{AccountState, PoolIndexer};
-use xyk_dex_types::{FULL_SPLIT_FRACTION, SplitFraction};
+use xyk_dex_types::math::{
+    exact_in_amount_out, exact_out_amount_in, fee_converted_to_quote_asset, mul_div,
+};
+use xyk_dex_types::{
+    CurrentFees, FULL_SPLIT_FRACTION, FeeConfiguration, FeeReceiver, ReferralSettings,
+    SplitFraction, asset_account_ids,
+};
 
 use crate::search::{
     self, Graph, MaxHops, PoolsDelta, QuoteAmount, Settings, SplitRoute, split_exactly,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::{info, warn};
 
 #[derive(Serialize, Debug, Clone)]
@@ -89,76 +97,81 @@ pub struct ExactOutPoolStep {
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
+const BASIS_POINTS: NonZeroU128 = NonZeroU128::new(10_000).unwrap();
 
-type U256 = ruint::aliases::U256;
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pool {
     id: u32,
     reserves: [Balance; 2],
-    /// The referrer's fee on swaps that put in token 0 and token 1, on top of `info.fees`. 0
-    /// without a referrer, or for one that isn't charged on the swap.
-    referral_fees: [FeeFraction; 2],
+    /// Fees of swaps that put in token 0 and token 1: `info.fees`, and the referrer's fee last
+    /// when it's charged on the swap
+    fees: Arc<[CurrentFees; 2]>,
     /// What swaps don't change, shared so simulations clone pools without allocating
     info: Arc<PoolInfo>,
 }
 
-#[derive(Debug)]
 struct PoolInfo {
     tokens: [AssetId; 2],
+    /// Pool and protocol fees at the block time, without a referral fee
     fees: CurrentFees,
     /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom
     /// liquidity of the quote token.
     min_reserves: [Balance; 2],
     /// Which token a launch pool converts its fees to
     launch_quote_token: Option<usize>,
-    /// Whether both tokens are stable assets, which pay reduced protocol and referral fees.
-    /// `None` when the contract can't tell, for NEP-171 tokens, which makes it panic on swaps.
-    stable_pair: Option<bool>,
 }
 
 /// A referrer's fee on Plach swaps, as the xyk DEX charges it
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Referrer {
-    pub fee_fraction: FeeFraction,
-    /// Instead of `fee_fraction` on swaps between two stable assets
-    pub fee_fraction_reduced: FeeFraction,
+    pub settings: ReferralSettings,
     /// The assets the referrer collects fees in. A swap whose fee would be in another asset
     /// doesn't charge one.
     pub fee_assets: HashSet<AssetId>,
 }
 
 impl Pool {
-    fn new(id: u32, data: PoolData) -> Self {
+    /// `None` for a pool of NEP-171 assets, which the contract can't swap in
+    fn new(id: u32, data: StoredPool, timestamp: Timestamp) -> Option<Self> {
         let launch_quote_token = match &data {
-            PoolData::Launch { .. } | PoolData::LaunchV2 { .. } => Some(0),
-            PoolData::Private { .. } | PoolData::Public { .. } => None,
+            StoredPool::LaunchV1 { .. } | StoredPool::LaunchV2 { .. } => Some(0),
+            StoredPool::PrivateV1 { .. }
+            | StoredPool::PublicV1 { .. }
+            | StoredPool::PrivateV2 { .. }
+            | StoredPool::PublicV2 { .. } => None,
         };
-        let (tokens, reserves, fees, min_reserves) = match data {
-            PoolData::Private { assets, fees, .. } | PoolData::Public { assets, fees, .. } => (
+        let (tokens, reserves, fee_configuration, min_reserves) = match data {
+            StoredPool::PrivateV1 { assets, fees, .. }
+            | StoredPool::PublicV1 { assets, fees, .. } => (
+                [assets.0.asset_id, assets.1.asset_id],
+                [assets.0.balance.0, assets.1.balance.0],
+                FeeConfiguration::V1(fees),
+                [0, 0],
+            ),
+            StoredPool::PrivateV2 { assets, fees, .. }
+            | StoredPool::PublicV2 { assets, fees, .. } => (
                 [assets.0.asset_id, assets.1.asset_id],
                 [assets.0.balance.0, assets.1.balance.0],
                 fees,
                 [0, 0],
             ),
-            PoolData::Launch {
+            StoredPool::LaunchV1 {
                 near_amount,
                 launched_asset,
                 fees,
                 phantom_liquidity_near,
-                ..
             } => (
                 [AssetId::Near, launched_asset.asset_id],
                 [near_amount.0, launched_asset.balance.0],
                 fees,
                 [phantom_liquidity_near.0, 0],
             ),
-            PoolData::LaunchV2 {
+            StoredPool::LaunchV2 {
                 quote_asset,
                 launched_asset,
                 fees,
                 phantom_liquidity,
-                ..
             } => (
                 [quote_asset.asset_id, launched_asset.asset_id],
                 [quote_asset.balance.0, launched_asset.balance.0],
@@ -166,217 +179,61 @@ impl Pool {
                 [phantom_liquidity.0, 0],
             ),
         };
-        let stable_pair = storage::should_reduce_fee([&tokens[0], &tokens[1]]).ok();
-        Self {
+        if tokens
+            .iter()
+            .any(|token| matches!(token, AssetId::Nep171(..)))
+        {
+            return None;
+        }
+        let fees = fee_configuration
+            .with_protocol_fee(&asset_account_ids([&tokens[0], &tokens[1]]), timestamp);
+        Some(Self {
             id,
             reserves,
-            referral_fees: [0, 0],
+            fees: Arc::new([fees.clone(), fees.clone()]),
             info: Arc::new(PoolInfo {
                 tokens,
                 fees,
                 min_reserves,
                 launch_quote_token,
-                stable_pair,
             }),
-        }
+        })
     }
 
     /// The pool with the fee `referrer` is charged on each swap through it, as the xyk DEX's
     /// `with_referral_fee` adds it: the reduced fee between two stable assets, and only when the
     /// referrer collects fees in the asset they're paid in. That's the asset put in, but for a
     /// launch pool selling into its quote token, which converts fees to it.
-    fn with_referrer(&self, referrer: &Referrer) -> Self {
-        let Some(stable_pair) = self.info.stable_pair else {
-            return self.clone();
-        };
-        let fee_fraction = if stable_pair {
-            referrer.fee_fraction_reduced
-        } else {
-            referrer.fee_fraction
-        };
-        let referral_fees = [0, 1].map(|token_in| {
+    fn with_referrer(&self, referrer_id: &AccountId, referrer: &Referrer) -> Self {
+        let [token0, token1] = &self.info.tokens;
+        let fee_fraction = referrer
+            .settings
+            .fee_fraction(&asset_account_ids([token0, token1]));
+        let charged = [0, 1].map(|token_in| {
             let token_out = 1 - token_in;
             let fee_token = if self.info.launch_quote_token == Some(token_out) {
                 token_out
             } else {
                 token_in
             };
-            if referrer.fee_assets.contains(&self.info.tokens[fee_token]) {
-                fee_fraction
+            fee_fraction > 0 && referrer.fee_assets.contains(&self.info.tokens[fee_token])
+        });
+        if charged == [false, false] {
+            return self.clone();
+        }
+        let fees = charged.map(|charged| {
+            let fees = self.info.fees.clone();
+            if charged {
+                fees.with_referral_fee(referrer_id.clone(), fee_fraction)
             } else {
-                0
+                fees
             }
         });
         Self {
-            referral_fees,
+            fees: Arc::new(fees),
             ..self.clone()
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
-pub enum PoolData {
-    Private {
-        assets: (AssetWithBalance, AssetWithBalance),
-        fees: CurrentFees,
-        fee_configuration: FeeConfiguration,
-        owner_id: AccountId,
-        locked: bool,
-    },
-    Public {
-        assets: (AssetWithBalance, AssetWithBalance),
-        fees: CurrentFees,
-        fee_configuration: FeeConfiguration,
-        total_shares: Option<U128>,
-    },
-    Launch {
-        near_amount: U128,
-        launched_asset: AssetWithBalance,
-        fees: CurrentFees,
-        fee_configuration: FeeConfiguration,
-        phantom_liquidity_near: U128,
-    },
-    LaunchV2 {
-        quote_asset: AssetWithBalance,
-        launched_asset: AssetWithBalance,
-        fees: CurrentFees,
-        fee_configuration: FeeConfiguration,
-        phantom_liquidity: U128,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
-// #[serde(untagged)]
-pub enum FeeConfiguration {
-    V1(CurrentFees),
-    V2(V1FeeConfiguration),
-}
-
-#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
-pub struct V1FeeConfiguration {
-    receivers: Vec<(FeeReceiver, FeeAmount)>,
-}
-
-type Timestamp = u64;
-
-#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
-pub enum FeeAmount {
-    Fixed(FeeFraction),
-    Scheduled {
-        start: (Timestamp, FeeFraction),
-        end: (Timestamp, FeeFraction),
-        curve: ScheduledFeeCurve,
-    },
-    Dynamic {
-        min: FeeFraction,
-        max: FeeFraction,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize, BorshDeserialize, PartialEq, Clone)]
-pub enum ScheduledFeeCurve {
-    Linear,
-}
-
-impl FeeAmount {
-    pub fn get_fee_fraction(&self, current_timestamp: Timestamp) -> FeeFraction {
-        match self {
-            FeeAmount::Fixed(fee_fraction) => *fee_fraction,
-            FeeAmount::Scheduled { start, end, curve } => {
-                let (start_time, start_fee_fraction) = *start;
-                let (end_time, end_fee_fraction) = *end;
-                let Some(time_elapsed) = current_timestamp.checked_sub(start_time) else {
-                    return start_fee_fraction;
-                };
-                if current_timestamp >= end_time {
-                    return end_fee_fraction;
-                }
-
-                // Was checked in .validate() check
-                let total_duration = end_time.checked_sub(start_time).unwrap();
-                let fee_range = start_fee_fraction.checked_sub(end_fee_fraction).unwrap();
-
-                let fee_decrease = match curve {
-                    ScheduledFeeCurve::Linear => {
-                        #[allow(clippy::arithmetic_side_effects)]
-                        // Multiplying u128 by u128 can't overflow u256, and total_duration
-                        // is not 0 due to .validate() check
-                        FeeFraction::try_from(u256_to_u128(
-                            u128_to_u256(fee_range as u128) * u128_to_u256(time_elapsed as u128)
-                                / u128_to_u256(total_duration as u128),
-                        ))
-                        .expect("Fee decrease overflows u32")
-                    }
-                };
-
-                assert!(
-                    fee_decrease <= fee_range,
-                    "Fee decrease must be less than end and start fee difference"
-                );
-
-                start_fee_fraction
-                    .checked_sub(fee_decrease)
-                    .expect("Fee calculation underflow")
-            }
-            FeeAmount::Dynamic { min: _, max: _ } => {
-                unimplemented!("Dynamic fee configuration is not implemented yet");
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
-pub struct CurrentFees {
-    pub receivers: Vec<(FeeReceiver, FeeFraction)>,
-}
-
-#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
-pub enum FeeReceiver {
-    Account(AccountId),
-    Pool,
-}
-
-type FeeFraction = u32;
-
-const MAX_FEE_FRACTION: FeeFraction = 1_000_000;
-
-#[derive(Serialize, Deserialize, BorshDeserialize, Debug, PartialEq, Clone)]
-pub struct AssetWithBalance {
-    pub asset_id: AssetId,
-    pub balance: U128,
-}
-
-fn u128_to_u256(value: u128) -> U256 {
-    U256::from(value)
-}
-
-fn u256_to_u128(value: U256) -> u128 {
-    u128::try_from(value).expect("Value must be less than 128 bits")
-}
-
-/// Fractions of every fee receiver and whether the pool keeps it, the referrer's last as the
-/// contract adds it
-fn fee_fractions(
-    fees: &CurrentFees,
-    referral_fee: FeeFraction,
-) -> impl Iterator<Item = (bool, FeeFraction)> + '_ {
-    fees.receivers
-        .iter()
-        .map(|(receiver, fee)| (matches!(receiver, FeeReceiver::Pool), *fee))
-        .chain((referral_fee > 0).then_some((false, referral_fee)))
-}
-
-fn total_fee_fraction(fees: &CurrentFees, referral_fee: FeeFraction) -> u128 {
-    fee_fractions(fees, referral_fee)
-        .map(|(_, fee)| u128::from(fee))
-        .sum::<u128>()
-}
-
-fn fee_amount(amount_in: u128, fee_fraction: FeeFraction) -> u128 {
-    u256_to_u128(
-        u128_to_u256(amount_in) * u128_to_u256(fee_fraction as u128)
-            / u128_to_u256(MAX_FEE_FRACTION as u128),
-    )
 }
 
 struct CollectedFees {
@@ -390,7 +247,6 @@ struct Swap<'a> {
     in_balance: &'a mut Balance,
     out_balance: &'a mut Balance,
     fees: &'a CurrentFees,
-    referral_fee: FeeFraction,
     /// Swaps fail if they leave less than this of the output token
     min_out_balance: Balance,
     /// Whether it's a launch pool selling into its quote token, which converts the fees it
@@ -402,10 +258,9 @@ impl Swap<'_> {
     fn collect_fees(&self, amount_in: u128) -> CollectedFees {
         let mut total_fees = 0u128;
         let mut pool_fee = 0u128;
-        for (kept_by_pool, fee_fraction) in fee_fractions(self.fees, self.referral_fee) {
-            let fee_amount = fee_amount(amount_in, fee_fraction);
+        for (receiver, fee_amount) in self.fees.amounts(amount_in) {
             total_fees = total_fees.checked_add(fee_amount).expect("Overflow");
-            if kept_by_pool {
+            if matches!(receiver, FeeReceiver::Pool) {
                 pool_fee = pool_fee.checked_add(fee_amount).expect("Overflow");
             }
         }
@@ -427,17 +282,12 @@ impl Swap<'_> {
             .expect("Overflow");
         *self.out_balance = self.out_balance.checked_sub(amount_out).expect("Underflow");
         if self.converts_fees {
-            for (kept_by_pool, fee_fraction) in fee_fractions(self.fees, self.referral_fee) {
-                if kept_by_pool {
+            for (receiver, fee_amount) in self.fees.amounts(amount_in) {
+                if matches!(receiver, FeeReceiver::Pool) {
                     continue;
                 }
-                let fee_amount = fee_amount(amount_in, fee_fraction);
-                // in_balance is positive after the swap, u128 + u128 can't overflow u256
-                #[allow(clippy::arithmetic_side_effects)]
-                let fee_amount_out = u256_to_u128(
-                    u128_to_u256(fee_amount) * u128_to_u256(*self.out_balance)
-                        / (u128_to_u256(*self.in_balance) + u128_to_u256(fee_amount)),
-                );
+                let fee_amount_out =
+                    fee_converted_to_quote_asset(fee_amount, *self.in_balance, *self.out_balance);
                 *self.in_balance = self.in_balance.checked_add(fee_amount).expect("Overflow");
                 *self.out_balance = self
                     .out_balance
@@ -450,11 +300,24 @@ impl Swap<'_> {
 }
 
 impl Pool {
-    /// The swap putting in token 0 if `first_in`, else token 1. `None` for a pool the contract
-    /// can't swap in.
+    /// The swap putting in token 0 if `first_in`, else token 1. `None` for a swap the contract
+    /// fails: out of an empty pool, or with a community fee collected in another asset than NEAR.
     fn swap(&mut self, first_in: bool) -> Option<Swap<'_>> {
-        self.info.stable_pair?;
-        let token_out = if first_in { 1 } else { 0 };
+        let (token_in, token_out) = if first_in { (0, 1) } else { (1, 0) };
+        if self.reserves.contains(&0) {
+            return None;
+        }
+        let converts_fees = self.info.launch_quote_token == Some(token_out);
+        let fees = &self.fees[token_in];
+        let fee_token = if converts_fees { token_out } else { token_in };
+        if self.info.tokens[fee_token] != AssetId::Near
+            && fees
+                .receivers
+                .iter()
+                .any(|(receiver, _)| matches!(receiver, FeeReceiver::Community(_)))
+        {
+            return None;
+        }
         let [balance0, balance1] = &mut self.reserves;
         let (in_balance, out_balance) = if first_in {
             (balance0, balance1)
@@ -464,10 +327,9 @@ impl Pool {
         Some(Swap {
             in_balance,
             out_balance,
-            fees: &self.info.fees,
-            referral_fee: self.referral_fees[1 - token_out],
+            fees,
             min_out_balance: self.info.min_reserves[token_out],
-            converts_fees: self.info.launch_quote_token == Some(token_out),
+            converts_fees,
         })
     }
 
@@ -499,15 +361,11 @@ impl search::Pool for Pool {
     ) -> Option<Balance> {
         self.unless_panicked(|pool| {
             let swap = pool.swap(token_in == 0)?;
-            if *swap.in_balance == 0 {
-                return None;
-            }
             let fees = swap.collect_fees(amount_in);
-            // u128 * u128 or u128 + u128 can't overflow u256; in_balance was checked to be positive
-            #[allow(clippy::arithmetic_side_effects)]
-            let amount_out = u256_to_u128(
-                u128_to_u256(fees.amount_in_after_fees) * u128_to_u256(*swap.out_balance)
-                    / (u128_to_u256(*swap.in_balance) + u128_to_u256(fees.amount_in_after_fees)),
+            let amount_out = exact_in_amount_out(
+                fees.amount_in_after_fees,
+                *swap.in_balance,
+                *swap.out_balance,
             );
             swap.settle(amount_in, fees, amount_out)?;
             Some(amount_out)
@@ -529,27 +387,7 @@ impl search::Pool for Pool {
             if amount_out >= out_balance || out_balance - amount_out < swap.min_out_balance {
                 return None;
             }
-
-            #[allow(clippy::arithmetic_side_effects)]
-            let amount_in_without_fees = u256_to_u128(
-                (u128_to_u256(in_balance) * u128_to_u256(amount_out))
-                    / (u128_to_u256(out_balance) - u128_to_u256(amount_out)),
-            )
-            .checked_add(1)
-            .expect("Overflow");
-            let total_fee_fraction = total_fee_fraction(swap.fees, swap.referral_fee);
-            let fee_denominator = (MAX_FEE_FRACTION as u128)
-                .checked_sub(total_fee_fraction)
-                .expect("Fee fraction somehow above 100%");
-            let fee_denominator_minus_one = fee_denominator
-                .checked_sub(1)
-                .expect("Fee fraction somehow equals 100%");
-            #[allow(clippy::arithmetic_side_effects)]
-            let amount_in = u256_to_u128(
-                (u128_to_u256(amount_in_without_fees) * u128_to_u256(MAX_FEE_FRACTION as u128)
-                    + u128_to_u256(fee_denominator_minus_one))
-                    / u128_to_u256(fee_denominator),
-            );
+            let amount_in = exact_out_amount_in(amount_out, in_balance, out_balance, swap.fees);
             let fees = swap.collect_fees(amount_in);
             swap.settle(amount_in, fees, amount_out)?;
             Some(amount_in)
@@ -581,29 +419,36 @@ impl Pools {
             .lock()
             .unwrap()
             .entry(referrer.clone())
-            .or_insert_with(|| Arc::new(self.graph.map_pools(|pool| pool.with_referrer(settings))))
+            .or_insert_with(|| {
+                Arc::new(
+                    self.graph
+                        .map_pools(|pool| pool.with_referrer(referrer, settings)),
+                )
+            })
             .clone()
     }
 }
 
-/// Everything a pools snapshot is built from, as returned by RPC at one block
-#[derive(Serialize, Deserialize)]
+/// Everything a pools snapshot is built from, as stored by the contract at one block
 struct PoolsSource {
     block_height: BlockHeight,
-    pools: Vec<PoolData>,
+    /// Of the block, which scheduled fees depend on
+    timestamp: Timestamp,
+    pools: Vec<StoredPool>,
     referrers: HashMap<AccountId, Referrer>,
 }
 
 fn build_pools(source: PoolsSource) -> Pools {
     let PoolsSource {
         block_height,
+        timestamp,
         pools,
         referrers,
     } = source;
     let pools = pools
         .into_iter()
         .enumerate()
-        .map(|(i, data)| Pool::new(i as u32, data))
+        .filter_map(|(i, data)| Pool::new(i as u32, data, timestamp))
         .collect::<Vec<_>>();
     Pools {
         block_height,
@@ -695,10 +540,7 @@ fn to_api_response(
                     .route
                     .emulate_exact_in(graph, amount_part, &mut pools_delta)
                     .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let min_amount_out = u256_to_u128(
-                    u128_to_u256(estimated_out) * u128_to_u256(10_000u128 - slippage_bp)
-                        / u128_to_u256(10_000u128),
-                );
+                let min_amount_out = mul_div(estimated_out, 10_000 - slippage_bp, BASIS_POINTS);
 
                 let mut pools_resp = Vec::new();
                 let mut current_token = token_in.clone();
@@ -751,10 +593,7 @@ fn to_api_response(
                     .route
                     .emulate_exact_out(graph, amount_out_part, &mut pools_delta)
                     .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let max_amount_in = u256_to_u128(
-                    u128_to_u256(amount_in) * u128_to_u256(10_000u128 + slippage_bp)
-                        / u128_to_u256(10_000),
-                );
+                let max_amount_in = mul_div(amount_in, 10_000 + slippage_bp, BASIS_POINTS);
 
                 let mut pools_resp = Vec::new();
                 let mut current_token = token_in.clone();
@@ -769,9 +608,10 @@ fn to_api_response(
                         token_out: graph.token(hop.token_out).clone(),
                         amount_in: U128(step_amount.0),
                         amount_out: U128(step_amount.1),
-                        max_amount_in: U128(u256_to_u128(
-                            u128_to_u256(step_amount.0) * u128_to_u256(10_000u128 + slippage_bp)
-                                / u128_to_u256(10_000),
+                        max_amount_in: U128(mul_div(
+                            step_amount.0,
+                            10_000 + slippage_bp,
+                            BASIS_POINTS,
                         )),
                     });
 
@@ -874,6 +714,10 @@ mod tests {
     use super::*;
     use crate::search::Pool as _;
 
+    use near_sdk::json_types::U128;
+    use xyk_dex_types::math::mul_div_sum;
+    use xyk_dex_types::{AssetWithBalance, FULL_FEE_FRACTION, FeeFraction};
+
     const POOL_FEE: FeeFraction = 3_000; // 0.3%
     const PROTOCOL_FEE: FeeFraction = 1_000; // 0.1%
     const REFERRAL_FEE: FeeFraction = 10_000; // 1%
@@ -883,15 +727,10 @@ mod tests {
         AssetId::Nep141(account_id.parse().unwrap())
     }
 
+    /// The pool fee, which the contract adds the protocol fee to
     fn fees() -> CurrentFees {
         CurrentFees {
-            receivers: vec![
-                (FeeReceiver::Pool, POOL_FEE),
-                (
-                    FeeReceiver::Account("plach.intear.near".parse().unwrap()),
-                    PROTOCOL_FEE,
-                ),
-            ],
+            receivers: vec![(FeeReceiver::Pool, POOL_FEE)],
         }
     }
 
@@ -902,19 +741,19 @@ mod tests {
         }
     }
 
+    fn stored_pool(token0: AssetId, token1: AssetId) -> StoredPool {
+        StoredPool::PrivateV1 {
+            assets: (
+                asset(token0, 10u128.pow(24)),
+                asset(token1, 2 * 10u128.pow(24)),
+            ),
+            _owner_id: "owner.near".parse().unwrap(),
+            fees: fees(),
+        }
+    }
+
     fn public_pool(token0: AssetId, token1: AssetId) -> Pool {
-        Pool::new(
-            0,
-            PoolData::Public {
-                assets: (
-                    asset(token0, 10u128.pow(24)),
-                    asset(token1, 2 * 10u128.pow(24)),
-                ),
-                fees: fees(),
-                fee_configuration: FeeConfiguration::V1(fees()),
-                total_shares: None,
-            },
-        )
+        Pool::new(0, stored_pool(token0, token1), 0).unwrap()
     }
 
     fn launch_pool(launched: AssetId) -> Pool {
@@ -924,22 +763,36 @@ mod tests {
     fn launch_pool_with_phantom_liquidity(launched: AssetId, phantom_liquidity: Balance) -> Pool {
         Pool::new(
             0,
-            PoolData::Launch {
+            StoredPool::LaunchV1 {
                 near_amount: U128(10u128.pow(24)),
                 launched_asset: asset(launched, 2 * 10u128.pow(24)),
-                fees: fees(),
-                fee_configuration: FeeConfiguration::V1(fees()),
+                fees: FeeConfiguration::V1(fees()),
                 phantom_liquidity_near: U128(phantom_liquidity),
             },
+            0,
         )
+        .unwrap()
+    }
+
+    fn referrer_id() -> AccountId {
+        "ref.near".parse().unwrap()
     }
 
     fn referrer(fee_assets: &[AssetId]) -> Referrer {
         Referrer {
-            fee_fraction: REFERRAL_FEE,
-            fee_fraction_reduced: REFERRAL_FEE_REDUCED,
+            settings: ReferralSettings::V1 {
+                fee_fraction: REFERRAL_FEE,
+                fee_fraction_reduced: REFERRAL_FEE_REDUCED,
+            },
             fee_assets: fee_assets.iter().cloned().collect(),
         }
+    }
+
+    /// The referral fee on swaps that put in token 0 and token 1
+    fn referral_fees(pool: &Pool) -> [FeeFraction; 2] {
+        pool.fees
+            .each_ref()
+            .map(|fees| fees.total_fee_fraction() - pool.info.fees.total_fee_fraction())
     }
 
     /// What the contract's x*y=k swap gives for `amount_in` after taking each fee, rounded down
@@ -951,21 +804,18 @@ mod tests {
     ) -> u128 {
         let taken: u128 = fees
             .iter()
-            .map(|&fee| amount_in * fee as u128 / MAX_FEE_FRACTION as u128)
+            .map(|&fee| amount_in * fee as u128 / FULL_FEE_FRACTION as u128)
             .sum();
         let after_fees = amount_in - taken;
         let (in_balance, out_balance) = (pool.reserves[token_in], pool.reserves[1 - token_in]);
-        u256_to_u128(
-            u128_to_u256(after_fees) * u128_to_u256(out_balance)
-                / (u128_to_u256(in_balance) + u128_to_u256(after_fees)),
-        )
+        mul_div_sum(after_fees, out_balance, in_balance, after_fees)
     }
 
     #[test]
     fn referral_fee_is_taken_from_the_input_it_collects_in() {
         let pool = public_pool(nep141("a.near"), nep141("b.near"));
-        let referred = pool.with_referrer(&referrer(&[nep141("a.near")]));
-        assert_eq!(referred.referral_fees, [REFERRAL_FEE, 0]);
+        let referred = pool.with_referrer(&referrer_id(), &referrer(&[nep141("a.near")]));
+        assert_eq!(referral_fees(&referred), [REFERRAL_FEE, 0]);
 
         let amount = 10u128.pow(22);
         assert_eq!(
@@ -989,9 +839,10 @@ mod tests {
     fn referral_fee_is_reduced_between_stable_assets() {
         let usdt = nep141("usdt.tether-token.near");
         let usdc = nep141("17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
-        let pool = public_pool(usdt.clone(), usdc.clone()).with_referrer(&referrer(&[usdt, usdc]));
+        let pool = public_pool(usdt.clone(), usdc.clone())
+            .with_referrer(&referrer_id(), &referrer(&[usdt, usdc]));
         assert_eq!(
-            pool.referral_fees,
+            referral_fees(&pool),
             [REFERRAL_FEE_REDUCED, REFERRAL_FEE_REDUCED]
         );
     }
@@ -1002,12 +853,11 @@ mod tests {
         let pool = launch_pool(launched.clone());
         // Buying puts the quote token in, selling converts the fee to it, so only it counts
         assert_eq!(
-            pool.with_referrer(&referrer(&[AssetId::Near]))
-                .referral_fees,
+            referral_fees(&pool.with_referrer(&referrer_id(), &referrer(&[AssetId::Near]))),
             [REFERRAL_FEE, REFERRAL_FEE]
         );
         assert_eq!(
-            pool.with_referrer(&referrer(&[launched])).referral_fees,
+            referral_fees(&pool.with_referrer(&referrer_id(), &referrer(&[launched]))),
             [0, 0]
         );
     }
@@ -1015,7 +865,7 @@ mod tests {
     #[test]
     fn exact_out_with_a_referral_fee_pays_enough_for_the_output() {
         let pool = public_pool(nep141("a.near"), nep141("b.near"))
-            .with_referrer(&referrer(&[nep141("a.near")]));
+            .with_referrer(&referrer_id(), &referrer(&[nep141("a.near")]));
         let amount_out = 10u128.pow(22);
         let amount_in = pool.quote_exact_out(0, 1, amount_out).unwrap();
         let without_referral = public_pool(nep141("a.near"), nep141("b.near"))
@@ -1026,18 +876,13 @@ mod tests {
         assert!(pool.quote_exact_in(0, 1, amount_in - 2).unwrap() < amount_out);
     }
 
-    /// `a * b / (c + d)`, rounded down, like the contract's `mul_div_sum`
-    fn mul_div_sum(a: u128, b: u128, c: u128, d: u128) -> u128 {
-        u256_to_u128(u128_to_u256(a) * u128_to_u256(b) / (u128_to_u256(c) + u128_to_u256(d)))
-    }
-
     #[test]
     fn pool_fee_stays_in_the_pool() {
         let mut pool = public_pool(nep141("a.near"), nep141("b.near"));
         let [in_before, out_before] = pool.reserves;
         let amount_in = 10u128.pow(22);
         let amount_out = pool.swap_exact_in(0, 1, amount_in).unwrap();
-        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / MAX_FEE_FRACTION as u128;
+        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / FULL_FEE_FRACTION as u128;
         assert_eq!(
             pool.reserves,
             [
@@ -1048,7 +893,7 @@ mod tests {
 
         let mut pool = public_pool(nep141("a.near"), nep141("b.near"));
         let amount_in = pool.swap_exact_out(0, 1, amount_out).unwrap();
-        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / MAX_FEE_FRACTION as u128;
+        let protocol_fee = amount_in * PROTOCOL_FEE as u128 / FULL_FEE_FRACTION as u128;
         assert_eq!(
             pool.reserves,
             [
@@ -1061,10 +906,11 @@ mod tests {
     #[test]
     fn launch_pools_convert_fees_when_selling_into_their_quote_token() {
         let launched = nep141("meme.near");
-        let mut pool = launch_pool(launched).with_referrer(&referrer(&[AssetId::Near]));
+        let mut pool =
+            launch_pool(launched).with_referrer(&referrer_id(), &referrer(&[AssetId::Near]));
         let [mut near, mut tokens] = pool.reserves;
         let amount_in = 10u128.pow(22);
-        let fee = |fraction: FeeFraction| amount_in * fraction as u128 / MAX_FEE_FRACTION as u128;
+        let fee = |fraction: FeeFraction| amount_in * fraction as u128 / FULL_FEE_FRACTION as u128;
         let after_fees = amount_in - fee(POOL_FEE) - fee(PROTOCOL_FEE) - fee(REFERRAL_FEE);
         let amount_out = mul_div_sum(after_fees, near, tokens, after_fees);
         tokens += after_fees + fee(POOL_FEE);
@@ -1093,18 +939,11 @@ mod tests {
 
     #[test]
     fn each_referrer_gets_its_own_graph_once() {
-        let referrer_id: AccountId = "ref.near".parse().unwrap();
+        let referrer_id = referrer_id();
         let pools = build_pools(PoolsSource {
             block_height: 1,
-            pools: vec![PoolData::Public {
-                assets: (
-                    asset(nep141("a.near"), 10u128.pow(24)),
-                    asset(nep141("b.near"), 10u128.pow(24)),
-                ),
-                fees: fees(),
-                fee_configuration: FeeConfiguration::V1(fees()),
-                total_shares: None,
-            }],
+            timestamp: 0,
+            pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
             referrers: HashMap::from([(referrer_id.clone(), referrer(&[nep141("a.near")]))]),
         });
         let without_settings = pools.graph_for(&"other.near".parse().unwrap());
@@ -1112,7 +951,7 @@ mod tests {
         let referred = pools.graph_for(&referrer_id);
         assert!(!Arc::ptr_eq(&referred, &pools.graph));
         assert!(Arc::ptr_eq(&referred, &pools.graph_for(&referrer_id)));
-        assert_eq!(referred.pools()[0].referral_fees, [REFERRAL_FEE, 0]);
-        assert_eq!(pools.graph.pools()[0].referral_fees, [0, 0]);
+        assert_eq!(referral_fees(&referred.pools()[0]), [REFERRAL_FEE, 0]);
+        assert_eq!(referral_fees(&pools.graph.pools()[0]), [0, 0]);
     }
 }
