@@ -42,6 +42,8 @@ pub enum SplitRouteApiResponse {
         contract_out: AssetId,
         amount_in: U128,
         amount_out: U128,
+        /// Added to `amount_out` by the fee discount, 0 without one
+        discount: U128,
         swap_gas: NearGas,
     },
     ExactOut {
@@ -51,6 +53,8 @@ pub enum SplitRouteApiResponse {
         amount_in: U128,
         max_amount_in: U128,
         amount_out: U128,
+        /// Taken off `amount_in` by the fee discount, 0 without one
+        discount: U128,
         swap_gas: NearGas,
     },
 }
@@ -606,6 +610,7 @@ fn to_api_response(
                 contract_out: token_out.clone(),
                 amount_in: U128(total_amount_in),
                 amount_out: U128(total_estimated_out),
+                discount: U128(0),
                 swap_gas: swap_gas(split_route),
             })
         }
@@ -669,10 +674,42 @@ fn to_api_response(
                 amount_in: U128(total_estimated_in),
                 max_amount_in: U128(total_max_amount_in),
                 amount_out: U128(total_amount_out),
+                discount: U128(0),
                 swap_gas: swap_gas(split_route),
             })
         }
     }
+}
+
+/// What `split_route` swaps on `graph` in total: the output for exact in, the input for exact out
+fn emulate_total(
+    split_route: &SplitRoute,
+    graph: &Graph<Pool>,
+    amount: QuoteAmount,
+) -> Result<Balance, anyhow::Error> {
+    let mut total: Balance = 0;
+    let mut pools_delta = PoolsDelta::default();
+    for (part, amount_part) in split_route
+        .parts
+        .iter()
+        .zip(split_exactly(amount.value(), &split_route.parts))
+    {
+        let swapped = match amount {
+            QuoteAmount::ExactIn(_) => {
+                part.route
+                    .emulate_exact_in(graph, amount_part, &mut pools_delta)
+            }
+            QuoteAmount::ExactOut(_) => part
+                .route
+                .emulate_exact_out(graph, amount_part, &mut pools_delta)
+                .map(|(amount_in, _)| amount_in),
+        }
+        .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
+        total = total
+            .checked_add(swapped)
+            .ok_or_else(|| anyhow::anyhow!("Total amount overflows u128"))?;
+    }
+    Ok(total)
 }
 
 pub struct Request {
@@ -720,7 +757,7 @@ pub fn find_path_in(
             &request.quoted_token_price_raw,
         )?,
     )?;
-    let response = to_api_response(
+    let mut response = to_api_response(
         &split_route,
         graph,
         &request.token_in,
@@ -728,6 +765,28 @@ pub fn find_path_in(
         request.amount,
         slippage_bp,
     )?;
+    if request.fee_discount != 0 {
+        // Compared to the same route without the fee discount
+        let undiscounted = emulate_total(
+            &split_route,
+            &pools.graph_for(&request.referrer, 0),
+            request.amount,
+        )?;
+        let (saved, discount) = match &mut response {
+            SplitRouteApiResponse::ExactIn {
+                amount_out,
+                discount,
+                ..
+            } => (amount_out.0.checked_sub(undiscounted), discount),
+            SplitRouteApiResponse::ExactOut {
+                amount_in,
+                discount,
+                ..
+            } => (undiscounted.checked_sub(amount_in.0), discount),
+        };
+        *discount =
+            U128(saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?);
+    }
     match &response {
         SplitRouteApiResponse::ExactIn { amount_out, .. } => info!(
             "Plach route from {} to {}: {} out, block {}",

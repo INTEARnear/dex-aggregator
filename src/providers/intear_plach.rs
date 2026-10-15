@@ -1,6 +1,5 @@
 use std::{future::Future, pin::Pin};
 
-use bigdecimal::BigDecimal;
 use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, WithdrawAmount};
 use lazy_static::lazy_static;
 use near_min_api::types::{
@@ -8,7 +7,6 @@ use near_min_api::types::{
     AccountId, Action, BlockHeight, FunctionCallAction, Gas, NearGas, NearToken,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
-use num_traits::ToPrimitive;
 use pathfinder::{
     plach::{self, SplitRouteApiResponse},
     MaxHops, QuoteAmount,
@@ -276,6 +274,10 @@ async fn route(
         SplitRouteApiResponse::ExactIn { swap_gas, .. }
         | SplitRouteApiResponse::ExactOut { swap_gas, .. } => swap_gas,
     };
+    let discount = fee_discounter.map(|_| match response {
+        SplitRouteApiResponse::ExactIn { discount, .. } => Amount::AmountOut(discount.0),
+        SplitRouteApiResponse::ExactOut { discount, .. } => Amount::AmountIn(discount.0),
+    });
     let (swap_routes, swap_amount, constraint, estimated_amount, worst_case_amount) = match response
     {
         SplitRouteApiResponse::ExactIn {
@@ -344,12 +346,6 @@ async fn route(
         }
         None => None,
     };
-    let discount = fee_discount.as_ref().map(|signed_fee_discount| {
-        (BigDecimal::from(signed_fee_discount.discount.fee_discount)
-            / BigDecimal::from(FULL_FEE_FRACTION_FRACTION))
-        .to_f64()
-        .unwrap()
-    });
     let swaps = vec![Operation::SwapSimple {
         dex_id: PLACH_DEX_ID.parse().unwrap(),
         message: Base64VecU8(
@@ -626,9 +622,14 @@ mod tests {
                     contract_out: token_out.clone(),
                     amount_in: near_min_api::types::U128(100),
                     amount_out: near_min_api::types::U128(80),
+                    discount: near_min_api::types::U128(0),
                     swap_gas: NearGas::from_tgas(34),
                 });
             }
+            let discount = near_min_api::types::U128(match request.fee_discount {
+                0 => 0,
+                _ => 5,
+            });
             match request.amount {
                 QuoteAmount::ExactIn(_) => Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![plach::ExactInRoute {
@@ -648,6 +649,7 @@ mod tests {
                     contract_out: token_out.clone(),
                     amount_in: near_min_api::types::U128(100),
                     amount_out: near_min_api::types::U128(80),
+                    discount,
                     swap_gas: NearGas::from_tgas(34),
                 }),
                 QuoteAmount::ExactOut(_) => Some(SplitRouteApiResponse::ExactOut {
@@ -670,6 +672,7 @@ mod tests {
                     amount_in: near_min_api::types::U128(100),
                     max_amount_in: near_min_api::types::U128(101),
                     amount_out: near_min_api::types::U128(80),
+                    discount,
                     swap_gas: NearGas::from_tgas(34),
                 }),
             }
@@ -767,7 +770,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::to_value(&route).unwrap()["discount"],
-            serde_json::json!(0.1)
+            serde_json::json!({ "amount_out": "5" })
         );
         let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
             route.execution_instructions.last()
