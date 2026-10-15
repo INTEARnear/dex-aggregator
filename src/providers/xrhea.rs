@@ -132,6 +132,7 @@ async fn route(
             dex_id: DexId::XRhea,
             execution_instructions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
         });
     } else if nep141_in == XRHEA_CONTRACT {
@@ -205,6 +206,7 @@ async fn route(
             dex_id: DexId::XRhea,
             execution_instructions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: TokenId::Nep141(RHEA_CONTRACT.parse().unwrap()),
         });
     }
@@ -302,6 +304,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
             })
         );
@@ -369,6 +372,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
             })
         );
@@ -424,6 +428,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RHEA_CONTRACT.parse().unwrap()),
             })
         );
@@ -483,6 +488,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
             })
         );
@@ -538,6 +544,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RHEA_CONTRACT.parse().unwrap()),
             })
         );
@@ -638,6 +645,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(XRHEA_CONTRACT.parse().unwrap()),
             })
         );

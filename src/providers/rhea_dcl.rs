@@ -196,6 +196,7 @@ async fn route(
         worst_case_amount,
         execution_instructions: transactions,
         deprecated_needs_unwrap_always_false: false,
+        discount: None,
         token_output,
     })
 }
@@ -355,6 +356,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -426,6 +428,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -508,6 +511,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -619,6 +623,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );

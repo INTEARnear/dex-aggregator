@@ -223,6 +223,7 @@ async fn route(
             worst_case_amount: Amount::AmountOut(total_min_amount_out),
             execution_instructions: transactions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: request.token_out.clone(),
         });
     }
@@ -287,6 +288,7 @@ async fn route(
         worst_case_amount: Amount::AmountOut(total_min_amount_out),
         execution_instructions: transactions,
         deprecated_needs_unwrap_always_false: false,
+        discount: None,
         token_output: if unwrapping_near {
             TokenId::Near
         } else {
@@ -447,6 +449,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -524,6 +527,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -609,6 +613,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -694,6 +699,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -776,6 +782,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141OnRhea("other".parse().unwrap()),
             })
         );
@@ -846,6 +853,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -924,6 +932,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -1001,6 +1010,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("other".parse().unwrap()),
             })
         );
@@ -1193,6 +1203,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -1260,6 +1271,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );

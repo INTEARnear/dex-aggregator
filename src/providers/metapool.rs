@@ -157,6 +157,7 @@ async fn route(
             dex_id: DexId::MetaPool,
             execution_instructions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
         });
     } else if is_near(&request.token_out) {
@@ -296,6 +297,7 @@ async fn route(
             dex_id: DexId::MetaPool,
             execution_instructions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: TokenId::Near,
         });
     }
@@ -419,6 +421,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );
@@ -475,6 +478,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );
@@ -535,6 +539,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );
@@ -591,6 +596,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );
@@ -643,6 +649,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );
@@ -690,6 +697,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -747,6 +755,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -794,6 +803,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -987,6 +997,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(METAPOOL_CONTRACT.parse().unwrap()),
             })
         );

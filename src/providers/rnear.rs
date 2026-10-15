@@ -131,6 +131,7 @@ async fn route(
             dex_id: DexId::RNear,
             execution_instructions,
             deprecated_needs_unwrap_always_false: false,
+            discount: None,
             token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
         });
     }
@@ -224,6 +225,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );
@@ -279,6 +281,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );
@@ -338,6 +341,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );
@@ -393,6 +397,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );
@@ -444,6 +449,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );
@@ -561,6 +567,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(RNEAR_CONTRACT.parse().unwrap()),
             })
         );

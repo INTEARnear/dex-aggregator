@@ -23,6 +23,7 @@ cached = { version = "0.55.1", features = ["async"] }
 bigdecimal = "0.4.8"
 num-traits = "0.2.19"
 borsh = "1.6.0"
+sha2 = "0.10.9"
 base64 = "0.21.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate", "chrono"] }

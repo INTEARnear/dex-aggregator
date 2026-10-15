@@ -1,14 +1,24 @@
 use std::{future::Future, pin::Pin};
 
+use bigdecimal::BigDecimal;
 use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, WithdrawAmount};
-use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken};
+use lazy_static::lazy_static;
+use near_min_api::types::{
+    near_crypto::{SecretKey, Signature},
+    AccountId, Action, BlockHeight, FunctionCallAction, Gas, NearGas, NearToken,
+};
 use near_sdk::json_types::{Base64VecU8, U128};
+use num_traits::ToPrimitive;
 use pathfinder::{
     plach::{self, SplitRouteApiResponse},
     MaxHops, QuoteAmount,
 };
+use sha2::{Digest, Sha256};
 use tracing::info;
-use xyk_dex_types::{SwapArgs, SwapRoute};
+use xyk_dex_types::{
+    FeeDiscount, FeeFractionFraction, SignedFeeDiscount, SwapArgs, SwapRoute,
+    FULL_FEE_FRACTION_FRACTION,
+};
 
 use crate::{
     shared_utils::{
@@ -28,6 +38,53 @@ const DEPOSIT_NEAR_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 const EXECUTE_OPERATIONS_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 
 pub use intear_dex_types::AssetId;
+
+/// Taken off the pool and protocol fees of every quote
+const FEE_DISCOUNT: FeeFractionFraction = FULL_FEE_FRACTION_FRACTION / 10;
+/// How long a quote's fee discount can be used, ~10 minutes
+const FEE_DISCOUNT_VALIDITY_BLOCKS: BlockHeight = 1000;
+
+lazy_static! {
+    pub static ref FEE_DISCOUNTER: FeeDiscounter = FeeDiscounter::from_env();
+}
+
+/// Signs fee discounts with the key set as the xyk DEX's fee discount signer
+pub struct FeeDiscounter {
+    secret_key: SecretKey,
+}
+
+impl FeeDiscounter {
+    fn from_env() -> Self {
+        let account_id: AccountId = std::env::var("FEE_DISCOUNTER_ACCOUNT_ID")
+            .expect("FEE_DISCOUNTER_ACCOUNT_ID must be set")
+            .parse()
+            .expect("Invalid FEE_DISCOUNTER_ACCOUNT_ID");
+        let secret_key: SecretKey = std::env::var("FEE_DISCOUNTER_PRIVATE_KEY")
+            .expect("FEE_DISCOUNTER_PRIVATE_KEY must be set")
+            .parse()
+            .expect("Invalid FEE_DISCOUNTER_PRIVATE_KEY");
+        info!(
+            "Signing Plach fee discounts as {account_id} with {}",
+            secret_key.public_key()
+        );
+        Self { secret_key }
+    }
+
+    /// Signs sha256(borsh(`discount`)), which the DEX verifies
+    fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
+        let hash = Sha256::digest(borsh::to_vec(&discount).unwrap());
+        let signature = match self.secret_key.sign(&hash) {
+            Signature::ED25519(signature) => signature.to_bytes().to_vec(),
+            // Borsh puts the key type before the 65 bytes of r, s, and the recovery id
+            signature @ Signature::SECP256K1(_) => borsh::to_vec(&signature).unwrap()[1..].to_vec(),
+            Signature::MLDSA65(_) => panic!("The DEX can't verify ML-DSA-65 fee discounts"),
+        };
+        SignedFeeDiscount {
+            discount,
+            signature,
+        }
+    }
+}
 
 trait PlachQuotes: Send + Sync {
     fn find_path(
@@ -132,7 +189,15 @@ impl Provider for IntearPlachProvider {
     }
 
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
-        Box::pin(async move { route(request, &Mainnet, &MainnetPlachQuotes).await })
+        Box::pin(async move {
+            route(
+                request,
+                &Mainnet,
+                &MainnetPlachQuotes,
+                Some(&*FEE_DISCOUNTER),
+            )
+            .await
+        })
     }
 }
 
@@ -140,6 +205,7 @@ async fn route(
     request: SwapRequest,
     network: &impl NetworkView,
     quotes: &impl PlachQuotes,
+    fee_discounter: Option<&FeeDiscounter>,
 ) -> Option<Route> {
     let amount_hint = match request.amount {
         Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
@@ -199,6 +265,10 @@ async fn route(
                 .referrer_id
                 .clone()
                 .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap()),
+            fee_discount: match fee_discounter {
+                Some(_) => FEE_DISCOUNT,
+                None => 0,
+            },
         })
         .await?;
 
@@ -256,12 +326,36 @@ async fn route(
     if swap_routes.is_empty() {
         return None;
     }
+    let fee_discount = match fee_discounter {
+        Some(fee_discounter) => {
+            let current_block_height = network
+                .current_block_height()
+                .inspect_err(|e| info!("No block height to expire a fee discount at: {e}"))
+                .ok()?;
+            Some(fee_discounter.sign(FeeDiscount {
+                routes: swap_routes.clone(),
+                asset_in: token_in.clone(),
+                asset_out: token_out.clone(),
+                trader_id: request.trader_account_id.clone(),
+                amount: swap_amount,
+                fee_discount: FEE_DISCOUNT,
+                expiration_block_height: current_block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
+            }))
+        }
+        None => None,
+    };
+    let discount = fee_discount.as_ref().map(|signed_fee_discount| {
+        (BigDecimal::from(signed_fee_discount.discount.fee_discount)
+            / BigDecimal::from(FULL_FEE_FRACTION_FRACTION))
+        .to_f64()
+        .unwrap()
+    });
     let swaps = vec![Operation::SwapSimple {
         dex_id: PLACH_DEX_ID.parse().unwrap(),
         message: Base64VecU8(
             borsh::to_vec(&SwapArgs {
                 routes: swap_routes,
-                fee_discount: None,
+                fee_discount,
             })
             .unwrap(),
         ),
@@ -459,6 +553,7 @@ async fn route(
         worst_case_amount,
         execution_instructions: [registration_transactions, transactions].concat(),
         deprecated_needs_unwrap_always_false: false,
+        discount,
         token_output: if output_withdrawn {
             match token_out {
                 AssetId::Near => TokenId::Near,
@@ -600,6 +695,7 @@ mod tests {
             },
             &TestNetworkView::default().with_test_prices(),
             &TestPlachQuotes::default(),
+            None,
         )
         .await
         .unwrap();
@@ -642,6 +738,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signs_fee_discount() {
+        use base64::Engine;
+        use near_min_api::types::near_crypto::KeyType;
+
+        let fee_discounter = FeeDiscounter {
+            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
+        };
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountIn(100),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                signing_public_key: None,
+                referrer_id: None,
+            },
+            &TestNetworkView::default().with_test_prices(),
+            &TestPlachQuotes::default(),
+            Some(&fee_discounter),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&route).unwrap()["discount"],
+            serde_json::json!(0.1)
+        );
+        let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
+            route.execution_instructions.last()
+        else {
+            panic!("No swap transaction");
+        };
+        let [Action::FunctionCall(deposit_near)] = actions.as_slice() else {
+            panic!("Swap transaction isn't a single function call");
+        };
+        let args = serde_json::from_slice::<serde_json::Value>(&deposit_near.args).unwrap();
+        let message = base64::engine::general_purpose::STANDARD
+            .decode(
+                args["operations"]["operations"][0]["SwapSimple"]["message"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+        let SwapArgs {
+            routes,
+            fee_discount:
+                Some(SignedFeeDiscount {
+                    discount,
+                    signature,
+                }),
+        } = borsh::from_slice(&message).unwrap()
+        else {
+            panic!("No fee discount");
+        };
+        assert_eq!(discount.routes, routes);
+        assert_eq!(discount.asset_in, AssetId::Near);
+        assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
+        assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
+        assert_eq!(discount.amount, SwapRequestAmount::ExactIn(U128(100)));
+        assert_eq!(discount.fee_discount, 100_000);
+        assert_eq!(discount.expiration_block_height, 1_001_000);
+        assert!(Signature::from_parts(KeyType::ED25519, &signature)
+            .unwrap()
+            .verify(
+                &Sha256::digest(borsh::to_vec(&discount).unwrap()),
+                &fee_discounter.secret_key.public_key(),
+            ));
+    }
+
+    #[tokio::test]
     async fn amount_in_near_to_ft() {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
@@ -662,6 +832,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -731,6 +902,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -757,6 +929,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -830,6 +1003,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -856,6 +1030,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -933,6 +1108,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -959,6 +1135,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1010,6 +1187,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::TokenOnIntearDex(token_out),
             })
         );
@@ -1036,6 +1214,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1108,6 +1287,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -1134,6 +1314,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1214,6 +1395,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Near,
             })
         );
@@ -1240,6 +1422,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1315,6 +1498,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -1341,6 +1525,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1400,6 +1585,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -1426,6 +1612,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1477,6 +1664,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::TokenOnIntearDex(token_out),
             })
         );
@@ -1501,6 +1689,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             None
@@ -1526,6 +1715,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::none(),
+                None,
             )
             .await,
             None
@@ -1551,6 +1741,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::empty_routes(),
+                None,
             )
             .await,
             None
@@ -1576,6 +1767,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1617,6 +1809,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );
@@ -1641,6 +1834,7 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
+                None,
             )
             .await,
             Some(Route {
@@ -1682,6 +1876,7 @@ mod tests {
                     }))],
                 }],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
         );

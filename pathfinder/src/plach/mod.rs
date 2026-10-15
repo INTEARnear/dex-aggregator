@@ -23,8 +23,8 @@ use xyk_dex_types::math::{
     exact_in_amount_out, exact_out_amount_in, fee_converted_to_quote_asset, mul_div,
 };
 use xyk_dex_types::{
-    CurrentFees, FULL_SPLIT_FRACTION, FeeConfiguration, FeeReceiver, ReferralSettings,
-    SplitFraction, asset_account_ids,
+    CurrentFees, FULL_SPLIT_FRACTION, FeeConfiguration, FeeFractionFraction, FeeReceiver,
+    ReferralSettings, SplitFraction, asset_account_ids,
 };
 
 use crate::search::{
@@ -110,6 +110,7 @@ pub struct Pool {
     info: Arc<PoolInfo>,
 }
 
+#[derive(Clone)]
 struct PoolInfo {
     tokens: [AssetId; 2],
     /// Pool and protocol fees at the block time, without a referral fee
@@ -231,6 +232,23 @@ impl Pool {
         });
         Self {
             fees: Arc::new(fees),
+            ..self.clone()
+        }
+    }
+
+    /// The pool with its pool and protocol fees discounted, as a signed fee discount makes the
+    /// xyk DEX charge them. Referral fees aren't discounted, so this goes before `with_referrer`.
+    fn with_fee_discount(&self, fee_discount: FeeFractionFraction) -> Self {
+        if fee_discount == 0 {
+            return self.clone();
+        }
+        let fees = self.info.fees.clone().discounted(fee_discount);
+        Self {
+            fees: Arc::new([fees.clone(), fees.clone()]),
+            info: Arc::new(PoolInfo {
+                fees,
+                ..(*self.info).clone()
+            }),
             ..self.clone()
         }
     }
@@ -402,28 +420,40 @@ lazy_static! {
 pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
-    /// Pools without referral fees
+    /// Pools without referral fees or a fee discount
     graph: Arc<Graph<Pool>>,
     referrers: HashMap<AccountId, Referrer>,
-    /// Pools with the referral fees of a referrer, made the first time it asks for a route
-    referrer_graphs: Mutex<HashMap<AccountId, Arc<Graph<Pool>>>>,
+    /// Pools with the referral fees of a referrer, if it charges any, and a fee discount, made
+    /// the first time they're asked for
+    referrer_graphs: Mutex<HashMap<GraphKey, Arc<Graph<Pool>>>>,
 }
 
+/// The referrer whose referral fees a graph has, if it charges any, and its fee discount
+type GraphKey = (Option<AccountId>, FeeFractionFraction);
+
 impl Pools {
-    /// Pools as `referrer` swaps through them, with its referral fees
-    fn graph_for(&self, referrer: &AccountId) -> Arc<Graph<Pool>> {
-        let Some(settings) = self.referrers.get(referrer) else {
+    /// Pools as `referrer` swaps through them with `fee_discount`, with its referral fees
+    fn graph_for(
+        &self,
+        referrer: &AccountId,
+        fee_discount: FeeFractionFraction,
+    ) -> Arc<Graph<Pool>> {
+        let settings = self.referrers.get(referrer);
+        if settings.is_none() && fee_discount == 0 {
             return self.graph.clone();
-        };
+        }
         self.referrer_graphs
             .lock()
             .unwrap()
-            .entry(referrer.clone())
+            .entry((settings.map(|_| referrer.clone()), fee_discount))
             .or_insert_with(|| {
-                Arc::new(
-                    self.graph
-                        .map_pools(|pool| pool.with_referrer(referrer, settings)),
-                )
+                Arc::new(self.graph.map_pools(|pool| {
+                    let pool = pool.with_fee_discount(fee_discount);
+                    match settings {
+                        Some(settings) => pool.with_referrer(referrer, settings),
+                        None => pool,
+                    }
+                }))
             })
             .clone()
     }
@@ -656,6 +686,8 @@ pub struct Request {
     pub quoted_token_price_raw: BigDecimal,
     /// The swap's referrer: its referral fee, if it charges one, is taken out of every pool
     pub referrer: AccountId,
+    /// Taken off the pool and protocol fees of every pool by a signed fee discount, 0 for none
+    pub fee_discount: FeeFractionFraction,
 }
 
 pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
@@ -668,7 +700,7 @@ pub fn find_path_in(
     request: &Request,
 ) -> Result<SplitRouteApiResponse, anyhow::Error> {
     let slippage_bp = crate::slippage_bp(&request.slippage)?;
-    let graph = &*pools.graph_for(&request.referrer);
+    let graph = &*pools.graph_for(&request.referrer, request.fee_discount);
     let (Some(token_in), Some(token_out)) = (
         graph.token_index(&request.token_in),
         graph.token_index(&request.token_out),
@@ -946,12 +978,35 @@ mod tests {
             pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
             referrers: HashMap::from([(referrer_id.clone(), referrer(&[nep141("a.near")]))]),
         });
-        let without_settings = pools.graph_for(&"other.near".parse().unwrap());
+        let without_settings = pools.graph_for(&"other.near".parse().unwrap(), 0);
         assert!(Arc::ptr_eq(&without_settings, &pools.graph));
-        let referred = pools.graph_for(&referrer_id);
+        let referred = pools.graph_for(&referrer_id, 0);
         assert!(!Arc::ptr_eq(&referred, &pools.graph));
-        assert!(Arc::ptr_eq(&referred, &pools.graph_for(&referrer_id)));
+        assert!(Arc::ptr_eq(&referred, &pools.graph_for(&referrer_id, 0)));
         assert_eq!(referral_fees(&referred.pools()[0]), [REFERRAL_FEE, 0]);
         assert_eq!(referral_fees(&pools.graph.pools()[0]), [0, 0]);
+
+        // Referrers without settings share the discounted graph
+        let discounted = pools.graph_for(&"other.near".parse().unwrap(), 100_000);
+        assert!(Arc::ptr_eq(
+            &discounted,
+            &pools.graph_for(&"another.near".parse().unwrap(), 100_000)
+        ));
+        let referred_discounted = pools.graph_for(&referrer_id, 100_000);
+        assert!(!Arc::ptr_eq(&referred_discounted, &discounted));
+        assert!(!Arc::ptr_eq(&referred_discounted, &referred));
+        assert_eq!(
+            referral_fees(&referred_discounted.pools()[0]),
+            [REFERRAL_FEE, 0]
+        );
+        // Only the pool and protocol fees are discounted, the referral fee goes on top
+        let discounted_fees = pools.graph.pools()[0].info.fees.clone().discounted(100_000);
+        assert!(
+            discounted.pools()[0]
+                .fees
+                .iter()
+                .all(|fees| *fees == discounted_fees)
+        );
+        assert!(referred_discounted.pools()[0].info.fees == discounted_fees);
     }
 }

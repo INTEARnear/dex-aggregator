@@ -210,6 +210,7 @@ async fn route(
                 execution_instructions: transactions,
                 token_output: TokenId::Nep141(nep141_out.clone()),
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
             };
 
             Some(route)
@@ -287,6 +288,7 @@ async fn route(
                 worst_case_amount: Amount::AmountIn(max_amount_in),
                 execution_instructions: transactions,
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(nep141_out.clone()),
             };
 
@@ -458,6 +460,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -526,6 +529,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -602,6 +606,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -678,6 +683,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -755,6 +761,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -823,6 +830,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
             })
         );
@@ -899,6 +907,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
             })
         );
@@ -976,6 +985,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
             })
         );
@@ -1049,6 +1059,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -1118,6 +1129,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
             })
         );
@@ -1397,6 +1409,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );
@@ -1469,6 +1482,7 @@ mod tests {
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
+                discount: None,
                 token_output: TokenId::Nep141("token.aidols.near".parse().unwrap()),
             })
         );

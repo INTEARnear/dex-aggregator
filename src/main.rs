@@ -313,6 +313,7 @@ async fn main() {
 
     info!("Starting swap-router HTTP server...");
 
+    lazy_static::initialize(&providers::intear_plach::FEE_DISCOUNTER);
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;
 

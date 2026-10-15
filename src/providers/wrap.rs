@@ -38,6 +38,7 @@ impl Provider for WrapProvider {
                     )
                     .await,
                     deprecated_needs_unwrap_always_false: false,
+                    discount: None,
                     token_output: request.token_in,
                 });
             }

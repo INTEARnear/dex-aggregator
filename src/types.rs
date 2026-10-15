@@ -217,6 +217,10 @@ pub struct Route {
     /// request a second quote, converting this token_output to your desired token output,
     /// after the received amount is known.
     pub token_output: TokenId,
+    /// The fee discount signed into this route, 0.1 takes 10% off the DEX's fees.
+    /// The estimated amounts already include it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discount: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
