@@ -350,7 +350,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(114)),
+                            gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -422,7 +422,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(114)),
+                            gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -505,7 +505,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(114)),
+                            gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -617,7 +617,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(114)),
+                            gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },

@@ -1762,7 +1762,7 @@ fn estimated_gas_usage_excludes_swap_margin() {
     let attached = swap_call_gas(NearGas::from_ggas(5_500), NearGas::from_tgas(10), false).0;
     assert_eq!(
         estimated_gas_usage(&transaction(attached)),
-        cost(fees + (attached.as_gas() - NearGas::from_tgas(20).as_gas()) * 100 / 110)
+        cost(fees + attached.as_gas() - NearGas::from_tgas(18).as_gas())
     );
     assert_eq!(
         max_gas_cost(&transaction(attached)),

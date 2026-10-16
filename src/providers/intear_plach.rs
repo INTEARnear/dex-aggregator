@@ -31,9 +31,27 @@ pub struct IntearPlachProvider;
 
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(36);
-const DEPOSIT_NEAR_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
-const EXECUTE_OPERATIONS_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
+const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
+const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);
+const WITHDRAWAL_CALLBACK_GAS: NearGas = NearGas::from_tgas(5);
+const SPARE_RESERVED_GAS: NearGas = NearGas::from_tgas(2);
+
+fn reserved_gas(operations: &[Operation]) -> NearGas {
+    let withdrawals_gas = operations
+        .iter()
+        .map(|operation| match operation {
+            Operation::Withdraw {
+                asset_id: AssetId::Near,
+                ..
+            } => WITHDRAWAL_CALLBACK_GAS.as_gas(),
+            Operation::Withdraw { .. } => {
+                WITHDRAWAL_TRANSFER_GAS.as_gas() + WITHDRAWAL_CALLBACK_GAS.as_gas()
+            }
+            _ => 0,
+        })
+        .sum::<u64>();
+    NearGas::from_gas(SPARE_RESERVED_GAS.as_gas() + withdrawals_gas)
+}
 
 pub use intear_dex_types::AssetId;
 
@@ -444,6 +462,7 @@ async fn route(
         Amount::AmountOut(_) => constraint,
     };
 
+    let reserved_gas = reserved_gas(&operations);
     let transactions = if use_fast_path {
         let execute_operations_action =
                     Action::FunctionCall(Box::new(FunctionCallAction {
@@ -453,7 +472,7 @@ async fn route(
                             "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                         }))
                         .unwrap(),
-                        gas: swap_call_gas(swap_gas, EXECUTE_OPERATIONS_RESERVED_GAS, false),
+                        gas: swap_call_gas(swap_gas, reserved_gas, false),
                         deposit: NearToken::from_yoctonear(1),
                     }));
         vec![ExecutionInstruction::NearTransaction {
@@ -478,7 +497,7 @@ async fn route(
                                 },
                             }))
                             .unwrap(),
-                            gas: swap_call_gas(swap_gas, DEPOSIT_NEAR_RESERVED_GAS, false),
+                            gas: swap_call_gas(swap_gas, reserved_gas, false),
                             deposit: NearToken::from_yoctonear(input_amount),
                         }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -520,7 +539,14 @@ async fn route(
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
-                                gas: swap_call_gas(swap_gas, FT_TRANSFER_CALL_RESERVED_GAS, true),
+                                gas: swap_call_gas(
+                                    swap_gas,
+                                    NearGas::from_gas(
+                                        reserved_gas.as_gas()
+                                            + FT_TRANSFER_CALL_RESERVED_GAS.as_gas(),
+                                    ),
+                                    true,
+                                ),
                                 deposit: NearToken::from_yoctonear(1),
                             }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -967,7 +993,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(69)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1068,7 +1094,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(69)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1173,7 +1199,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(69)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                     },
@@ -1252,7 +1278,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(54)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1352,7 +1378,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(103_400)),
+                            gas: Gas(NearGas::from_tgas(89)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1460,7 +1486,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(103_400)),
+                            gas: Gas(NearGas::from_tgas(89)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1563,7 +1589,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(74)),
                             deposit: NearToken::from_yoctonear(101),
                         }))],
                     },
@@ -1650,7 +1676,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(69)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1729,7 +1755,7 @@ mod tests {
                                 "referrer": DEFAULT_REFERRER_ID,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(74_400)),
+                            gas: Gas(NearGas::from_tgas(54)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1875,7 +1901,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_ggas(74_400)),
+                        gas: Gas(NearGas::from_tgas(69)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],
@@ -1942,7 +1968,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_ggas(74_400)),
+                        gas: Gas(NearGas::from_tgas(69)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                 }],

@@ -443,7 +443,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -521,7 +521,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -607,7 +607,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -693,7 +693,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -776,7 +776,7 @@ mod tests {
                                 "skip_degen_price_sync": true,
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(36_050)),
+                            gas: Gas(NearGas::from_ggas(33_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -847,7 +847,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -926,7 +926,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1004,7 +1004,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1197,7 +1197,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },
@@ -1265,7 +1265,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_ggas(93_050)),
+                            gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                     },

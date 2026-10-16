@@ -47,15 +47,14 @@ const FUNCTION_CALL_BYTE_FEE_GAS: NearGas = NearGas::from_gas(47_683_715 + 2_235
 
 const MAX_SWAP_GAS: NearGas = NearGas::from_tgas(900);
 const FT_TRANSFER_CALL_GAS: NearGas = NearGas::from_tgas(10);
-const SWAP_GAS_MARGIN_FIXED_PART: NearGas = NearGas::from_tgas(20);
-const SWAP_GAS_MARGIN_PERCENT_PART: u64 = 10;
+const SWAP_GAS_MARGIN: NearGas = NearGas::from_tgas(18);
 
 /// Gas to attach to a call that swaps: the gas the DEX is predicted to burn for the swaps with a
 /// margin, `reserved` for everything else the DEX needs in the call, its callbacks and transfers,
 /// and `FT_TRANSFER_CALL_GAS` if it's `ft_transfer_call`.
 pub fn swap_call_gas(swap_gas: NearGas, reserved: NearGas, ft_transfer_call: bool) -> Gas {
-    let gas = swap_gas.as_gas() * (100 + SWAP_GAS_MARGIN_PERCENT_PART) / 100
-        + SWAP_GAS_MARGIN_FIXED_PART.as_gas()
+    let gas = swap_gas.as_gas()
+        + SWAP_GAS_MARGIN.as_gas()
         + reserved.as_gas()
         + if ft_transfer_call {
             FT_TRANSFER_CALL_GAS.as_gas()
@@ -1313,11 +1312,7 @@ pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToke
 /// What the execution instructions are expected to cost in gas, with unused margin refunded
 pub fn estimated_gas_usage(execution_instructions: &[ExecutionInstruction]) -> NearToken {
     let gas = total_gas(execution_instructions, |call| {
-        call.gas
-            .as_gas()
-            .saturating_sub(SWAP_GAS_MARGIN_FIXED_PART.as_gas())
-            * 100
-            / (100 + SWAP_GAS_MARGIN_PERCENT_PART)
+        call.gas.as_gas().saturating_sub(SWAP_GAS_MARGIN.as_gas())
     });
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
 }

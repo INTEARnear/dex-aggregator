@@ -489,11 +489,28 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-const HOP_GAS: NearGas = NearGas::from_ggas(2_500);
+const HOP_GAS: NearGas = NearGas::from_ggas(3_500);
 
-fn swap_gas(split_route: &SplitRoute) -> NearGas {
+impl Pool {
+    fn hop_gas(&self) -> NearGas {
+        match self.detail {
+            PoolDetailInfo::SimplePoolInfo(_) => HOP_GAS,
+            PoolDetailInfo::StablePoolInfo(_) => NearGas::from_ggas(4_000),
+            PoolDetailInfo::RatedPoolInfo(_) => NearGas::from_ggas(5_800),
+            PoolDetailInfo::DegenPoolInfo(_) => NearGas::from_ggas(5_000),
+        }
+    }
+}
+
+fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> NearGas {
     NearGas::from_gas(
-        NearGas::from_ggas(3_000).as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64,
+        NearGas::from_ggas(1_500).as_gas()
+            + split_route
+                .parts
+                .iter()
+                .flat_map(|part| &part.route.hops)
+                .map(|hop| graph.pools()[hop.pool].hop_gas().as_gas())
+                .sum::<u64>(),
     )
 }
 
@@ -550,7 +567,7 @@ fn exact_in_response(
         contract_out: token_out.clone(),
         amount_in: total_amount_in,
         amount_out: total_estimated_out,
-        swap_gas: swap_gas(split_route),
+        swap_gas: swap_gas(split_route, graph),
     })
 }
 

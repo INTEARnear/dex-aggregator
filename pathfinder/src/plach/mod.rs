@@ -547,8 +547,8 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-const SWAP_BASE_GAS: NearGas = NearGas::from_tgas(26);
-const HOP_GAS: NearGas = NearGas::from_ggas(4_500);
+const SWAP_BASE_GAS: NearGas = NearGas::from_tgas(23);
+const HOP_GAS: NearGas = NearGas::from_tgas(2);
 
 fn swap_gas(split_route: &SplitRoute) -> NearGas {
     NearGas::from_gas(SWAP_BASE_GAS.as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64)
