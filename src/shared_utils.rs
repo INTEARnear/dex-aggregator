@@ -193,6 +193,12 @@ pub trait NetworkView: Send + Sync {
         asset_id: &AssetId,
     ) -> impl Future<Output = bool> + Send;
 
+    fn ft_balance(
+        &self,
+        token_id: AccountId,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<Balance, String>> + Send;
+
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
@@ -263,6 +269,25 @@ impl NetworkView for Mainnet {
             .unwrap_or_default()
     }
 
+    async fn ft_balance(
+        &self,
+        token_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<Balance, String> {
+        RPC_CLIENT
+            .call::<near_sdk::json_types::U128>(
+                token_id,
+                "ft_balance_of",
+                serde_json::json!({
+                    "account_id": account_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map(|balance| balance.0)
+            .map_err(|err| format!("{err:?}"))
+    }
+
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
         TOKEN_INFOS.read().unwrap().clone()
     }
@@ -282,6 +307,7 @@ pub(crate) struct TestNetworkView {
     tokens: Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
+    ft_balances: HashMap<(AccountId, AccountId), Balance>,
 }
 
 #[cfg(test)]
@@ -295,6 +321,7 @@ impl Default for TestNetworkView {
             tokens: Ok(Arc::default()),
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
+            ft_balances: HashMap::new(),
         }
     }
 }
@@ -391,6 +418,19 @@ impl TestNetworkView {
         self
     }
 
+    pub(crate) fn with_ft_balance(
+        mut self,
+        token_id: &str,
+        account_id: &str,
+        amount: Balance,
+    ) -> Self {
+        self.ft_balances.insert(
+            (token_id.parse().unwrap(), account_id.parse().unwrap()),
+            amount,
+        );
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_native_balance(mut self, account_id: &str, amount: NearToken) -> Self {
         self.native_balances
@@ -434,6 +474,18 @@ impl NetworkView for TestNetworkView {
             .get(&(account_id.clone(), asset_id.clone()))
             .copied()
             .unwrap_or(false)
+    }
+
+    async fn ft_balance(
+        &self,
+        token_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<Balance, String> {
+        Ok(self
+            .ft_balances
+            .get(&(token_id, account_id.clone()))
+            .copied()
+            .unwrap_or(0))
     }
 
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {

@@ -4,7 +4,7 @@ use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, Withdr
 use lazy_static::lazy_static;
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
-    AccountId, Action, BlockHeight, FunctionCallAction, Gas, NearGas, NearToken,
+    AccountId, Action, Balance, BlockHeight, FunctionCallAction, Gas, NearGas, NearToken,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
 use pathfinder::{
@@ -37,10 +37,24 @@ const EXECUTE_OPERATIONS_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
 
 pub use intear_dex_types::AssetId;
 
-/// Taken off the pool and protocol fees of every quote
-const FEE_DISCOUNT: FeeFractionFraction = FULL_FEE_FRACTION_FRACTION / 10;
+const TEAR_TOKEN_ID: &str = "token.intear.near";
+const ONE_TEAR: Balance = 10u128.pow(24);
+
+const TEAR_FEE_DISCOUNTS: [(Balance, FeeFractionFraction); 3] = [
+    (100_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION * 3 / 4), // 100,000 = 75% discount
+    (1_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 4),       // 1,000 = 25% discount
+    (10 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 10),         // 10 = 10% discount
+];
+
 /// How long a quote's fee discount can be used, ~10 minutes
 const FEE_DISCOUNT_VALIDITY_BLOCKS: BlockHeight = 1000;
+
+fn tear_fee_discount(tear_balance: Balance) -> Option<FeeFractionFraction> {
+    TEAR_FEE_DISCOUNTS
+        .into_iter()
+        .find(|(min_balance, _)| tear_balance >= *min_balance)
+        .map(|(_, fee_discount)| fee_discount)
+}
 
 lazy_static! {
     pub static ref FEE_DISCOUNTER: FeeDiscounter = FeeDiscounter::from_env();
@@ -241,6 +255,18 @@ async fn route(
         return None;
     }
 
+    let fee_discount = match (fee_discounter, &request.trader_account_id) {
+        (Some(fee_discounter), Some(trader_account_id)) => {
+            let tear_balance = network
+                .ft_balance(TEAR_TOKEN_ID.parse().unwrap(), trader_account_id)
+                .await
+                .inspect_err(|e| info!("No TEAR balance to discount fees by: {e}"))
+                .ok()?;
+            tear_fee_discount(tear_balance).map(|fee_discount| (fee_discounter, fee_discount))
+        }
+        _ => None,
+    };
+
     let response = quotes
         .find_path(plach::Request {
             token_in: token_in.clone(),
@@ -263,10 +289,7 @@ async fn route(
                 .referrer_id
                 .clone()
                 .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap()),
-            fee_discount: match fee_discounter {
-                Some(_) => FEE_DISCOUNT,
-                None => 0,
-            },
+            fee_discount: fee_discount.map_or(0, |(_, fee_discount)| fee_discount),
         })
         .await?;
 
@@ -274,7 +297,7 @@ async fn route(
         SplitRouteApiResponse::ExactIn { swap_gas, .. }
         | SplitRouteApiResponse::ExactOut { swap_gas, .. } => swap_gas,
     };
-    let discount = fee_discounter.map(|_| match response {
+    let discount = fee_discount.map(|_| match response {
         SplitRouteApiResponse::ExactIn { discount, .. } => Amount::AmountOut(discount.0),
         SplitRouteApiResponse::ExactOut { discount, .. } => Amount::AmountIn(discount.0),
     });
@@ -328,8 +351,8 @@ async fn route(
     if swap_routes.is_empty() {
         return None;
     }
-    let fee_discount = match fee_discounter {
-        Some(fee_discounter) => {
+    let fee_discount = match fee_discount {
+        Some((fee_discounter, fee_discount)) => {
             let current_block_height = network
                 .current_block_height()
                 .inspect_err(|e| info!("No block height to expire a fee discount at: {e}"))
@@ -340,7 +363,7 @@ async fn route(
                 asset_out: token_out.clone(),
                 trader_id: request.trader_account_id.clone(),
                 amount: swap_amount,
-                fee_discount: FEE_DISCOUNT,
+                fee_discount,
                 expiration_block_height: current_block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
             }))
         }
@@ -740,6 +763,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fee_discount_grows_with_tear_holdings() {
+        assert_eq!(tear_fee_discount(0), None);
+        assert_eq!(tear_fee_discount(10 * ONE_TEAR - 1), None);
+        assert_eq!(tear_fee_discount(10 * ONE_TEAR), Some(100_000));
+        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR - 1), Some(100_000));
+        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR), Some(250_000));
+        assert_eq!(tear_fee_discount(100_000 * ONE_TEAR), Some(750_000));
+        assert_eq!(tear_fee_discount(u128::MAX), Some(750_000));
+    }
+
+    #[tokio::test]
+    async fn no_fee_discount_without_tear() {
+        use near_min_api::types::near_crypto::KeyType;
+
+        let fee_discounter = FeeDiscounter {
+            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
+        };
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountIn(100),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                signing_public_key: None,
+                referrer_id: None,
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 10 * ONE_TEAR - 1),
+            &TestPlachQuotes::default(),
+            Some(&fee_discounter),
+        )
+        .await
+        .unwrap();
+        assert_eq!(route.discount, None);
+    }
+
     #[tokio::test]
     async fn signs_fee_discount() {
         use base64::Engine;
@@ -762,7 +828,9 @@ mod tests {
                 signing_public_key: None,
                 referrer_id: None,
             },
-            &TestNetworkView::default().with_test_prices(),
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 1_000 * ONE_TEAR),
             &TestPlachQuotes::default(),
             Some(&fee_discounter),
         )
@@ -804,7 +872,7 @@ mod tests {
         assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
         assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
         assert_eq!(discount.amount, SwapRequestAmount::ExactIn(U128(100)));
-        assert_eq!(discount.fee_discount, 100_000);
+        assert_eq!(discount.fee_discount, 250_000);
         assert_eq!(discount.expiration_block_height, 1_001_000);
         assert!(Signature::from_parts(KeyType::ED25519, &signature)
             .unwrap()
