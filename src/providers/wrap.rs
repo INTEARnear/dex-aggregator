@@ -20,8 +20,6 @@ impl Provider for WrapProvider {
             if nep141_in == nep141_out {
                 // Identity: fee-free conversion is handled in main.rs
                 return Some(Route {
-                    deadline: None,
-                    has_slippage: false,
                     estimated_amount: match request.amount {
                         Amount::AmountIn(amount) => Amount::AmountOut(amount),
                         Amount::AmountOut(amount) => Amount::AmountIn(amount),

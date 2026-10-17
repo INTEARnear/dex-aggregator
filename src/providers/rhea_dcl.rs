@@ -233,8 +233,7 @@ async fn route(
     Some(Route {
         dex_id: DexId::RheaDcl,
         estimated_amount,
-        deadline: None,
-        has_slippage: true,
+
         worst_case_amount,
         execution_instructions: transactions,
         deprecated_needs_unwrap_always_false: false,
@@ -345,8 +344,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::RheaDcl,
@@ -433,8 +430,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::RheaDcl,
@@ -508,8 +503,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::RheaDcl,
@@ -646,8 +639,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::RheaDcl,

@@ -241,8 +241,6 @@ async fn route(
 
         return Some(Route {
             dex_id: DexId::Rhea,
-            deadline: None,
-            has_slippage: true,
             estimated_amount: Amount::AmountOut(response.amount_out),
             worst_case_amount: Amount::AmountOut(total_min_amount_out),
             execution_instructions: transactions,
@@ -309,8 +307,6 @@ async fn route(
 
     Some(Route {
         dex_id: DexId::Rhea,
-        deadline: None,
-        has_slippage: true,
         estimated_amount: Amount::AmountOut(response.amount_out),
         worst_case_amount: Amount::AmountOut(total_min_amount_out),
         execution_instructions: transactions,
@@ -424,8 +420,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -510,8 +504,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -591,8 +583,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -681,8 +671,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -780,8 +768,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -857,8 +843,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -930,8 +914,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -1012,8 +994,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -1218,8 +1198,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,
@@ -1288,8 +1266,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Rhea,

@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, Utc};
 use near_min_api::{
     types::{near_crypto::PublicKey, AccountId, Action, Balance, NearToken},
     utils::dec_format,
@@ -234,13 +233,6 @@ pub enum Slippage {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Route {
-    /// The deadline for the route. If provided, you should refresh the route by
-    /// calling the /route endpoint again 2-3 seconds before the deadline to account
-    /// for network and block production latency.
-    pub deadline: Option<DateTime<Utc>>,
-    /// Whether the route has slippage. Usually it's true for AMM models like Rhea
-    /// and false for OTC / guaranteed-quote models.
-    pub has_slippage: bool,
     /// The amount of tokens this route will swap. If you provided `Amount::AmountOut`,
     /// this amount will be `Amount::AmountIn` and vice versa.
     pub estimated_amount: Amount,

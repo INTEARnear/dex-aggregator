@@ -594,8 +594,7 @@ async fn route(
 
     Some(Route {
         dex_id: DexId::Plach,
-        deadline: None,
-        has_slippage: true,
+
         estimated_amount,
         worst_case_amount,
         execution_instructions: [registration_transactions, transactions].concat(),
@@ -936,8 +935,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1036,8 +1033,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1141,8 +1136,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1250,8 +1243,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1331,8 +1322,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1434,8 +1423,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1546,8 +1533,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::Plach,
@@ -1652,8 +1637,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::Plach,
@@ -1741,8 +1724,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::Plach,
@@ -1898,8 +1879,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
@@ -1966,8 +1945,6 @@ mod tests {
             )
             .await,
             Some(Route {
-                deadline: None,
-                has_slippage: true,
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::Plach,
