@@ -114,12 +114,13 @@ pub fn create_rhea_withdraw_action(
     }))
 }
 
-pub fn create_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -> Action {
+pub fn create_fee_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "ft_transfer".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
             "receiver_id": receiver_id,
             "amount": amount.to_string(),
+            "memo": "Trading fee",
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(10)),
@@ -127,7 +128,7 @@ pub fn create_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -> Ac
     }))
 }
 
-pub fn create_rhea_mft_transfer_action(
+pub fn create_rhea_fee_mft_transfer_action(
     token_id: &AccountId,
     receiver_id: &AccountId,
     amount: Balance,
@@ -138,6 +139,7 @@ pub fn create_rhea_mft_transfer_action(
             "token_id": token_id,
             "receiver_id": receiver_id,
             "amount": amount.to_string(),
+            "memo": "Trading fee",
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(10)),
@@ -328,7 +330,7 @@ pub async fn convert_to_nep141_with_fees(
             receiver_id: nep141.clone(),
             actions: fees
                 .iter()
-                .map(|fee| create_ft_transfer_action(&fee.referrer_id, fee.amount))
+                .map(|fee| create_fee_ft_transfer_action(&fee.referrer_id, fee.amount))
                 .collect(),
             is_fee_transaction: true,
         }]

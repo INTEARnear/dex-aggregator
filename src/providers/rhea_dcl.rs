@@ -249,8 +249,8 @@ mod tests {
 
     use super::*;
     use crate::shared_utils::{
-        create_ft_transfer_action, create_storage_deposit_action_for_contract, create_wrap_action,
-        TestNetworkView, WRAP_NEAR,
+        create_fee_ft_transfer_action, create_storage_deposit_action_for_contract,
+        create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
     use xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID;
@@ -761,8 +761,8 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 4),
-                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 4),
+                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
                     ],
                     is_fee_transaction: true,
                 },
@@ -820,8 +820,8 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -887,9 +887,9 @@ mod tests {
             [ExecutionInstruction::NearTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
                 actions: vec![
-                    create_ft_transfer_action(&"ref.near".parse().unwrap(), 1),
-                    create_ft_transfer_action(&"ref2.near".parse().unwrap(), 2),
-                    create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                    create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 1),
+                    create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 2),
+                    create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
                 ],
                 is_fee_transaction: true,
             },]

@@ -1853,3 +1853,30 @@ async fn protocol_share_is_not_charged_when_the_protocol_cant_receive() {
     // The referrer still only gets its 80%
     assert_eq!(payable.0, vec![("ref.near".parse().unwrap(), 8_000)]);
 }
+
+#[test]
+fn fee_transfers_have_a_trading_fee_memo() {
+    let args = |action: Action| match action {
+        Action::FunctionCall(call) => {
+            serde_json::from_slice::<serde_json::Value>(&call.args).unwrap()
+        }
+        _ => panic!("Not a function call"),
+    };
+    assert_eq!(
+        args(create_fee_ft_transfer_action(&account("ref.near"), 8)),
+        serde_json::json!({"receiver_id": "ref.near", "amount": "8", "memo": "Trading fee"})
+    );
+    assert_eq!(
+        args(create_rhea_fee_mft_transfer_action(
+            &account("ft"),
+            &account("ref.near"),
+            8
+        )),
+        serde_json::json!({
+            "token_id": "ft",
+            "receiver_id": "ref.near",
+            "amount": "8",
+            "memo": "Trading fee",
+        })
+    );
+}

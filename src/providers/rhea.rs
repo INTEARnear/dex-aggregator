@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, convert_to_nep141_with_fees, create_rhea_mft_transfer_action,
+        convert_to_nep141, convert_to_nep141_with_fees, create_rhea_fee_mft_transfer_action,
         create_storage_deposit_action_for_contract, deposit_storage_if_needed, get_slippage,
         needs_storage_deposit_for_contract, payable_referral_fees, price_raw,
         referrer_fees_of_total, swap_call_gas, total_fee_amount, Mainnet, NetworkView,
@@ -227,7 +227,7 @@ async fn route(
 
         let fee_actions = referrer_fees
             .iter()
-            .map(|fee| create_rhea_mft_transfer_action(&token_in, &fee.referrer_id, fee.amount))
+            .map(|fee| create_rhea_fee_mft_transfer_action(&token_in, &fee.referrer_id, fee.amount))
             .collect();
         let transactions = [
             registration_transactions,
@@ -331,8 +331,8 @@ mod tests {
     use super::*;
     use crate::providers::intear_plach::AssetId;
     use crate::shared_utils::{
-        create_ft_transfer_action, create_intear_dex_withdraw_action,
-        create_rhea_mft_transfer_action, create_rhea_withdraw_action,
+        create_fee_ft_transfer_action, create_intear_dex_withdraw_action,
+        create_rhea_fee_mft_transfer_action, create_rhea_withdraw_action,
         create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
@@ -1432,8 +1432,8 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1480,8 +1480,8 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: "ft".parse().unwrap(),
                     actions: vec![
-                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1557,12 +1557,12 @@ mod tests {
                         gas: Gas(NearGas::from_ggas(33_500)),
                         deposit: NearToken::from_yoctonear(1),
                     })),
-                    create_rhea_mft_transfer_action(
+                    create_rhea_fee_mft_transfer_action(
                         &"ft".parse().unwrap(),
                         &"ref.near".parse().unwrap(),
                         8,
                     ),
-                    create_rhea_mft_transfer_action(
+                    create_rhea_fee_mft_transfer_action(
                         &"ft".parse().unwrap(),
                         &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
                         2,
@@ -1647,9 +1647,9 @@ mod tests {
                     receiver_id: "ft".parse().unwrap(),
                     // 80% of each fee to its referrer, the protocol's 20% of both together
                     actions: vec![
-                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
+                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1702,9 +1702,9 @@ mod tests {
             &ExecutionInstruction::NearTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
                 actions: vec![
-                    create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                    create_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                    create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                    create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                    create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
+                    create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
                 ],
                 is_fee_transaction: true,
             }
@@ -1740,17 +1740,17 @@ mod tests {
         assert_eq!(
             actions[1..],
             [
-                create_rhea_mft_transfer_action(
+                create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &"ref.near".parse().unwrap(),
                     8,
                 ),
-                create_rhea_mft_transfer_action(
+                create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &"ref2.near".parse().unwrap(),
                     16,
                 ),
-                create_rhea_mft_transfer_action(
+                create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
                     6,
