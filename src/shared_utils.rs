@@ -22,10 +22,14 @@ use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
 use tracing::{error, info, warn};
+use xyk_dex_types::{
+    FULL_FEE_FRACTION, FULL_FEE_FRACTION_FRACTION, PROTOCOL_FEE_RECEIVER_ID,
+    REFERRAL_FEE_PROTOCOL_SHARE,
+};
 
 use crate::{
     providers::intear_plach::AssetId,
-    types::{ExecutionInstruction, Slippage, TokenId},
+    types::{ExecutionInstruction, ReferralFees, Slippage, TokenId},
 };
 
 pub const WRAP_NEAR: &str = "wrap.near";
@@ -106,6 +110,37 @@ pub fn create_rhea_withdraw_action(
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(50)),
+        deposit: NearToken::from_yoctonear(1),
+    }))
+}
+
+pub fn create_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -> Action {
+    Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "ft_transfer".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({
+            "receiver_id": receiver_id,
+            "amount": amount.to_string(),
+        }))
+        .unwrap(),
+        gas: Gas(NearGas::from_tgas(10)),
+        deposit: NearToken::from_yoctonear(1),
+    }))
+}
+
+pub fn create_rhea_mft_transfer_action(
+    token_id: &AccountId,
+    receiver_id: &AccountId,
+    amount: Balance,
+) -> Action {
+    Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "mft_transfer".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({
+            "token_id": token_id,
+            "receiver_id": receiver_id,
+            "amount": amount.to_string(),
+        }))
+        .unwrap(),
+        gas: Gas(NearGas::from_tgas(10)),
         deposit: NearToken::from_yoctonear(1),
     }))
 }
@@ -201,6 +236,104 @@ pub trait NetworkView: Send + Sync {
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
+}
+
+/// A referrer's fee in the input token of a route
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferrerFee {
+    pub referrer_id: AccountId,
+    pub amount: Balance,
+}
+
+/// The referral fees of the request that `can_receive` says the referrer can be paid, the
+/// others are skipped. Like the xyk DEX, [`REFERRAL_FEE_PROTOCOL_SHARE`] of each fee goes to the
+/// protocol fee receiver instead of the referrer, if it can be paid too.
+pub async fn payable_referral_fees<Fut: Future<Output = bool>>(
+    referral_fees: &ReferralFees,
+    can_receive: impl Fn(AccountId) -> Fut,
+) -> ReferralFees {
+    let mut payable = Vec::new();
+    let mut protocol_share = 0;
+    for (referrer_id, fee_fraction) in &referral_fees.0 {
+        // A fee of 0 pays nothing, so there's no need to check
+        if *fee_fraction == 0 {
+            continue;
+        }
+        if can_receive(referrer_id.clone()).await {
+            // Rounded down, like the xyk DEX
+            let share = (u64::from(*fee_fraction) * u64::from(REFERRAL_FEE_PROTOCOL_SHARE)
+                / u64::from(FULL_FEE_FRACTION_FRACTION)) as u32;
+            protocol_share += share;
+            payable.push((referrer_id.clone(), fee_fraction - share));
+        } else {
+            info!("Referrer {referrer_id} can't receive the input token, routing without its fee");
+        }
+    }
+    if protocol_share > 0 {
+        if can_receive(PROTOCOL_FEE_RECEIVER_ID.to_owned()).await {
+            match payable
+                .iter_mut()
+                .find(|(referrer_id, _)| referrer_id == PROTOCOL_FEE_RECEIVER_ID)
+            {
+                Some((_, fee_fraction)) => *fee_fraction += protocol_share,
+                None => payable.push((PROTOCOL_FEE_RECEIVER_ID.to_owned(), protocol_share)),
+            }
+        } else {
+            info!(
+                "{PROTOCOL_FEE_RECEIVER_ID} can't receive the input token, routing without the protocol share of referral fees"
+            );
+        }
+    }
+    ReferralFees(payable)
+}
+
+/// Each referrer's fee out of `total`, without the ones rounded down to nothing
+pub fn referrer_fees_of_total(referral_fees: &ReferralFees, total: Balance) -> Vec<ReferrerFee> {
+    referral_fees
+        .0
+        .iter()
+        .map(|(referrer_id, fee_fraction)| ReferrerFee {
+            referrer_id: referrer_id.clone(),
+            // Split so it doesn't overflow for large amounts, rounded down
+            amount: total / FULL_FEE_FRACTION as u128 * *fee_fraction as u128
+                + total % FULL_FEE_FRACTION as u128 * *fee_fraction as u128
+                    / FULL_FEE_FRACTION as u128,
+        })
+        .filter(|fee| fee.amount > 0)
+        .collect()
+}
+
+pub fn total_fee_amount(fees: &[ReferrerFee]) -> Balance {
+    fees.iter().map(|fee| fee.amount).sum()
+}
+
+/// [`convert_to_nep141`] of `total`, and the fee transaction that sends `fees` of it to the
+/// referrers with `ft_transfer`, to go after the swap. NEAR is wrapped whole, so its fees are paid
+/// in wNEAR too.
+pub async fn convert_to_nep141_with_fees(
+    token_id: &TokenId,
+    trader_account_id: Option<AccountId>,
+    total: Balance,
+    fees: &[ReferrerFee],
+) -> Option<(
+    Vec<ExecutionInstruction>,
+    Vec<ExecutionInstruction>,
+    AccountId,
+)> {
+    let (to_nep141, nep141) = convert_to_nep141(token_id, trader_account_id, total).await?;
+    let send_fees = if fees.is_empty() {
+        Vec::new()
+    } else {
+        vec![ExecutionInstruction::NearTransaction {
+            receiver_id: nep141.clone(),
+            actions: fees
+                .iter()
+                .map(|fee| create_ft_transfer_action(&fee.referrer_id, fee.amount))
+                .collect(),
+            is_fee_transaction: true,
+        }]
+    };
+    Some((to_nep141, send_fees, nep141))
 }
 
 pub struct Mainnet;
@@ -518,6 +651,7 @@ async fn create_ft_deposit_registrations(
         vec![ExecutionInstruction::NearTransaction {
             receiver_id: token_id.clone(),
             actions,
+            is_fee_transaction: false,
         }]
     }
 }
@@ -583,6 +717,7 @@ pub async fn create_storage_deposit_action(
             actions: vec![
                 create_nep141_storage_deposit_action(network, token_account_id, None).await,
             ],
+            is_fee_transaction: false,
         }],
         TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
         TokenId::Nep141OnRhea(token_id) => {
@@ -603,6 +738,7 @@ pub async fn create_storage_deposit_action(
                         deposit: NearToken::from_yoctonear(1),
                     })),
                 ],
+                is_fee_transaction: false,
             }]
         }
         TokenId::TokenOnIntearDex(asset_id) => {
@@ -625,6 +761,7 @@ pub async fn create_storage_deposit_action(
                         deposit: NearToken::from_yoctonear(1),
                     })),
                 ],
+                is_fee_transaction: false,
             }]
         }
     }
@@ -942,6 +1079,7 @@ pub fn optimize_execution_instructions(
             ExecutionInstruction::NearTransaction {
                 receiver_id,
                 actions,
+                is_fee_transaction,
             } => {
                 if actions.is_empty() {
                     continue;
@@ -949,9 +1087,14 @@ pub fn optimize_execution_instructions(
                 if let Some(ExecutionInstruction::NearTransaction {
                     receiver_id: prev_receiver_id,
                     actions: prev_actions,
+                    is_fee_transaction: prev_is_fee_transaction,
                 }) = optimized_execution_instructions.last_mut()
                 {
-                    if prev_receiver_id == receiver_id {
+                    // Fee transactions only merge with each other, so failed swap
+                    // ft_trasnsfer_call doesn't merge with fee ft_transfer
+                    if prev_receiver_id == receiver_id
+                        && prev_is_fee_transaction == is_fee_transaction
+                    {
                         prev_actions.extend(actions.iter().cloned());
                     } else {
                         optimized_execution_instructions.push(next_instruction);
@@ -977,6 +1120,7 @@ pub async fn convert_to_nep141(
                 transactions.push(ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
                     actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+                    is_fee_transaction: false,
                 });
             }
             Some((transactions, WRAP_NEAR.parse::<AccountId>().unwrap()))
@@ -986,6 +1130,7 @@ pub async fn convert_to_nep141(
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: "v2.ref-finance.near".parse().unwrap(),
                 actions: vec![create_rhea_withdraw_action(token_id, amount, false)],
+                is_fee_transaction: false,
             }],
             token_id.clone(),
         )),
@@ -994,6 +1139,7 @@ pub async fn convert_to_nep141(
                 vec![ExecutionInstruction::NearTransaction {
                     receiver_id: "dex.intear.near".parse().unwrap(),
                     actions: vec![create_intear_dex_withdraw_action(asset_id, amount)],
+                    is_fee_transaction: false,
                 }]
             } else {
                 vec![]
@@ -1004,6 +1150,7 @@ pub async fn convert_to_nep141(
                         vec![ExecutionInstruction::NearTransaction {
                             receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
                             actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+                            is_fee_transaction: false,
                         }]
                     } else {
                         vec![]
@@ -1032,6 +1179,7 @@ pub async fn convert_to_native(
                 Some(vec![ExecutionInstruction::NearTransaction {
                     receiver_id: account_id.clone(),
                     actions: vec![create_unwrap_action(amount)],
+                    is_fee_transaction: false,
                 }])
             } else {
                 None
@@ -1049,6 +1197,7 @@ pub async fn convert_to_native(
                     amount.as_yoctonear(),
                     true,
                 )],
+                is_fee_transaction: false,
             }])
         }
         TokenId::Nep141OnRhea(_non_wrap_near) => None,
@@ -1062,6 +1211,7 @@ pub async fn convert_to_native(
                     asset_id,
                     amount.as_yoctonear(),
                 )],
+                is_fee_transaction: false,
             };
             match asset_id {
                 AssetId::Near => Some(vec![withdraw]),
@@ -1070,6 +1220,7 @@ pub async fn convert_to_native(
                     ExecutionInstruction::NearTransaction {
                         receiver_id: account_id.clone(),
                         actions: vec![create_unwrap_action(amount)],
+                        is_fee_transaction: false,
                     },
                 ]),
                 AssetId::Nep141(_) | AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => None,
@@ -1089,6 +1240,7 @@ pub async fn deposit_storage_on_contract_if_needed(
             return vec![ExecutionInstruction::NearTransaction {
                 receiver_id: contract_id.to_owned(),
                 actions: vec![create_storage_deposit_action_for_contract(amount, true)],
+                is_fee_transaction: false,
             }];
         }
     }
@@ -1167,6 +1319,7 @@ pub async fn convert_to(
                 vec![ExecutionInstruction::NearTransaction {
                     receiver_id: "v2.ref-finance.near".parse().unwrap(),
                     actions: vec![create_rhea_withdraw_action(token_id, amount, unwrap_near)],
+                    is_fee_transaction: false,
                 }],
                 if unwrap_near {
                     BaseTokenId::Near
@@ -1179,6 +1332,7 @@ pub async fn convert_to(
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: "dex.intear.near".parse().unwrap(),
                 actions: vec![create_intear_dex_withdraw_action(asset_id, amount)],
+                is_fee_transaction: false,
             }],
             from_base_token,
         ),
@@ -1204,6 +1358,7 @@ pub async fn convert_to(
                     &"v2.ref-finance.near".parse().unwrap(),
                     amount,
                 )],
+                is_fee_transaction: false,
             }],
         ),
         TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) => (
@@ -1224,6 +1379,7 @@ pub async fn convert_to(
                     &"dex.intear.near".parse().unwrap(),
                     amount,
                 )],
+                is_fee_transaction: false,
             }],
         ),
         TokenId::TokenOnIntearDex(AssetId::Near) => (
@@ -1236,6 +1392,7 @@ pub async fn convert_to(
                     gas: Gas(NearGas::from_tgas(10)),
                     deposit: NearToken::from_yoctonear(amount),
                 }))],
+                is_fee_transaction: false,
             }],
         ),
         TokenId::Near
@@ -1253,6 +1410,7 @@ pub async fn convert_to(
                 vec![ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
                     actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+                    is_fee_transaction: false,
                 }]
             } else {
                 vec![]
@@ -1263,6 +1421,7 @@ pub async fn convert_to(
                 vec![ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse::<AccountId>().unwrap(),
                     actions: vec![create_unwrap_action(NearToken::from_yoctonear(amount))],
+                    is_fee_transaction: false,
                 }]
             } else {
                 vec![]

@@ -6,11 +6,14 @@ use pathfinder::{
     MaxHops, QuoteAmount,
 };
 use tracing::info;
+use xyk_dex_types::FULL_FEE_FRACTION;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, deposit_storage_if_needed, deposit_storage_on_contract_if_needed,
-        get_slippage, price_raw, swap_call_gas, Mainnet, NetworkView,
+        convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
+        deposit_storage_on_contract_if_needed, get_slippage, needs_storage_deposit_for_contract,
+        payable_referral_fees, price_raw, referrer_fees_of_total, swap_call_gas, total_fee_amount,
+        Mainnet, NetworkView, ReferrerFee,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -70,12 +73,26 @@ async fn route(
         return None;
     }
 
+    // The fees come out of the input. Exact-in quotes the rest of it, exact-out adds the fees on
+    // top of the estimated input once it's quoted.
+    let nep141_in = &token_in;
+    let referral_fees = payable_referral_fees(&request.referral_fees, |referrer_id| async move {
+        !needs_storage_deposit_for_contract(network, &referrer_id, nep141_in).await
+    })
+    .await;
+    let exact_in_fees = match request.amount {
+        Amount::AmountIn(amount_in) => referrer_fees_of_total(&referral_fees, amount_in),
+        Amount::AmountOut(_) => Vec::new(),
+    };
+
     let response = quotes
         .find_path(dcl::Request {
             token_in: token_in.clone(),
             token_out: token_out.clone(),
             amount: match request.amount {
-                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
+                Amount::AmountIn(amount_in) => {
+                    QuoteAmount::ExactIn(amount_in - total_fee_amount(&exact_in_fees))
+                }
                 Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
             },
             max_hops: MaxHops::Four,
@@ -92,7 +109,7 @@ async fn route(
         .await?;
 
     let unwrapping_near = request.token_out == TokenId::Near;
-    let (amount_in, message, estimated_amount, worst_case_amount, swap_gas) = match response {
+    let (amount_in, message, estimated_amount, worst_case_amount, swap_gas, fees) = match response {
         RouteApiResponse::ExactIn { route, .. } => {
             let pool_ids = route
                 .pools
@@ -113,6 +130,7 @@ async fn route(
                 Amount::AmountOut(route.amount_out.0),
                 Amount::AmountOut(route.min_amount_out.0),
                 route.swap_gas,
+                exact_in_fees,
             )
         }
         RouteApiResponse::ExactOut { route, .. } => {
@@ -131,12 +149,33 @@ async fn route(
                     "skip_unwrap_near": !unwrapping_near,
                 }
             });
+            // Each referrer's share of the estimated input with all fees, not the worst case, so
+            // high slippage doesn't raise the fees
+            let rest = (FULL_FEE_FRACTION
+                - referral_fees
+                    .0
+                    .iter()
+                    .map(|(_, fee_fraction)| fee_fraction)
+                    .sum::<u32>()) as u128;
+            let amount = route.amount_in.0;
+            let fees = referral_fees
+                .0
+                .iter()
+                .map(|(referrer_id, fee_fraction)| ReferrerFee {
+                    referrer_id: referrer_id.clone(),
+                    amount: amount / rest * *fee_fraction as u128
+                        + amount % rest * *fee_fraction as u128 / rest,
+                })
+                .filter(|fee| fee.amount > 0)
+                .collect::<Vec<_>>();
+            let fee_amount = total_fee_amount(&fees);
             (
                 route.max_amount_in.0,
                 message,
-                Amount::AmountIn(route.amount_in.0),
-                Amount::AmountIn(route.max_amount_in.0),
+                Amount::AmountIn(route.amount_in.0 + fee_amount),
+                Amount::AmountIn(route.max_amount_in.0 + fee_amount),
                 route.swap_gas,
+                fees,
             )
         }
     };
@@ -155,12 +194,14 @@ async fn route(
     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
         receiver_id: token_in,
         actions: vec![swap_action],
+        is_fee_transaction: false,
     }];
 
-    let (input_to_nep141, input_nep141) = convert_to_nep141(
+    let (input_to_nep141, send_fees, input_nep141) = convert_to_nep141_with_fees(
         &request.token_in,
         request.trader_account_id.clone(),
-        amount_in,
+        amount_in + total_fee_amount(&fees),
+        &fees,
     )
     .await?;
     let token_output = if unwrapping_near {
@@ -186,6 +227,7 @@ async fn route(
         .await,
         input_to_nep141,
         swap_transactions,
+        send_fees,
     ]
     .concat();
     Some(Route {
@@ -207,9 +249,11 @@ mod tests {
 
     use super::*;
     use crate::shared_utils::{
-        create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
+        create_ft_transfer_action, create_storage_deposit_action_for_contract, create_wrap_action,
+        TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
+    use xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestRheaDclQuotes {
@@ -248,17 +292,17 @@ mod tests {
                 step(format!("{token_out}|usdc|2000"), &usdc, token_out),
             ];
             match request.amount {
-                QuoteAmount::ExactIn(_) => Some(RouteApiResponse::ExactIn {
+                QuoteAmount::ExactIn(amount_in) => Some(RouteApiResponse::ExactIn {
                     route: dcl::ExactInRoute {
                         pools,
-                        amount_in: U128(100),
+                        amount_in: U128(amount_in),
                         min_amount_out: U128(79),
                         amount_out: U128(80),
                         swap_gas: NearGas::from_tgas(20),
                     },
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: U128(100),
+                    amount_in: U128(amount_in),
                     amount_out: U128(80),
                 }),
                 QuoteAmount::ExactOut(_) => Some(RouteApiResponse::ExactOut {
@@ -295,6 +339,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -313,6 +358,7 @@ mod tests {
                             NearToken::from_millinear(500),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -320,6 +366,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -327,10 +374,12 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -353,6 +402,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -378,6 +428,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -396,6 +447,7 @@ mod tests {
                             NearToken::from_millinear(500),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -403,6 +455,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -425,6 +478,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -450,6 +504,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -468,6 +523,7 @@ mod tests {
                             NearToken::from_millinear(500),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -475,6 +531,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -482,10 +539,12 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(101))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -508,6 +567,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -533,6 +593,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -558,6 +619,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::none(),
@@ -583,6 +645,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -598,6 +661,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(101))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -620,12 +684,224 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(110)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn amount_out_referrer_fee_is_on_top_of_estimated_input() {
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountOut(80),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: None,
+                signing_public_key: None,
+                referrer_id: None,
+                referral_fees: "{\"ref.near\":0.05}".parse().unwrap(),
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaDclQuotes::default(),
+        )
+        .await
+        .unwrap();
+        // 5% of the estimated input with the fee: 100 * 5% / 95%, 80% of it to the referrer and
+        // 20% to the protocol, each rounded down
+        assert_eq!(route.estimated_amount, Amount::AmountIn(105));
+        assert_eq!(route.worst_case_amount, Amount::AmountIn(106));
+        assert_eq!(
+            route.execution_instructions,
+            vec![
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![create_wrap_action(NearToken::from_yoctonear(106))],
+                    is_fee_transaction: false,
+                },
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "ft_transfer_call".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "receiver_id": RHEA_DCL_CONTRACT_ID,
+                            "amount": "101",
+                            "msg": serde_json::to_string(&serde_json::json!({
+                                "SwapByOutput": {
+                                    "pool_ids": vec!["ft|usdc|2000", "wrap.near|usdc|100"],
+                                    "output_token": "ft",
+                                    "output_amount": "80",
+                                    "skip_unwrap_near": true,
+                                }
+                            }))
+                            .unwrap(),
+                        }))
+                        .unwrap(),
+                        gas: Gas(NearGas::from_tgas(110)),
+                        deposit: NearToken::from_yoctonear(1),
+                    }))],
+                    is_fee_transaction: false,
+                },
+                // After the swap
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![
+                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 4),
+                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn amount_in_referrer_fee_comes_out_of_the_quoted_input() {
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountIn(1000),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: None,
+                signing_public_key: None,
+                referrer_id: None,
+                referral_fees: "{\"ref.near\":0.01}".parse().unwrap(),
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaDclQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions[0],
+            ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![create_wrap_action(NearToken::from_yoctonear(1000))],
+                is_fee_transaction: false,
+            }
+        );
+        // After the swap
+        assert_eq!(
+            route.execution_instructions[route.execution_instructions.len() - 1..],
+            [
+                // 1% of 1000, 80% to the referrer and 20% to the protocol
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![
+                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn amount_out_referrer_fees_share_the_estimated_input() {
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountOut(80),
+                max_wait_ms: 1_000,
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: None,
+                signing_public_key: None,
+                referrer_id: None,
+                referral_fees: r#"{"ref.near":0.02,"ref2.near":0.03}"#.parse().unwrap(),
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref2.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaDclQuotes::default(),
+        )
+        .await
+        .unwrap();
+        // Each is its share of the estimated input with all fees: 100 * fee / 95% rounded down,
+        // 80% of each fee to its referrer and the protocol's 20% of both together
+        assert_eq!(route.estimated_amount, Amount::AmountIn(104));
+        assert_eq!(route.worst_case_amount, Amount::AmountIn(105));
+        assert_eq!(
+            route.execution_instructions[0],
+            ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![create_wrap_action(NearToken::from_yoctonear(105))],
+                is_fee_transaction: false,
+            }
+        );
+        // After the swap
+        assert_eq!(
+            route.execution_instructions[route.execution_instructions.len() - 1..],
+            [ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![
+                    create_ft_transfer_action(&"ref.near".parse().unwrap(), 1),
+                    create_ft_transfer_action(&"ref2.near".parse().unwrap(), 2),
+                    create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                ],
+                is_fee_transaction: true,
+            },]
         );
     }
 }

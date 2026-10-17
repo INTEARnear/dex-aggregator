@@ -2223,7 +2223,7 @@ dependencies = [
 [[package]]
 name = "intear-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=22daf3c561a4bc2d824e532a718b9229b44dcd7c#22daf3c561a4bc2d824e532a718b9229b44dcd7c"
+source = "git+https://github.com/INTEARnear/dex?rev=25c30dfe89a2b7e79ef29162f67ee070a7a47704#25c30dfe89a2b7e79ef29162f67ee070a7a47704"
 dependencies = [
  "near-sdk",
 ]
@@ -4665,7 +4665,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5447,7 +5447,7 @@ dependencies = [
 [[package]]
 name = "xyk-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=22daf3c561a4bc2d824e532a718b9229b44dcd7c#22daf3c561a4bc2d824e532a718b9229b44dcd7c"
+source = "git+https://github.com/INTEARnear/dex?rev=25c30dfe89a2b7e79ef29162f67ee070a7a47704#25c30dfe89a2b7e79ef29162f67ee070a7a47704"
 dependencies = [
  "ethnum",
  "intear-dex-types",

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use self::math::{SwapResult, as_u128, mul_div_floor};
-use self::pool::{Pool, PoolInit, Work};
+use self::pool::{Pool, PoolInit, PoolTax, Work};
 
 use crate::search::{self, Graph, MaxHops, PoolsDelta, QuoteAmount, Route, Settings};
 
@@ -103,6 +103,7 @@ struct PoolInfo {
     total_order_y: String,
     state: String,
     whitelist: Option<Vec<AccountId>>,
+    tax: Option<PoolTax>,
 }
 
 lazy_static! {
@@ -192,6 +193,7 @@ fn build_pool(
             token_y: info.token_y,
             fee: info.fee,
             point_delta: info.point_delta,
+            tax: info.tax,
             current_point: info.current_point,
             liquidity: info.liquidity,
             liquidity_x: info.liquidity_x,

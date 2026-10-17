@@ -70,6 +70,7 @@ fn near_tx(instruction: &ExecutionInstruction) -> (&AccountId, &[Action]) {
         ExecutionInstruction::NearTransaction {
             receiver_id,
             actions,
+            ..
         } => (receiver_id, actions),
     }
 }
@@ -88,6 +89,7 @@ fn wrap_tx(receiver: &str, amount: u128) -> ExecutionInstruction {
     ExecutionInstruction::NearTransaction {
         receiver_id: account(receiver),
         actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+        is_fee_transaction: false,
     }
 }
 
@@ -366,6 +368,7 @@ fn optimize_skips_empty_actions() {
         optimize_execution_instructions(vec![ExecutionInstruction::NearTransaction {
             receiver_id: account(WRAP_NEAR),
             actions: vec![],
+            is_fee_transaction: false,
         }])
         .is_empty()
     );
@@ -407,6 +410,31 @@ fn optimize_does_not_merge_different_receivers() {
 }
 
 #[test]
+fn optimize_merges_fee_transactions_only_with_each_other() {
+    let fee_tx = |amount| ExecutionInstruction::NearTransaction {
+        receiver_id: account(WRAP_NEAR),
+        actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+        is_fee_transaction: true,
+    };
+    let optimized =
+        optimize_execution_instructions(vec![wrap_tx(WRAP_NEAR, 1), fee_tx(2), fee_tx(3)]);
+    assert_eq!(
+        optimized,
+        vec![
+            wrap_tx(WRAP_NEAR, 1),
+            ExecutionInstruction::NearTransaction {
+                receiver_id: account(WRAP_NEAR),
+                actions: vec![
+                    create_wrap_action(NearToken::from_yoctonear(2)),
+                    create_wrap_action(NearToken::from_yoctonear(3)),
+                ],
+                is_fee_transaction: true,
+            },
+        ]
+    );
+}
+
+#[test]
 fn optimize_does_not_merge_non_adjacent_same_receiver() {
     let optimized = optimize_execution_instructions(vec![
         wrap_tx(WRAP_NEAR, 1),
@@ -423,6 +451,7 @@ fn optimize_skips_empty_actions_then_merges_neighbors() {
         ExecutionInstruction::NearTransaction {
             receiver_id: account(WRAP_NEAR),
             actions: vec![],
+            is_fee_transaction: false,
         },
         wrap_tx(WRAP_NEAR, 2),
     ]);
@@ -1722,6 +1751,7 @@ fn storage_deposits_add_up_every_deposit() {
                 NearToken::from_millinear(500),
                 true,
             )],
+            is_fee_transaction: false,
         },
         ExecutionInstruction::NearTransaction {
             receiver_id: account("ft"),
@@ -1729,6 +1759,7 @@ fn storage_deposits_add_up_every_deposit() {
                 NearToken::from_micronear(1_250),
                 true,
             )],
+            is_fee_transaction: false,
         },
     ];
     assert_eq!(
@@ -1751,6 +1782,7 @@ fn estimated_gas_usage_excludes_swap_margin() {
         vec![ExecutionInstruction::NearTransaction {
             receiver_id: account("v2.ref-finance.near"),
             actions: vec![call(gas)],
+            is_fee_transaction: false,
         }]
     };
     let fees = TRANSACTION_FEE_GAS.as_gas()
@@ -1773,4 +1805,51 @@ fn estimated_gas_usage_excludes_swap_margin() {
         estimated_gas_usage(&transaction(NearGas::from_tgas(10))),
         cost(fees)
     );
+}
+
+#[tokio::test]
+async fn protocol_gets_its_share_of_each_payable_referral_fee() {
+    let referral_fees: ReferralFees = r#"{"ref.near":0.01,"ref2.near":0.02,"cant.near":0.01}"#
+        .parse()
+        .unwrap();
+    let payable = payable_referral_fees(&referral_fees, |account_id| async move {
+        account_id.as_str() != "cant.near"
+    })
+    .await;
+    // 80% of each paid fee to its referrer, 20% of both together to the protocol, and nothing
+    // of the fee that isn't paid
+    assert_eq!(
+        payable.0,
+        vec![
+            ("ref.near".parse().unwrap(), 8_000),
+            ("ref2.near".parse().unwrap(), 16_000),
+            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6_000),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn protocol_share_adds_to_the_protocol_as_a_referrer() {
+    let referral_fees: ReferralFees =
+        r#"{"ref.near":0.01,"plach.intear.near":0.01}"#.parse().unwrap();
+    let payable = payable_referral_fees(&referral_fees, |_| async { true }).await;
+    assert_eq!(
+        payable.0,
+        // Referrers come sorted by account ID
+        vec![
+            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 12_000),
+            ("ref.near".parse().unwrap(), 8_000),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn protocol_share_is_not_charged_when_the_protocol_cant_receive() {
+    let referral_fees: ReferralFees = r#"{"ref.near":0.01}"#.parse().unwrap();
+    let payable = payable_referral_fees(&referral_fees, |account_id| async move {
+        account_id != xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID
+    })
+    .await;
+    // The referrer still only gets its 80%
+    assert_eq!(payable.0, vec![("ref.near".parse().unwrap(), 8_000)]);
 }

@@ -30,7 +30,7 @@ use crate::{
         storage_deposits, Mainnet,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
-    types::{Amount, DexId, Quote, Route, Slippage, SwapRequest, TokenId},
+    types::{Amount, DexId, ExecutionInstruction, Quote, Route, Slippage, SwapRequest, TokenId},
 };
 
 mod providers;
@@ -248,8 +248,22 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
                 route.token_output = request.token_out.clone();
             }
         }
+        // Fee transactions go last, after the output conversion too, so the swap doesn't wait
+        // for fees.
+        let (fee_transactions, swap_transactions): (Vec<_>, Vec<_>) = route
+            .execution_instructions
+            .drain(..)
+            .partition(|instruction| {
+                matches!(
+                    instruction,
+                    ExecutionInstruction::NearTransaction {
+                        is_fee_transaction: true,
+                        ..
+                    }
+                )
+            });
         route.execution_instructions =
-            optimize_execution_instructions(route.execution_instructions.clone());
+            optimize_execution_instructions([swap_transactions, fee_transactions].concat());
     }
 
     let mut quotes = routes

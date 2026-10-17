@@ -1,5 +1,6 @@
 use near_min_api::types::{AccountId, Balance};
 use ruint::aliases::U256;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ pub struct PoolData {
     pub token_y: AccountId,
     fee: u32,
     point_delta: i32,
+    tax: Option<PoolTax>,
     /// Points with liquidity_sum != 0 (even with a zero net delta) and the liquidity delta when
     /// crossed from left to right
     endpoints: BTreeMap<i32, i128>,
@@ -65,12 +67,21 @@ pub struct Work {
     pub words: u64,
 }
 
+/// A pool's tax, both out of PROTOCOL_FEE_DENOMINATOR: the tax takes `tax_rate` of each
+/// swap fee for the pool's creator, and the protocol keeps `protocol_portion` of the tax
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PoolTax {
+    pub tax_rate: u16,
+    pub protocol_portion: u16,
+}
+
 pub struct PoolInit {
     pub id: String,
     pub token_x: AccountId,
     pub token_y: AccountId,
     pub fee: u32,
     pub point_delta: i32,
+    pub tax: Option<PoolTax>,
     pub current_point: i32,
     pub liquidity: Balance,
     pub liquidity_x: Balance,
@@ -126,6 +137,7 @@ impl Pool {
                 token_y: init.token_y,
                 fee: init.fee,
                 point_delta: init.point_delta,
+                tax: init.tax,
                 endpoints,
                 orders,
                 marked,
@@ -316,9 +328,19 @@ impl Pool {
     /// fee when there's no liquidity to give the rest to.
     fn charge_fee(&mut self, in_token_x: bool, fee: Balance) -> SwapResult<()> {
         let charged = if self.state.liquidity > 0 {
-            fee.checked_mul(self.protocol_fee_rate as u128)
-                .ok_or(SwapError::Panic("attempt to multiply with overflow"))?
-                / PROTOCOL_FEE_DENOMINATOR
+            // With a tax (2.4.0), the protocol fee rate applies to what the tax leaves of the
+            // fee, and the protocol's portion of the tax is added, as swaps on the staging
+            // contract show
+            match self.data.tax {
+                Some(tax) => {
+                    let taxed = fee_part(fee, tax.tax_rate as u32)?;
+                    checked_add(
+                        fee_part(checked_sub(fee, taxed)?, self.protocol_fee_rate)?,
+                        fee_part(taxed, tax.protocol_portion as u32)?,
+                    )?
+                }
+                None => fee_part(fee, self.protocol_fee_rate)?,
+            }
         } else {
             fee
         };
@@ -644,4 +666,12 @@ impl Pool {
         }
         Err(SwapError::NotFilled)
     }
+}
+
+/// `rate` out of PROTOCOL_FEE_DENOMINATOR of `fee`, rounded down
+fn fee_part(fee: Balance, rate: u32) -> SwapResult<Balance> {
+    Ok(fee
+        .checked_mul(rate as u128)
+        .ok_or(SwapError::Panic("attempt to multiply with overflow"))?
+        / PROTOCOL_FEE_DENOMINATOR)
 }

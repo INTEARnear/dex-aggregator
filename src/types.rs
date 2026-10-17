@@ -1,4 +1,4 @@
-use std::{fmt::Display, str::FromStr};
+use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
@@ -6,10 +6,12 @@ use near_min_api::{
     types::{near_crypto::PublicKey, AccountId, Action, Balance, NearToken},
     utils::dec_format,
 };
+use num_traits::{ToPrimitive, Zero};
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::intear_plach::AssetId;
+use xyk_dex_types::{FeeFraction, FULL_FEE_FRACTION, MAX_REFERRAL_FEE_FRACTION};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -80,7 +82,7 @@ impl FromStr for TokenId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SwapRequest {
     /// The token to swap from. This and token_out must be different.
     pub token_in: TokenId,
@@ -107,29 +109,77 @@ pub struct SwapRequest {
     /// The account ID of the referrer. If provided, the route will include referral
     /// parameter for DEXes that support it (DexId::Rhea, DexId::Aidols, DexId::Plach)
     pub referrer_id: Option<AccountId>,
+    /// Fees the route pays to referrers, as a JSON object of referrer account IDs and
+    /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Plach charges them
+    /// itself, Rhea and Rhea DCL routes send them in the input token after the swap call.
+    #[serde(default)]
+    pub referral_fees: ReferralFees,
+}
+
+/// Referrers and the fee each charges, in fractions of [`FULL_FEE_FRACTION`]. At most
+/// `MAX_REFERRERS`, adding up to at most [`MAX_REFERRAL_FEE_FRACTION`], as Plach allows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferralFees(pub Vec<(AccountId, FeeFraction)>);
+
+impl From<&ReferralFees> for xyk_dex_types::ReferralFees {
+    fn from(referral_fees: &ReferralFees) -> Self {
+        Self(referral_fees.0.clone())
+    }
+}
+
+impl FromStr for ReferralFees {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let fees: BTreeMap<AccountId, f64> =
+            serde_json::from_str(s).map_err(|error| format!("Invalid referral fees: {error}"))?;
+        let fees = fees
+            .into_iter()
+            .map(|(referrer_id, fee)| {
+                // The shortest decimal that reads as the number, so 0.01 is exactly 0.01 and not
+                // the binary f64 closest to it
+                let fee_fraction = BigDecimal::from_str(&fee.to_string())
+                    .map_err(|error| format!("Invalid referral fee of {referrer_id}: {error}"))?
+                    * BigDecimal::from(FULL_FEE_FRACTION);
+                if !fee_fraction.is_integer() {
+                    return Err(format!(
+                        "Referral fee of {referrer_id} must be a whole number of millionths"
+                    ));
+                }
+                if fee_fraction < BigDecimal::zero() || fee_fraction > MAX_REFERRAL_FEE_FRACTION {
+                    return Err(format!(
+                        "Referral fee of {referrer_id} must be between 0 and {}",
+                        (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION)
+                            / BigDecimal::from(FULL_FEE_FRACTION))
+                        .normalized()
+                    ));
+                }
+                let fee_fraction = fee_fraction
+                    .to_u32()
+                    .expect("Checked to be a whole number between 0 and the maximum fee");
+                Ok((referrer_id, fee_fraction))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let referral_fees = ReferralFees(fees);
+        xyk_dex_types::ReferralFees::from(&referral_fees)
+            .validate()
+            .map_err(|error| error.to_string())?;
+        Ok(referral_fees)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReferralFees {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 mod comma_separated {
     use std::{fmt::Display, str::FromStr};
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S, T>(value: &Option<Vec<T>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Display,
-    {
-        if let Some(value) = value {
-            let s = value
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            Some(s).serialize(serializer)
-        } else {
-            None::<String>.serialize(serializer)
-        }
-    }
+    use serde::{Deserialize, Deserializer};
 
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
     where
@@ -247,6 +297,11 @@ pub enum ExecutionInstruction {
     NearTransaction {
         receiver_id: AccountId,
         actions: Vec<Action>,
+        /// Pays referral fees after the swap. The swap is done once the transactions before it
+        /// succeed, so a frontend can show it as done without waiting for this one. Fee
+        /// transactions are always the last ones of a route.
+        #[serde(default)]
+        is_fee_transaction: bool,
     },
 }
 

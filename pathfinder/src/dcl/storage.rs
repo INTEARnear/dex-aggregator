@@ -5,6 +5,7 @@ use near_min_api::types::{AccountId, Balance};
 use pool_indexer::{AccountState, Watch};
 
 use super::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT};
+use super::pool::PoolTax;
 use super::{Metadata, PoolInfo, RHEA_DCL_CONTRACT_ID};
 
 const STATE_KEY: &[u8] = b"STATE";
@@ -14,7 +15,6 @@ const POOLS_PREFIX: &[u8] = &[1, b'v'];
 const POINTS_PREFIX: &[u8] = &[0x0c];
 /// Elements of the frozen token set, keys are the prefix and u64 index
 const FROZEN_TOKENS_PREFIX: &[u8] = &[2, b'e'];
-const CONTRACT_VERSION: u8 = 3;
 
 pub fn watch() -> Watch {
     Watch {
@@ -67,7 +67,14 @@ struct StoredContract {
     _lookup_map_0x08: Vec<u8>,
     _unordered_map_0x0f: StoredUnorderedMap,
     _lookup_map_0x09: Vec<u8>,
-    _counters: (u128, u128, u64, u64),
+    _counters: (u128, u128),
+}
+
+/// Fields that version 4 inserted between the counters of `StoredContract`
+#[derive(BorshDeserialize)]
+struct StoredContractV4Fields {
+    _create_pool_with_tax_whitelist: StoredUnorderedMap,
+    _whitelisted_tokens: StoredUnorderedSet,
 }
 
 #[derive(BorshDeserialize)]
@@ -77,6 +84,18 @@ enum StoredPool {
         pool: StoredPoolV0,
         whitelist: Option<Vec<AccountId>>,
     },
+    V2 {
+        pool: StoredPoolV0,
+        whitelist: Option<Vec<AccountId>>,
+        tax: Option<StoredPoolTax>,
+    },
+}
+
+#[derive(BorshDeserialize)]
+struct StoredPoolTax {
+    _creator: AccountId,
+    tax_rate: u16,
+    protocol_portion: u16,
 }
 
 #[derive(BorshDeserialize)]
@@ -144,10 +163,23 @@ pub(super) fn contract(state: &AccountState) -> Result<(Metadata, Vec<AccountId>
         .entries
         .get(STATE_KEY)
         .ok_or_else(|| anyhow::anyhow!("STATE is missing"))?;
-    let contract = borsh::from_slice::<StoredContract>(value)
-        .map_err(|e| anyhow::anyhow!("Invalid STATE {value:02x?}: {e}"))?;
-    if contract.version != CONTRACT_VERSION {
-        anyhow::bail!("Unknown contract version {}", contract.version);
+    // Versions 3 and 4 differ only by the fields that 4 inserted before the last counters
+    let invalid = |e: std::io::Error| anyhow::anyhow!("Invalid STATE {value:02x?}: {e}");
+    let mut reader = value.as_slice();
+    let contract = StoredContract::deserialize(&mut reader).map_err(invalid)?;
+    match contract.version {
+        3 => {}
+        4 => {
+            StoredContractV4Fields::deserialize(&mut reader).map_err(invalid)?;
+        }
+        version => anyhow::bail!("Unknown contract version {version}"),
+    }
+    <(u64, u64)>::deserialize(&mut reader).map_err(invalid)?;
+    if !reader.is_empty() {
+        anyhow::bail!(
+            "STATE {value:02x?} has {} unknown trailing bytes",
+            reader.len()
+        );
     }
     if contract.state != [0; 4] {
         anyhow::bail!("Unknown contract state bytes {:02x?}", contract.state);
@@ -194,11 +226,16 @@ pub(super) fn pools(state: &AccountState, pool_count: u64) -> Result<Vec<PoolInf
                 .entries
                 .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("Pool {index} is missing"))?;
-            let (pool, whitelist) = match borsh::from_slice::<StoredPool>(value)
+            let (pool, whitelist, tax) = match borsh::from_slice::<StoredPool>(value)
                 .map_err(|e| anyhow::anyhow!("Invalid pool {index}: {e}"))?
             {
-                StoredPool::V0(pool) => (pool, None),
-                StoredPool::V1 { pool, whitelist } => (pool, whitelist),
+                StoredPool::V0(pool) => (pool, None, None),
+                StoredPool::V1 { pool, whitelist } => (pool, whitelist, None),
+                StoredPool::V2 {
+                    pool,
+                    whitelist,
+                    tax,
+                } => (pool, whitelist, tax),
             };
             if pool.state != [0; 9] {
                 anyhow::bail!(
@@ -223,6 +260,10 @@ pub(super) fn pools(state: &AccountState, pool_count: u64) -> Result<Vec<PoolInf
                 total_order_y: pool.total_order_y.to_string(),
                 state: "Running".to_string(),
                 whitelist,
+                tax: tax.map(|tax| PoolTax {
+                    tax_rate: tax.tax_rate,
+                    protocol_portion: tax.protocol_portion,
+                }),
             })
         })
         .collect()

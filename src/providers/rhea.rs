@@ -9,9 +9,11 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, create_storage_deposit_action_for_contract, deposit_storage_if_needed,
-        get_slippage, price_raw, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID,
-        STORAGE_BYTE_COST,
+        convert_to_nep141, convert_to_nep141_with_fees, create_rhea_mft_transfer_action,
+        create_storage_deposit_action_for_contract, deposit_storage_if_needed, get_slippage,
+        needs_storage_deposit_for_contract, payable_referral_fees, price_raw,
+        referrer_fees_of_total, swap_call_gas, total_fee_amount, Mainnet, NetworkView,
+        DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -73,6 +75,7 @@ async fn registration(
     Some(vec![ExecutionInstruction::NearTransaction {
         receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
         actions,
+        is_fee_transaction: false,
     }])
 }
 
@@ -128,11 +131,31 @@ async fn route(
         return None;
     }
 
+    // Fast path: swap directly within Rhea ledger if both in/out are Rhea balances
+    let fast_path = matches!(request.token_in, TokenId::Nep141OnRhea(_))
+        && matches!(request.token_out, TokenId::Nep141OnRhea(_));
+
+    let token_in_ref = &token_in;
+    let payable_referral_fees =
+        payable_referral_fees(&request.referral_fees, |referrer_id| async move {
+            if fast_path {
+                network
+                    .is_rhea_token_registered(&referrer_id, token_in_ref)
+                    .await
+            } else {
+                !needs_storage_deposit_for_contract(network, &referrer_id, token_in_ref).await
+            }
+        })
+        .await;
+    let referrer_fees = referrer_fees_of_total(&payable_referral_fees, exact_amount_in);
+    // The fees come out of the input, so the rest is what's quoted and swapped
+    let swap_amount_in = exact_amount_in - total_fee_amount(&referrer_fees);
+
     let response = quotes
         .find_path(rhea::Request {
             token_in: token_in.clone(),
             token_out: token_out.clone(),
-            amount_in: exact_amount_in,
+            amount_in: swap_amount_in,
             max_hops: MaxHops::Four,
             slippage,
             near_price_raw: price_raw(network, &TokenId::Near)?,
@@ -189,16 +212,12 @@ async fn route(
         })
         .collect();
 
-    // Fast path: swap directly within Rhea ledger if both in/out are Rhea balances
-    if matches!(request.token_in, TokenId::Nep141OnRhea(_))
-        && matches!(request.token_out, TokenId::Nep141OnRhea(_))
-    {
-        info!("Using fast path");
+    if fast_path {
         let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
             method_name: "swap".to_string(),
             args: serde_json::to_vec(&serde_json::json!({
                 "actions": actions,
-                "referral_id": DEFAULT_REFERRER_ID,
+                "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                 "skip_degen_price_sync": true,
             }))
             .unwrap(),
@@ -206,11 +225,16 @@ async fn route(
             deposit: NearToken::from_yoctonear(1),
         }));
 
+        let fee_actions = referrer_fees
+            .iter()
+            .map(|fee| create_rhea_mft_transfer_action(&token_in, &fee.referrer_id, fee.amount))
+            .collect();
         let transactions = [
             registration_transactions,
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
-                actions: vec![swap_action],
+                actions: [vec![swap_action], fee_actions].concat(),
+                is_fee_transaction: false,
             }],
         ]
         .concat();
@@ -233,7 +257,7 @@ async fn route(
         method_name: "ft_transfer_call".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
             "receiver_id": RHEA_CONTRACT_ID,
-            "amount": exact_amount_in.to_string(),
+            "amount": swap_amount_in.to_string(),
             "msg": serde_json::to_string(&serde_json::json!({
                 "force": 0,
                 "actions": actions,
@@ -249,12 +273,14 @@ async fn route(
     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
         receiver_id: token_in,
         actions: vec![ft_transfer_call_swap_action],
+        is_fee_transaction: false,
     }];
 
-    let (input_to_nep141, input_nep141) = convert_to_nep141(
+    let (input_to_nep141, send_fees, input_nep141) = convert_to_nep141_with_fees(
         &request.token_in,
         request.trader_account_id.clone(),
         exact_amount_in,
+        &referrer_fees,
     )
     .await?;
 
@@ -277,6 +303,7 @@ async fn route(
         .await,
         input_to_nep141,
         swap_transactions,
+        send_fees,
     ]
     .concat();
 
@@ -304,10 +331,12 @@ mod tests {
     use super::*;
     use crate::providers::intear_plach::AssetId;
     use crate::shared_utils::{
-        create_intear_dex_withdraw_action, create_rhea_withdraw_action,
+        create_ft_transfer_action, create_intear_dex_withdraw_action,
+        create_rhea_mft_transfer_action, create_rhea_withdraw_action,
         create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
+    use xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestRheaQuotes {
@@ -353,11 +382,11 @@ mod tests {
                         pool_id: 1,
                         token_in: request.token_in.clone(),
                         token_out: request.token_out.clone(),
-                        amount_in: 100,
+                        amount_in: request.amount_in,
                         amount_out: 0,
                         min_amount_out: 79,
                     }],
-                    amount_in: 100,
+                    amount_in: request.amount_in,
                     min_amount_out: 79,
                     amount_out: 0,
                 }]
@@ -366,7 +395,7 @@ mod tests {
                 routes,
                 contract_in: request.token_in,
                 contract_out: request.token_out,
-                amount_in: 100,
+                amount_in: request.amount_in,
                 amount_out: 80,
                 swap_gas: NearGas::from_ggas(5_500),
             })
@@ -389,6 +418,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -407,6 +437,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -414,10 +445,12 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -446,6 +479,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -471,6 +505,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -489,6 +524,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -496,6 +532,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -524,6 +561,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -549,6 +587,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -567,6 +606,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -574,6 +614,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
@@ -582,6 +623,7 @@ mod tests {
                             100,
                             false,
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -610,6 +652,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -635,6 +678,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -653,6 +697,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -660,14 +705,17 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "dex.intear.near".parse().unwrap(),
                         actions: vec![create_intear_dex_withdraw_action(&AssetId::Near, 100)],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -696,6 +744,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -721,6 +770,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default()
                     .with_test_prices()
@@ -758,6 +808,7 @@ mod tests {
                                 deposit: NearToken::from_yoctonear(1),
                             })),
                         ],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
@@ -779,6 +830,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(33_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -804,6 +856,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -822,6 +875,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -850,6 +904,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -875,6 +930,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -893,6 +949,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
@@ -901,6 +958,7 @@ mod tests {
                             100,
                             false,
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -929,6 +987,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -954,6 +1013,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -972,6 +1032,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -979,6 +1040,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "ft".parse().unwrap(),
@@ -1007,6 +1069,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -1032,6 +1095,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1057,6 +1121,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1082,6 +1147,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::none(),
@@ -1107,6 +1173,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::empty_routes(),
@@ -1132,6 +1199,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1157,6 +1225,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1172,6 +1241,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -1200,6 +1270,7 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -1225,6 +1296,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: Some("ref.near".parse().unwrap()),
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1240,6 +1312,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
@@ -1268,12 +1341,437 @@ mod tests {
                             gas: Gas(NearGas::from_ggas(90_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
             })
+        );
+    }
+
+    fn rhea_swap_msg(
+        token_in: &str,
+        token_out: &str,
+        amount_in: &str,
+        referral_id: &str,
+    ) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "force": 0,
+            "actions": vec![serde_json::json!({
+                "pool_id": 1,
+                "token_in": token_in,
+                "token_out": token_out,
+                "amount_in": amount_in,
+                "amount_out": "0",
+                "min_amount_out": "79",
+            })],
+            "skip_degen_price_sync": true,
+            "skip_unwrap_near": true,
+            "referral_id": referral_id,
+        }))
+        .unwrap()
+    }
+
+    fn ft_transfer_call_to_rhea(amount: &str, msg: String) -> Action {
+        Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "ft_transfer_call".to_string(),
+            args: serde_json::to_vec(&serde_json::json!({
+                "receiver_id": RHEA_CONTRACT_ID,
+                "amount": amount,
+                "msg": msg,
+            }))
+            .unwrap(),
+            gas: Gas(NearGas::from_ggas(90_500)),
+            deposit: NearToken::from_yoctonear(1),
+        }))
+    }
+
+    fn referred_request(token_in: TokenId, token_out: TokenId) -> SwapRequest {
+        SwapRequest {
+            token_in,
+            token_out,
+            amount: Amount::AmountIn(1000),
+            max_wait_ms: 1_000,
+            slippage: Slippage::Fixed {
+                slippage: "0.01".parse().unwrap(),
+            },
+            dexes: None,
+            trader_account_id: None,
+            signing_public_key: None,
+            referrer_id: Some("ref.near".parse().unwrap()),
+            referral_fees: "{\"ref.near\":0.01}".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn referrer_fee_in_near_is_sent_as_wnear_after_the_swap() {
+        let route = route(
+            referred_request(TokenId::Near, TokenId::Nep141("ft".parse().unwrap())),
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions,
+            vec![
+                // All of the input is wrapped, the fees too
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![create_wrap_action(NearToken::from_yoctonear(1000))],
+                    is_fee_transaction: false,
+                },
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![ft_transfer_call_to_rhea(
+                        "990",
+                        rhea_swap_msg(WRAP_NEAR, "ft", "990", "ref.near"),
+                    )],
+                    is_fee_transaction: false,
+                },
+                // After the swap, 1% of 1000, 80% to the referrer and 20% to the protocol
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: WRAP_NEAR.parse().unwrap(),
+                    actions: vec![
+                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn referrer_fee_in_ft_is_transferred_after_the_swap() {
+        let route = route(
+            referred_request(
+                TokenId::Nep141("ft".parse().unwrap()),
+                TokenId::Nep141("other".parse().unwrap()),
+            ),
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    "ft",
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    "ft",
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions,
+            vec![
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    actions: vec![ft_transfer_call_to_rhea(
+                        "990",
+                        rhea_swap_msg("ft", "other", "990", "ref.near"),
+                    )],
+                    is_fee_transaction: false,
+                },
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    actions: vec![
+                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn referrer_without_storage_on_input_gets_no_fee() {
+        let route = route(
+            referred_request(
+                TokenId::Nep141("ft".parse().unwrap()),
+                TokenId::Nep141("other".parse().unwrap()),
+            ),
+            &TestNetworkView::default().with_test_prices(),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions,
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: "ft".parse().unwrap(),
+                actions: vec![ft_transfer_call_to_rhea(
+                    "1000",
+                    rhea_swap_msg("ft", "other", "1000", "ref.near"),
+                )],
+                is_fee_transaction: false,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn referrer_fee_on_fast_path_moves_rhea_balance() {
+        let route = route(
+            SwapRequest {
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                ..referred_request(
+                    TokenId::Nep141OnRhea("ft".parse().unwrap()),
+                    TokenId::Nep141OnRhea("other".parse().unwrap()),
+                )
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_rhea_registered("trader.near", "ft", true)
+                .with_rhea_registered("trader.near", "other", true)
+                .with_rhea_registered("ref.near", "ft", true)
+                .with_rhea_registered(PROTOCOL_FEE_RECEIVER_ID.as_str(), "ft", true),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions,
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
+                actions: vec![
+                    Action::FunctionCall(Box::new(FunctionCallAction {
+                        method_name: "swap".to_string(),
+                        args: serde_json::to_vec(&serde_json::json!({
+                            "actions": vec![serde_json::json!({
+                                "pool_id": 1,
+                                "token_in": "ft",
+                                "token_out": "other",
+                                "amount_in": "990",
+                                "amount_out": "0",
+                                "min_amount_out": "79",
+                            })],
+                            "referral_id": "ref.near",
+                            "skip_degen_price_sync": true,
+                        }))
+                        .unwrap(),
+                        gas: Gas(NearGas::from_ggas(33_500)),
+                        deposit: NearToken::from_yoctonear(1),
+                    })),
+                    create_rhea_mft_transfer_action(
+                        &"ft".parse().unwrap(),
+                        &"ref.near".parse().unwrap(),
+                        8,
+                    ),
+                    create_rhea_mft_transfer_action(
+                        &"ft".parse().unwrap(),
+                        &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
+                        2,
+                    ),
+                ],
+                is_fee_transaction: false,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn referrer_without_rhea_registration_gets_no_fee_on_fast_path() {
+        let route = route(
+            SwapRequest {
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                ..referred_request(
+                    TokenId::Nep141OnRhea("ft".parse().unwrap()),
+                    TokenId::Nep141OnRhea("other".parse().unwrap()),
+                )
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_rhea_registered("trader.near", "ft", true)
+                .with_rhea_registered("trader.near", "other", true),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        let ExecutionInstruction::NearTransaction { actions, .. } =
+            &route.execution_instructions[0];
+        assert_eq!(actions.len(), 1, "Only the swap, no fee transfer");
+    }
+
+    #[tokio::test]
+    async fn each_referrer_that_can_receive_the_input_gets_its_fee() {
+        let route = route(
+            SwapRequest {
+                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02,"nostorage.near":0.01}"#
+                    .parse()
+                    .unwrap(),
+                ..referred_request(
+                    TokenId::Nep141("ft".parse().unwrap()),
+                    TokenId::Nep141("other".parse().unwrap()),
+                )
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    "ft",
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    "ft",
+                    "ref2.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    "ft",
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions,
+            vec![
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    actions: vec![ft_transfer_call_to_rhea(
+                        "970",
+                        rhea_swap_msg("ft", "other", "970", "ref.near"),
+                    )],
+                    is_fee_transaction: false,
+                },
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    // 80% of each fee to its referrer, the protocol's 20% of both together
+                    actions: vec![
+                        create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
+                        create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_referrer_fee_in_near_is_its_own_wnear_transfer() {
+        let route = route(
+            SwapRequest {
+                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02}"#.parse().unwrap(),
+                ..referred_request(TokenId::Near, TokenId::Nep141("ft".parse().unwrap()))
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    "ref2.near",
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                )
+                .with_storage(
+                    WRAP_NEAR,
+                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    "0.00125 NEAR".parse().unwrap(),
+                    NearToken::from_yoctonear(0),
+                ),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route.execution_instructions[0],
+            ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![create_wrap_action(NearToken::from_yoctonear(1000))],
+                is_fee_transaction: false,
+            }
+        );
+        // After the swap
+        assert_eq!(
+            route.execution_instructions.last().unwrap(),
+            &ExecutionInstruction::NearTransaction {
+                receiver_id: WRAP_NEAR.parse().unwrap(),
+                actions: vec![
+                    create_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                    create_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
+                    create_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                ],
+                is_fee_transaction: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_moves_rhea_balance_to_each_registered_referrer() {
+        let route = route(
+            SwapRequest {
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02,"unregistered.near":0.01}"#
+                    .parse()
+                    .unwrap(),
+                ..referred_request(
+                    TokenId::Nep141OnRhea("ft".parse().unwrap()),
+                    TokenId::Nep141OnRhea("other".parse().unwrap()),
+                )
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_rhea_registered("trader.near", "ft", true)
+                .with_rhea_registered("trader.near", "other", true)
+                .with_rhea_registered("ref.near", "ft", true)
+                .with_rhea_registered("ref2.near", "ft", true)
+                .with_rhea_registered(PROTOCOL_FEE_RECEIVER_ID.as_str(), "ft", true),
+            &TestRheaQuotes::default(),
+        )
+        .await
+        .unwrap();
+        let ExecutionInstruction::NearTransaction { actions, .. } =
+            &route.execution_instructions[0];
+        assert_eq!(
+            actions[1..],
+            [
+                create_rhea_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &"ref.near".parse().unwrap(),
+                    8,
+                ),
+                create_rhea_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &"ref2.near".parse().unwrap(),
+                    16,
+                ),
+                create_rhea_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
+                    6,
+                ),
+            ]
         );
     }
 }

@@ -23,8 +23,8 @@ use xyk_dex_types::math::{
     exact_in_amount_out, exact_out_amount_in, fee_converted_to_quote_asset, mul_div,
 };
 use xyk_dex_types::{
-    CurrentFees, FULL_SPLIT_FRACTION, FeeConfiguration, FeeFractionFraction, FeeReceiver,
-    ReferralSettings, SplitFraction, asset_account_ids,
+    CurrentFees, FULL_SPLIT_FRACTION, FeeConfiguration, FeeFraction, FeeFractionFraction,
+    FeeReceiver, ReferralFees, SplitFraction, asset_account_ids,
 };
 
 use crate::search::{
@@ -107,8 +107,8 @@ const BASIS_POINTS: NonZeroU128 = NonZeroU128::new(10_000).unwrap();
 pub struct Pool {
     id: u32,
     reserves: [Balance; 2],
-    /// Fees of swaps that put in token 0 and token 1: `info.fees`, and the referrer's fee last
-    /// when it's charged on the swap
+    /// Fees of swaps that put in token 0 and token 1: `info.fees`, and the referrers' fees last
+    /// when they're charged on the swap
     fees: Arc<[CurrentFees; 2]>,
     /// What swaps don't change, shared so simulations clone pools without allocating
     info: Arc<PoolInfo>,
@@ -126,15 +126,9 @@ struct PoolInfo {
     launch_quote_token: Option<usize>,
 }
 
-/// A referrer's fee on Plach swaps, as the xyk DEX charges it
-#[derive(Clone, PartialEq)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct Referrer {
-    pub settings: ReferralSettings,
-    /// The assets the referrer collects fees in. A swap whose fee would be in another asset
-    /// doesn't charge one.
-    pub fee_assets: HashSet<AssetId>,
-}
+/// The assets each account collects fees in. A swap whose referral fee would be in another asset
+/// doesn't pay the referrer one.
+pub type FeeAssets = HashMap<AccountId, HashSet<AssetId>>;
 
 impl Pool {
     /// `None` for a pool of NEP-171 assets, which the contract can't swap in
@@ -205,34 +199,26 @@ impl Pool {
         })
     }
 
-    /// The pool with the fee `referrer` is charged on each swap through it, as the xyk DEX's
-    /// `with_referral_fee` adds it: the reduced fee between two stable assets, and only when the
-    /// referrer collects fees in the asset they're paid in. That's the asset put in, but for a
-    /// launch pool selling into its quote token, which converts fees to it.
-    fn with_referrer(&self, referrer_id: &AccountId, referrer: &Referrer) -> Self {
-        let [token0, token1] = &self.info.tokens;
-        let fee_fraction = referrer
-            .settings
-            .fee_fraction(&asset_account_ids([token0, token1]));
-        let charged = [0, 1].map(|token_in| {
+    /// The pool with the fees of `referral_fees` charged on each swap through it, as the xyk
+    /// DEX's `with_referral_fees` adds them: only for referrers that collect fees in the asset
+    /// they're paid in. That's the asset put in, but for a launch pool selling into its quote
+    /// token, which converts fees to it.
+    fn with_referral_fees(&self, referral_fees: &ReferralFees, fee_assets: &FeeAssets) -> Self {
+        let fees = [0, 1].map(|token_in| {
             let token_out = 1 - token_in;
             let fee_token = if self.info.launch_quote_token == Some(token_out) {
                 token_out
             } else {
                 token_in
             };
-            fee_fraction > 0 && referrer.fee_assets.contains(&self.info.tokens[fee_token])
-        });
-        if charged == [false, false] {
-            return self.clone();
-        }
-        let fees = charged.map(|charged| {
-            let fees = self.info.fees.clone();
-            if charged {
-                fees.with_referral_fee(referrer_id.clone(), fee_fraction)
-            } else {
-                fees
-            }
+            self.info
+                .fees
+                .clone()
+                .with_referral_fees(referral_fees, |referrer_id| {
+                    fee_assets
+                        .get(referrer_id)
+                        .is_some_and(|assets| assets.contains(&self.info.tokens[fee_token]))
+                })
         });
         Self {
             fees: Arc::new(fees),
@@ -241,7 +227,8 @@ impl Pool {
     }
 
     /// The pool with its pool and protocol fees discounted, as a signed fee discount makes the
-    /// xyk DEX charge them. Referral fees aren't discounted, so this goes before `with_referrer`.
+    /// xyk DEX charge them. Referral fees aren't discounted, so this goes before
+    /// `with_referral_fees`.
     fn with_fee_discount(&self, fee_discount: FeeFractionFraction) -> Self {
         if fee_discount == 0 {
             return self.clone();
@@ -426,37 +413,46 @@ pub struct Pools {
     updated_at: Instant,
     /// Pools without referral fees or a fee discount
     graph: Arc<Graph<Pool>>,
-    referrers: HashMap<AccountId, Referrer>,
-    /// Pools with the referral fees of a referrer, if it charges any, and a fee discount, made
-    /// the first time they're asked for
-    referrer_graphs: Mutex<HashMap<GraphKey, Arc<Graph<Pool>>>>,
+    fee_assets: FeeAssets,
+    /// Pools with referral fees and a fee discount, made the first time they're asked for. A
+    /// snapshot only lives for a block, so this only holds the ones asked for in it.
+    referral_graphs: Mutex<HashMap<GraphKey, Arc<Graph<Pool>>>>,
 }
 
-/// The referrer whose referral fees a graph has, if it charges any, and its fee discount
-type GraphKey = (Option<AccountId>, FeeFractionFraction);
+/// The referral fees a graph has, of referrers that collect fees in any asset, and its fee
+/// discount
+type GraphKey = (Vec<(AccountId, FeeFraction)>, FeeFractionFraction);
 
 impl Pools {
-    /// Pools as `referrer` swaps through them with `fee_discount`, with its referral fees
+    /// Pools as a swap with `referral_fees` and `fee_discount` goes through them
     fn graph_for(
         &self,
-        referrer: &AccountId,
+        referral_fees: &ReferralFees,
         fee_discount: FeeFractionFraction,
     ) -> Arc<Graph<Pool>> {
-        let settings = self.referrers.get(referrer);
-        if settings.is_none() && fee_discount == 0 {
+        // Referrers without fee assets or with no fee are never paid, so their fees don't need
+        // a graph
+        let referral_fees = ReferralFees(
+            referral_fees
+                .0
+                .iter()
+                .filter(|(referrer_id, fee_fraction)| {
+                    *fee_fraction > 0 && self.fee_assets.contains_key(referrer_id)
+                })
+                .cloned()
+                .collect(),
+        );
+        if referral_fees.0.is_empty() && fee_discount == 0 {
             return self.graph.clone();
         }
-        self.referrer_graphs
+        self.referral_graphs
             .lock()
             .unwrap()
-            .entry((settings.map(|_| referrer.clone()), fee_discount))
+            .entry((referral_fees.0.clone(), fee_discount))
             .or_insert_with(|| {
                 Arc::new(self.graph.map_pools(|pool| {
-                    let pool = pool.with_fee_discount(fee_discount);
-                    match settings {
-                        Some(settings) => pool.with_referrer(referrer, settings),
-                        None => pool,
-                    }
+                    pool.with_fee_discount(fee_discount)
+                        .with_referral_fees(&referral_fees, &self.fee_assets)
                 }))
             })
             .clone()
@@ -469,7 +465,7 @@ struct PoolsSource {
     /// Of the block, which scheduled fees depend on
     timestamp: Timestamp,
     pools: Vec<StoredPool>,
-    referrers: HashMap<AccountId, Referrer>,
+    fee_assets: FeeAssets,
 }
 
 fn build_pools(source: PoolsSource) -> Pools {
@@ -477,7 +473,7 @@ fn build_pools(source: PoolsSource) -> Pools {
         block_height,
         timestamp,
         pools,
-        referrers,
+        fee_assets,
     } = source;
     let pools = pools
         .into_iter()
@@ -488,8 +484,8 @@ fn build_pools(source: PoolsSource) -> Pools {
         block_height,
         updated_at: Instant::now(),
         graph: Arc::new(Graph::new(pools)),
-        referrers,
-        referrer_graphs: Mutex::default(),
+        fee_assets,
+        referral_graphs: Mutex::default(),
     }
 }
 
@@ -721,8 +717,9 @@ pub struct Request {
     pub slippage: BigDecimal,
     pub near_price_raw: BigDecimal,
     pub quoted_token_price_raw: BigDecimal,
-    /// The swap's referrer: its referral fee, if it charges one, is taken out of every pool
-    pub referrer: AccountId,
+    /// Fees the swap pays referrers, taken out of every pool by the referrers that collect fees in
+    /// the asset the pool pays them in
+    pub referral_fees: ReferralFees,
     /// Taken off the pool and protocol fees of every pool by a signed fee discount, 0 for none
     pub fee_discount: FeeFractionFraction,
 }
@@ -737,7 +734,7 @@ pub fn find_path_in(
     request: &Request,
 ) -> Result<SplitRouteApiResponse, anyhow::Error> {
     let slippage_bp = crate::slippage_bp(&request.slippage)?;
-    let graph = &*pools.graph_for(&request.referrer, request.fee_discount);
+    let graph = &*pools.graph_for(&request.referral_fees, request.fee_discount);
     let (Some(token_in), Some(token_out)) = (
         graph.token_index(&request.token_in),
         graph.token_index(&request.token_out),
@@ -769,7 +766,7 @@ pub fn find_path_in(
         // Compared to the same route without the fee discount
         let undiscounted = emulate_total(
             &split_route,
-            &pools.graph_for(&request.referrer, 0),
+            &pools.graph_for(&request.referral_fees, 0),
             request.amount,
         )?;
         let (saved, discount) = match &mut response {
@@ -807,12 +804,15 @@ mod tests {
 
     use near_sdk::json_types::U128;
     use xyk_dex_types::math::mul_div_sum;
-    use xyk_dex_types::{AssetWithBalance, FULL_FEE_FRACTION, FeeFraction};
+    use xyk_dex_types::{
+        AssetWithBalance, FULL_FEE_FRACTION, FULL_FEE_FRACTION_FRACTION, PROTOCOL_FEE_RECEIVER_ID,
+        REFERRAL_FEE_PROTOCOL_SHARE,
+    };
 
     const POOL_FEE: FeeFraction = 3_000; // 0.3%
     const PROTOCOL_FEE: FeeFraction = 1_000; // 0.1%
     const REFERRAL_FEE: FeeFraction = 10_000; // 1%
-    const REFERRAL_FEE_REDUCED: FeeFraction = 500; // 0.05%
+    const OTHER_REFERRAL_FEE: FeeFraction = 5_000; // 0.5%
 
     fn nep141(account_id: &str) -> AssetId {
         AssetId::Nep141(account_id.parse().unwrap())
@@ -869,14 +869,24 @@ mod tests {
         "ref.near".parse().unwrap()
     }
 
-    fn referrer(fee_assets: &[AssetId]) -> Referrer {
-        Referrer {
-            settings: ReferralSettings::V1 {
-                fee_fraction: REFERRAL_FEE,
-                fee_fraction_reduced: REFERRAL_FEE_REDUCED,
-            },
-            fee_assets: fee_assets.iter().cloned().collect(),
-        }
+    fn other_referrer_id() -> AccountId {
+        "ref2.near".parse().unwrap()
+    }
+
+    /// The part of a referral fee the xyk DEX gives the protocol fee receiver
+    fn protocol_share(fee_fraction: FeeFraction) -> FeeFraction {
+        (u64::from(fee_fraction) * u64::from(REFERRAL_FEE_PROTOCOL_SHARE)
+            / u64::from(FULL_FEE_FRACTION_FRACTION)) as FeeFraction
+    }
+
+    /// `ref.near` charging [`REFERRAL_FEE`]
+    fn one_referrer() -> ReferralFees {
+        ReferralFees(vec![(referrer_id(), REFERRAL_FEE)])
+    }
+
+    /// `ref.near` collecting fees in `assets`
+    fn referrer_fee_assets(assets: &[AssetId]) -> FeeAssets {
+        FeeAssets::from([(referrer_id(), assets.iter().cloned().collect())])
     }
 
     /// The referral fee on swaps that put in token 0 and token 1
@@ -905,7 +915,8 @@ mod tests {
     #[test]
     fn referral_fee_is_taken_from_the_input_it_collects_in() {
         let pool = public_pool(nep141("a.near"), nep141("b.near"));
-        let referred = pool.with_referrer(&referrer_id(), &referrer(&[nep141("a.near")]));
+        let referred =
+            pool.with_referral_fees(&one_referrer(), &referrer_fee_assets(&[nep141("a.near")]));
         assert_eq!(referral_fees(&referred), [REFERRAL_FEE, 0]);
 
         let amount = 10u128.pow(22);
@@ -927,14 +938,62 @@ mod tests {
     }
 
     #[test]
-    fn referral_fee_is_reduced_between_stable_assets() {
-        let usdt = nep141("usdt.tether-token.near");
-        let usdc = nep141("17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
-        let pool = public_pool(usdt.clone(), usdc.clone())
-            .with_referrer(&referrer_id(), &referrer(&[usdt, usdc]));
+    fn each_referrer_is_paid_in_its_own_fee_assets() {
+        let pool = public_pool(nep141("a.near"), nep141("b.near"));
+        let referred = pool.with_referral_fees(
+            &ReferralFees(vec![
+                (referrer_id(), REFERRAL_FEE),
+                (other_referrer_id(), OTHER_REFERRAL_FEE),
+                ("unregistered.near".parse().unwrap(), REFERRAL_FEE),
+            ]),
+            &FeeAssets::from([
+                (referrer_id(), HashSet::from([nep141("a.near")])),
+                (
+                    other_referrer_id(),
+                    HashSet::from([nep141("a.near"), nep141("b.near")]),
+                ),
+            ]),
+        );
         assert_eq!(
-            referral_fees(&pool),
-            [REFERRAL_FEE_REDUCED, REFERRAL_FEE_REDUCED]
+            referral_fees(&referred),
+            [REFERRAL_FEE + OTHER_REFERRAL_FEE, OTHER_REFERRAL_FEE]
+        );
+        // In the order of the request, after the pool and protocol fees
+        // In the order of the request, after the pool and protocol fees, with the protocol's
+        // share of each added to the protocol fee
+        let shares = protocol_share(REFERRAL_FEE) + protocol_share(OTHER_REFERRAL_FEE);
+        assert!(
+            referred.fees[0].receivers[1..]
+                == [
+                    (
+                        FeeReceiver::Account(PROTOCOL_FEE_RECEIVER_ID.to_owned()),
+                        PROTOCOL_FEE + shares
+                    ),
+                    (
+                        FeeReceiver::Account(referrer_id()),
+                        REFERRAL_FEE - protocol_share(REFERRAL_FEE)
+                    ),
+                    (
+                        FeeReceiver::Account(other_referrer_id()),
+                        OTHER_REFERRAL_FEE - protocol_share(OTHER_REFERRAL_FEE)
+                    ),
+                ]
+        );
+
+        let amount = 10u128.pow(22);
+        assert_eq!(
+            referred.quote_exact_in(0, 1, amount),
+            Some(contract_exact_in(
+                &pool,
+                0,
+                amount,
+                &[
+                    POOL_FEE,
+                    PROTOCOL_FEE + shares,
+                    REFERRAL_FEE - protocol_share(REFERRAL_FEE),
+                    OTHER_REFERRAL_FEE - protocol_share(OTHER_REFERRAL_FEE)
+                ]
+            ))
         );
     }
 
@@ -944,11 +1003,15 @@ mod tests {
         let pool = launch_pool(launched.clone());
         // Buying puts the quote token in, selling converts the fee to it, so only it counts
         assert_eq!(
-            referral_fees(&pool.with_referrer(&referrer_id(), &referrer(&[AssetId::Near]))),
+            referral_fees(
+                &pool.with_referral_fees(&one_referrer(), &referrer_fee_assets(&[AssetId::Near]))
+            ),
             [REFERRAL_FEE, REFERRAL_FEE]
         );
         assert_eq!(
-            referral_fees(&pool.with_referrer(&referrer_id(), &referrer(&[launched]))),
+            referral_fees(
+                &pool.with_referral_fees(&one_referrer(), &referrer_fee_assets(&[launched]))
+            ),
             [0, 0]
         );
     }
@@ -956,7 +1019,7 @@ mod tests {
     #[test]
     fn exact_out_with_a_referral_fee_pays_enough_for_the_output() {
         let pool = public_pool(nep141("a.near"), nep141("b.near"))
-            .with_referrer(&referrer_id(), &referrer(&[nep141("a.near")]));
+            .with_referral_fees(&one_referrer(), &referrer_fee_assets(&[nep141("a.near")]));
         let amount_out = 10u128.pow(22);
         let amount_in = pool.quote_exact_out(0, 1, amount_out).unwrap();
         let without_referral = public_pool(nep141("a.near"), nep141("b.near"))
@@ -997,17 +1060,20 @@ mod tests {
     #[test]
     fn launch_pools_convert_fees_when_selling_into_their_quote_token() {
         let launched = nep141("meme.near");
-        let mut pool =
-            launch_pool(launched).with_referrer(&referrer_id(), &referrer(&[AssetId::Near]));
+        let mut pool = launch_pool(launched)
+            .with_referral_fees(&one_referrer(), &referrer_fee_assets(&[AssetId::Near]));
         let [mut near, mut tokens] = pool.reserves;
         let amount_in = 10u128.pow(22);
         let fee = |fraction: FeeFraction| amount_in * fraction as u128 / FULL_FEE_FRACTION as u128;
-        let after_fees = amount_in - fee(POOL_FEE) - fee(PROTOCOL_FEE) - fee(REFERRAL_FEE);
+        // The protocol gets its share of the referral fee
+        let protocol_fee = PROTOCOL_FEE + protocol_share(REFERRAL_FEE);
+        let referral_fee = REFERRAL_FEE - protocol_share(REFERRAL_FEE);
+        let after_fees = amount_in - fee(POOL_FEE) - fee(protocol_fee) - fee(referral_fee);
         let amount_out = mul_div_sum(after_fees, near, tokens, after_fees);
         tokens += after_fees + fee(POOL_FEE);
         near -= amount_out;
         // The protocol fee, then the referral fee, each swapped to NEAR on the moved reserves
-        for fraction in [PROTOCOL_FEE, REFERRAL_FEE] {
+        for fraction in [protocol_fee, referral_fee] {
             near -= mul_div_sum(fee(fraction), near, tokens, fee(fraction));
             tokens += fee(fraction);
         }
@@ -1029,29 +1095,46 @@ mod tests {
     }
 
     #[test]
-    fn each_referrer_gets_its_own_graph_once() {
-        let referrer_id = referrer_id();
+    fn each_set_of_referral_fees_gets_its_own_graph_once() {
         let pools = build_pools(PoolsSource {
             block_height: 1,
             timestamp: 0,
             pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
-            referrers: HashMap::from([(referrer_id.clone(), referrer(&[nep141("a.near")]))]),
+            fee_assets: referrer_fee_assets(&[nep141("a.near")]),
         });
-        let without_settings = pools.graph_for(&"other.near".parse().unwrap(), 0);
-        assert!(Arc::ptr_eq(&without_settings, &pools.graph));
-        let referred = pools.graph_for(&referrer_id, 0);
+        let unpaid = ReferralFees(vec![("other.near".parse().unwrap(), REFERRAL_FEE)]);
+        let without_fees = pools.graph_for(&unpaid, 0);
+        assert!(Arc::ptr_eq(&without_fees, &pools.graph));
+        assert!(Arc::ptr_eq(
+            &pools.graph_for(&ReferralFees::default(), 0),
+            &pools.graph
+        ));
+        let referred = pools.graph_for(&one_referrer(), 0);
         assert!(!Arc::ptr_eq(&referred, &pools.graph));
-        assert!(Arc::ptr_eq(&referred, &pools.graph_for(&referrer_id, 0)));
+        assert!(Arc::ptr_eq(&referred, &pools.graph_for(&one_referrer(), 0)));
+        // A referrer that collects no fees doesn't change the graph
+        assert!(Arc::ptr_eq(
+            &referred,
+            &pools.graph_for(
+                &ReferralFees(vec![
+                    (referrer_id(), REFERRAL_FEE),
+                    ("other.near".parse().unwrap(), REFERRAL_FEE)
+                ]),
+                0
+            )
+        ));
         assert_eq!(referral_fees(&referred.pools()[0]), [REFERRAL_FEE, 0]);
         assert_eq!(referral_fees(&pools.graph.pools()[0]), [0, 0]);
+        let higher = pools.graph_for(&ReferralFees(vec![(referrer_id(), 2 * REFERRAL_FEE)]), 0);
+        assert_eq!(referral_fees(&higher.pools()[0]), [2 * REFERRAL_FEE, 0]);
 
-        // Referrers without settings share the discounted graph
-        let discounted = pools.graph_for(&"other.near".parse().unwrap(), 100_000);
+        // Swaps without paid referral fees share the discounted graph
+        let discounted = pools.graph_for(&unpaid, 100_000);
         assert!(Arc::ptr_eq(
             &discounted,
-            &pools.graph_for(&"another.near".parse().unwrap(), 100_000)
+            &pools.graph_for(&ReferralFees::default(), 100_000)
         ));
-        let referred_discounted = pools.graph_for(&referrer_id, 100_000);
+        let referred_discounted = pools.graph_for(&one_referrer(), 100_000);
         assert!(!Arc::ptr_eq(&referred_discounted, &discounted));
         assert!(!Arc::ptr_eq(&referred_discounted, &referred));
         assert_eq!(

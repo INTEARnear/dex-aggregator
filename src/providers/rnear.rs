@@ -103,6 +103,7 @@ async fn route(
                 gas: Gas(NearGas::from_tgas(10)),
                 deposit: NearToken::from_yoctonear(amount_near_in),
             }))],
+            is_fee_transaction: false,
         }];
 
         let execution_instructions = [
@@ -195,6 +196,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -213,6 +215,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -222,6 +225,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(10)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -247,6 +251,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -262,6 +267,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
                         actions: vec![create_unwrap_action(NearToken::from_yoctonear(100))],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -269,6 +275,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -278,6 +285,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(10)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -303,6 +311,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -322,6 +331,7 @@ mod tests {
                             100,
                             true,
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -329,6 +339,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -338,6 +349,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(10)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -363,6 +375,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -378,6 +391,7 @@ mod tests {
                     ExecutionInstruction::NearTransaction {
                         receiver_id: "dex.intear.near".parse().unwrap(),
                         actions: vec![create_intear_dex_withdraw_action(&AssetId::Near, 100)],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -385,6 +399,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -394,6 +409,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(10)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -419,6 +435,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -437,6 +454,7 @@ mod tests {
                             "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
+                        is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
                         receiver_id: RNEAR_CONTRACT.parse().unwrap(),
@@ -446,6 +464,7 @@ mod tests {
                             gas: Gas(NearGas::from_tgas(10)),
                             deposit: NearToken::from_yoctonear(80),
                         }))],
+                        is_fee_transaction: false,
                     },
                 ],
                 deprecated_needs_unwrap_always_false: false,
@@ -471,6 +490,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -496,6 +516,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -521,6 +542,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::none(),
@@ -546,6 +568,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
+                    referral_fees: Default::default(),
                 },
                 &TestNetworkView::default(),
                 &TestRNearQuotes::default(),
@@ -565,6 +588,7 @@ mod tests {
                         gas: Gas(NearGas::from_tgas(10)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
+                    is_fee_transaction: false,
                 }],
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
