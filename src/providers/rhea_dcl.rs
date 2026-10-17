@@ -331,7 +331,6 @@ mod tests {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
                     amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -420,7 +419,6 @@ mod tests {
                     token_in: TokenId::Nep141("ft".parse().unwrap()),
                     token_out: TokenId::Near,
                     amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -496,7 +494,6 @@ mod tests {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
                     amount: Amount::AmountOut(80),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -585,7 +582,6 @@ mod tests {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
                     amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -611,7 +607,6 @@ mod tests {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
                     amount: Amount::AmountIn(100),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -637,7 +632,6 @@ mod tests {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
                     amount: Amount::AmountOut(80),
-                    max_wait_ms: 1_000,
                     slippage: Slippage::Fixed {
                         slippage: "0.01".parse().unwrap(),
                     },
@@ -701,7 +695,6 @@ mod tests {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
                 amount: Amount::AmountOut(80),
-                max_wait_ms: 1_000,
                 slippage: Slippage::Fixed {
                     slippage: "0.01".parse().unwrap(),
                 },
@@ -784,7 +777,6 @@ mod tests {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
                 amount: Amount::AmountIn(1000),
-                max_wait_ms: 1_000,
                 slippage: Slippage::Fixed {
                     slippage: "0.01".parse().unwrap(),
                 },
@@ -844,7 +836,6 @@ mod tests {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
                 amount: Amount::AmountOut(80),
-                max_wait_ms: 1_000,
                 slippage: Slippage::Fixed {
                     slippage: "0.01".parse().unwrap(),
                 },

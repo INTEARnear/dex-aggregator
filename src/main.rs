@@ -132,13 +132,6 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
         ));
     }
 
-    if request.max_wait_ms > 60_000 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Max wait must be less than 60 seconds".to_string(),
-        ));
-    }
-
     if request.dexes.as_ref().is_some_and(|dexes| dexes.is_empty()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -153,25 +146,15 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
 async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
-        &providers::aidols::AidolsProvider,
         &providers::wrap::WrapProvider,
         &providers::rhea_dcl::RheaDclProvider,
-        &providers::metapool::MetapoolProvider,
-        &providers::linear::LinearProvider,
-        &providers::xrhea::XRheaProvider,
-        &providers::rnear::RNearProvider,
         &providers::intear_plach::IntearPlachProvider,
     ];
 
     let dexes = request.dexes.clone().unwrap_or(vec![
-        DexId::Rhea,
-        DexId::Aidols,
         DexId::Wrap,
+        DexId::Rhea,
         DexId::RheaDcl,
-        DexId::MetaPool,
-        DexId::Linear,
-        DexId::XRhea,
-        DexId::RNear,
         DexId::Plach,
     ]);
 

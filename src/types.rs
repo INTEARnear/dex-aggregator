@@ -91,10 +91,6 @@ pub struct SwapRequest {
     /// The amount to swap. If it's AmountOut, some dexes might not support this.
     #[serde(flatten)]
     pub amount: Amount,
-    /// The maximum amount of time to wait for the route to be found. Some dexes
-    /// might show a better quote if you wait a bit longer.
-    /// Usually, 2-3 seconds is enough. Maximum is 60 seconds.
-    pub max_wait_ms: u64,
     /// The slippage tolerance. `1.00` means 100%, `0.001` means 0.1%.
     #[serde(flatten)]
     pub slippage: Slippage,
