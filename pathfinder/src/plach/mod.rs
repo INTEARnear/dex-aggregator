@@ -545,9 +545,41 @@ const SETTINGS: Settings = Settings {
 
 const SWAP_BASE_GAS: NearGas = NearGas::from_tgas(23);
 const HOP_GAS: NearGas = NearGas::from_tgas(2);
+/// Reading and validating the referral fees of the swap message, once per swap
+const REFERRAL_FEES_GAS: NearGas = NearGas::from_tgas(1);
+/// Checking in every hop whether each referrer sent collects fees in the hop's asset, paid or not
+const REFERRER_CHECK_GAS: NearGas = NearGas::from_ggas(250);
+/// Paying a referral fee in a hop and writing the referrer's balance
+const REFERRAL_FEE_GAS: NearGas = NearGas::from_ggas(750);
 
-fn swap_gas(split_route: &SplitRoute) -> NearGas {
-    NearGas::from_gas(SWAP_BASE_GAS.as_gas() + HOP_GAS.as_gas() * split_route.hops() as u64)
+/// Gas of a hop for ranking routes, with the checks of `referrers` sent
+fn hop_gas(referrers: usize) -> NearGas {
+    NearGas::from_gas(HOP_GAS.as_gas() + REFERRER_CHECK_GAS.as_gas() * referrers as u64)
+}
+
+/// Gas the DEX burns for `split_route` on `graph` with `referrers` sent in the swap message
+fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>, referrers: usize) -> NearGas {
+    let hops = split_route
+        .parts
+        .iter()
+        .flat_map(|part| &part.route.hops)
+        .collect::<Vec<_>>();
+    // Every referral fee paid in a hop is a receiver the pool's fees have on top of its own
+    let referral_fees_paid = hops
+        .iter()
+        .map(|hop| {
+            let pool = &graph.pools()[hop.pool];
+            pool.fees[hop.position_in()].receivers.len() - pool.info.fees.receivers.len()
+        })
+        .sum::<usize>();
+    let referral_gas = if referrers == 0 {
+        0
+    } else {
+        REFERRAL_FEES_GAS.as_gas() + REFERRAL_FEE_GAS.as_gas() * referral_fees_paid as u64
+    };
+    NearGas::from_gas(
+        SWAP_BASE_GAS.as_gas() + hop_gas(referrers).as_gas() * hops.len() as u64 + referral_gas,
+    )
 }
 
 fn to_api_response(
@@ -557,6 +589,7 @@ fn to_api_response(
     token_out: &AssetId,
     amount: QuoteAmount,
     slippage_bp: u128,
+    referrers: usize,
 ) -> Result<SplitRouteApiResponse, anyhow::Error> {
     match amount {
         QuoteAmount::ExactIn(total_amount_in) => {
@@ -607,7 +640,7 @@ fn to_api_response(
                 amount_in: U128(total_amount_in),
                 amount_out: U128(total_estimated_out),
                 discount: U128(0),
-                swap_gas: swap_gas(split_route),
+                swap_gas: swap_gas(split_route, graph, referrers),
             })
         }
         QuoteAmount::ExactOut(total_amount_out) => {
@@ -671,7 +704,7 @@ fn to_api_response(
                 max_amount_in: U128(total_max_amount_in),
                 amount_out: U128(total_amount_out),
                 discount: U128(0),
-                swap_gas: swap_gas(split_route),
+                swap_gas: swap_gas(split_route, graph, referrers),
             })
         }
     }
@@ -749,7 +782,7 @@ pub fn find_path_in(
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            HOP_GAS,
+            hop_gas(request.referral_fees.0.len()),
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,
@@ -761,6 +794,7 @@ pub fn find_path_in(
         &request.token_out,
         request.amount,
         slippage_bp,
+        request.referral_fees.0.len(),
     )?;
     if request.fee_discount != 0 {
         // Compared to the same route without the fee discount
@@ -1150,5 +1184,60 @@ mod tests {
                 .all(|fees| *fees == discounted_fees)
         );
         assert!(referred_discounted.pools()[0].info.fees == discounted_fees);
+    }
+
+    #[test]
+    fn swap_gas_counts_referrers_checked_and_paid() {
+        let pools = build_pools(PoolsSource {
+            block_height: 1,
+            timestamp: 0,
+            pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
+            fee_assets: referrer_fee_assets(&[nep141("a.near")]),
+        });
+        let swap_gas = |token_in: &str, token_out: &str, referral_fees: ReferralFees| {
+            let response = find_path_in(
+                &pools,
+                &Request {
+                    token_in: nep141(token_in),
+                    token_out: nep141(token_out),
+                    amount: QuoteAmount::ExactIn(10u128.pow(21)),
+                    max_hops: MaxHops::Four,
+                    slippage: "0.01".parse().unwrap(),
+                    near_price_raw: BigDecimal::from(1),
+                    quoted_token_price_raw: BigDecimal::from(1),
+                    referral_fees,
+                    fee_discount: 0,
+                },
+            )
+            .unwrap();
+            match response {
+                SplitRouteApiResponse::ExactIn { swap_gas, .. } => swap_gas,
+                SplitRouteApiResponse::ExactOut { .. } => unreachable!(),
+            }
+        };
+        let both = ReferralFees(vec![
+            (referrer_id(), REFERRAL_FEE),
+            (other_referrer_id(), OTHER_REFERRAL_FEE),
+        ]);
+        // 23 base and 2 for the hop
+        assert_eq!(
+            swap_gas("a.near", "b.near", ReferralFees::default()),
+            NearGas::from_tgas(25)
+        );
+        // 1 for the referral fees, 0.25 for checking ref.near and 0.75 for paying it
+        assert_eq!(
+            swap_gas("a.near", "b.near", one_referrer()),
+            NearGas::from_tgas(27)
+        );
+        // ref2.near collects no fees, but is checked
+        assert_eq!(
+            swap_gas("a.near", "b.near", both),
+            NearGas::from_ggas(27_250)
+        );
+        // ref.near collects fees in a.near only, so selling b.near checks it without paying
+        assert_eq!(
+            swap_gas("b.near", "a.near", one_referrer()),
+            NearGas::from_ggas(26_250)
+        );
     }
 }

@@ -4,7 +4,7 @@ use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, Withdr
 use lazy_static::lazy_static;
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
-    AccountId, Action, Balance, BlockHeight, FunctionCallAction, Gas, NearGas, NearToken,
+    AccountId, Action, Balance, BlockHeight, FunctionCallAction, NearGas, NearToken,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
 use pathfinder::{
@@ -20,10 +20,11 @@ use xyk_dex_types::{
 
 use crate::{
     shared_utils::{
-        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage, is_near,
-        price_raw, swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID, STORAGE_BYTE_COST,
+        convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage,
+        intear_registration, is_near, price_raw, register_input_in_wallet, swap_call_gas, Mainnet,
+        NetworkView, DEFAULT_REFERRER_ID,
     },
-    types::{ExecutionInstruction, TokenId},
+    types::{ExecutionInstruction, ReferralFees, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
 
@@ -134,86 +135,6 @@ impl PlachQuotes for MainnetPlachQuotes {
     }
 }
 
-const RECORD_BYTES: u128 = 40;
-const ACCOUNT_ID_LENGTH_BYTES: u128 = 4;
-
-fn account_storage_bytes(id: u128) -> u128 {
-    RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 32
-}
-
-fn balances_storage_bytes(id: u128) -> u128 {
-    let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
-    RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 4 + (4 + key_prefix) + (4 + key_prefix)
-}
-
-fn balance_storage_bytes(id: u128, asset_id: &AssetId) -> u128 {
-    let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
-    let asset_id = borsh::to_vec(asset_id).unwrap().len() as u128;
-    (RECORD_BYTES + key_prefix + 4 + asset_id) + (RECORD_BYTES + 32 + 16 + 4)
-}
-/// `storage_deposit` takes no less
-const MIN_STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(5);
-
-/// Registers the assets the trader doesn't have yet, with the storage deposit they lack. The map
-/// of the trader's balances is paid for even if it exists, since the engine has no view for it.
-async fn registration(
-    network: &impl NetworkView,
-    trader_account_id: &AccountId,
-    asset_ids: &[&AssetId],
-) -> Option<Vec<ExecutionInstruction>> {
-    let mut unregistered = Vec::new();
-    for &asset_id in asset_ids {
-        if !unregistered.contains(&asset_id)
-            && !network
-                .is_intear_asset_registered(trader_account_id, asset_id)
-                .await
-        {
-            unregistered.push(asset_id);
-        }
-    }
-    if unregistered.is_empty() {
-        return Some(vec![]);
-    }
-    let storage = network
-        .storage_balance(INTEAR_DEX_CONTRACT_ID.parse().unwrap(), trader_account_id)
-        .await
-        .inspect_err(|e| info!("Failed to get the storage balance of {trader_account_id}: {e}"))
-        .ok()?;
-    let id = trader_account_id.len() as u128;
-    let account_bytes = match storage {
-        Some(_) => 0,
-        None => account_storage_bytes(id),
-    };
-    let bytes = account_bytes
-        + balances_storage_bytes(id)
-        + unregistered
-            .iter()
-            .map(|asset_id| balance_storage_bytes(id, asset_id))
-            .sum::<u128>();
-    let needed = STORAGE_BYTE_COST.saturating_mul(bytes);
-    let available = storage.map_or(NearToken::from_yoctonear(0), |storage| storage.available());
-    let mut actions = Vec::new();
-    if needed > available {
-        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
-            method_name: "storage_deposit".to_string(),
-            args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-            gas: Gas(NearGas::from_tgas(5)),
-            deposit: needed.saturating_sub(available).max(MIN_STORAGE_DEPOSIT),
-        })));
-    }
-    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "register_assets".to_string(),
-        args: serde_json::to_vec(&serde_json::json!({ "asset_ids": unregistered })).unwrap(),
-        gas: Gas(NearGas::from_tgas(5)),
-        deposit: NearToken::from_yoctonear(1),
-    })));
-    Some(vec![ExecutionInstruction::NearTransaction {
-        receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-        actions,
-        is_fee_transaction: false,
-    }])
-}
-
 impl Provider for IntearPlachProvider {
     fn dex_id(&self) -> DexId {
         DexId::Plach
@@ -274,6 +195,17 @@ async fn route(
         return None;
     }
 
+    // Referrers without a fee are never paid, but the DEX would still check them in every hop
+    let referral_fees = ReferralFees(
+        request
+            .referral_fees
+            .0
+            .iter()
+            .filter(|(_, fee_fraction)| *fee_fraction > 0)
+            .cloned()
+            .collect(),
+    );
+
     let fee_discount = match (fee_discounter, &request.trader_account_id) {
         (Some(fee_discounter), Some(trader_account_id)) => {
             let tear_balance = network
@@ -304,7 +236,7 @@ async fn route(
                     Amount::AmountOut(_) => &request.token_in,
                 },
             )?,
-            referral_fees: (&request.referral_fees).into(),
+            referral_fees: (&referral_fees).into(),
             fee_discount: fee_discount.map_or(0, |(_, fee_discount)| fee_discount),
         })
         .await?;
@@ -391,7 +323,7 @@ async fn route(
             borsh::to_vec(&SwapArgs {
                 routes: swap_routes,
                 fee_discount,
-                referral_fees: (&request.referral_fees).into(),
+                referral_fees: (&referral_fees).into(),
             })
             .unwrap(),
         ),
@@ -449,9 +381,17 @@ async fn route(
         true
     };
 
+    // The fast path swaps from the input's balance, and exact-out withdraws what's left of the
+    // input, so only exact-in deposits are swapped whole without a balance of the input
+    let registered_assets: &[&AssetId] =
+        if use_fast_path || matches!(request.amount, Amount::AmountOut(_)) {
+            &[&token_in, &token_out]
+        } else {
+            &[&token_out]
+        };
     let registration_transactions = match request.trader_account_id.as_ref() {
         Some(trader_account_id) => {
-            registration(network, trader_account_id, &[&token_in, &token_out]).await?
+            intear_registration(network, trader_account_id, registered_assets).await?
         }
         None => vec![],
     };
@@ -474,11 +414,29 @@ async fn route(
                         gas: swap_call_gas(swap_gas, reserved_gas, false),
                         deposit: NearToken::from_yoctonear(1),
                     }));
-        vec![ExecutionInstruction::NearTransaction {
-            receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-            actions: vec![execute_operations_action],
-            is_fee_transaction: false,
-        }]
+        let output_storage = if output_withdrawn {
+            deposit_storage_if_needed(
+                network,
+                &match &token_out {
+                    AssetId::Near => TokenId::Near,
+                    AssetId::Nep141(token_id) => TokenId::Nep141(token_id.clone()),
+                    AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
+                },
+                request.trader_account_id.clone(),
+            )
+            .await?
+        } else {
+            vec![]
+        };
+        [
+            output_storage,
+            vec![ExecutionInstruction::NearTransaction {
+                receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+                actions: vec![execute_operations_action],
+                is_fee_transaction: false,
+            }],
+        ]
+        .concat()
     } else {
         match token_in {
             AssetId::Near => {
@@ -510,18 +468,18 @@ async fn route(
                         network,
                         &match &token_out {
                             AssetId::Near => TokenId::Near,
-                            AssetId::Nep141(token_out_id) => TokenId::Nep141(token_out_id.clone()),
+                            AssetId::Nep141(token_id) => TokenId::Nep141(token_id.clone()),
                             AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
                         },
                         request.trader_account_id.clone(),
                     )
-                    .await,
+                    .await?,
                     deposit_storage_if_needed(
                         network,
                         &TokenId::Near,
                         request.trader_account_id.clone(),
                     )
-                    .await,
+                    .await?,
                     input_to_native,
                     swap_transactions,
                 ]
@@ -574,13 +532,14 @@ async fn route(
                         },
                         request.trader_account_id.clone(),
                     )
-                    .await,
-                    deposit_storage_if_needed(
+                    .await?,
+                    register_input_in_wallet(
                         network,
-                        &TokenId::Nep141(input_nep141),
+                        &request.token_in,
+                        input_nep141,
                         request.trader_account_id.clone(),
                     )
-                    .await,
+                    .await?,
                     input_to_nep141,
                     swap_transactions,
                 ]
@@ -946,12 +905,13 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
+                                // A new trader with one balance takes less than the minimum
+                                deposit: NearToken::from_millinear(5),
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
-                                    "asset_ids": vec![token_in.clone(), token_out.clone()],
+                                    "asset_ids": vec![token_out.clone()],
                                 }))
                                 .unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
@@ -1044,12 +1004,13 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
+                                // A new trader with one balance takes less than the minimum
+                                deposit: NearToken::from_millinear(5),
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
-                                    "asset_ids": vec![token_in.clone(), token_out.clone()],
+                                    "asset_ids": vec![token_out.clone()],
                                 }))
                                 .unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
@@ -1147,12 +1108,13 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
+                                // A new trader with one balance takes less than the minimum
+                                deposit: NearToken::from_millinear(5),
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
-                                    "asset_ids": vec![token_in.clone(), token_out.clone()],
+                                    "asset_ids": vec![token_out.clone()],
                                 }))
                                 .unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
@@ -1333,25 +1295,19 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
+                                // A new trader with one balance takes less than the minimum
+                                deposit: NearToken::from_millinear(5),
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
-                                    "asset_ids": vec![token_in.clone(), token_out.clone()],
+                                    "asset_ids": vec![token_out.clone()],
                                 }))
                                 .unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
                                 deposit: NearToken::from_yoctonear(1),
                             })),
                         ],
-                        is_fee_transaction: false,
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),true
-                        )],
                         is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {
@@ -1434,12 +1390,13 @@ mod tests {
                                 method_name: "storage_deposit".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
-                                deposit: NEW_TRADER_NEAR_AND_FT_STORAGE,
+                                // A new trader with one balance takes less than the minimum
+                                deposit: NearToken::from_millinear(5),
                             })),
                             Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "register_assets".to_string(),
                                 args: serde_json::to_vec(&serde_json::json!({
-                                    "asset_ids": vec![token_in.clone(), token_out.clone()],
+                                    "asset_ids": vec![token_out.clone()],
                                 }))
                                 .unwrap(),
                                 gas: Gas(NearGas::from_tgas(5)),
@@ -1660,6 +1617,14 @@ mod tests {
                                 deposit: NearToken::from_yoctonear(1),
                             })),
                         ],
+                        is_fee_transaction: false,
+                    },
+                    ExecutionInstruction::NearTransaction {
+                        receiver_id: "ft".parse().unwrap(),
+                        actions: vec![create_storage_deposit_action_for_contract(
+                            "0.00125 NEAR".parse().unwrap(),
+                            true,
+                        )],
                         is_fee_transaction: false,
                     },
                     ExecutionInstruction::NearTransaction {

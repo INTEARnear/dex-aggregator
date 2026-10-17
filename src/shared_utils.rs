@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     future::Future,
@@ -205,6 +207,20 @@ pub struct StorageBalanceBounds {
     min: NearToken,
 }
 
+impl StorageBalanceBounds {
+    pub fn min(&self) -> NearToken {
+        self.min
+    }
+}
+
+/// Rhea's storage of an account as `get_user_storage_state` counts it, which can use more than its
+/// deposit from older storage rules
+#[derive(Debug, Clone, Deserialize)]
+pub struct RheaStorageState {
+    deposit: NearToken,
+    usage: NearToken,
+}
+
 pub trait NetworkView: Send + Sync {
     fn storage_balance(
         &self,
@@ -228,6 +244,21 @@ pub trait NetworkView: Send + Sync {
         account_id: &AccountId,
         asset_id: &AssetId,
     ) -> impl Future<Output = bool> + Send;
+
+    fn rhea_storage_state(
+        &self,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<Option<RheaStorageState>, String>> + Send;
+
+    fn intear_balances_exist(
+        &self,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<bool, String>> + Send;
+
+    fn is_intear_asset_in_custody(
+        &self,
+        asset_id: &AssetId,
+    ) -> impl Future<Output = Result<bool, String>> + Send;
 
     fn ft_balance(
         &self,
@@ -403,6 +434,55 @@ impl NetworkView for Mainnet {
             .unwrap_or_default()
     }
 
+    async fn rhea_storage_state(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<RheaStorageState>, String> {
+        RPC_CLIENT
+            .call::<Option<RheaStorageState>>(
+                "v2.ref-finance.near".parse().unwrap(),
+                "get_user_storage_state",
+                serde_json::json!({
+                    "account_id": account_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn intear_balances_exist(&self, account_id: &AccountId) -> Result<bool, String> {
+        RPC_CLIENT
+            .call::<Vec<serde_json::Value>>(
+                "dex.intear.near".parse().unwrap(),
+                "registered_assets_of",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "from_index": 0,
+                    "limit": 1,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map(|assets| !assets.is_empty())
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn is_intear_asset_in_custody(&self, asset_id: &AssetId) -> Result<bool, String> {
+        RPC_CLIENT
+            .call::<Option<near_sdk::json_types::U128>>(
+                "dex.intear.near".parse().unwrap(),
+                "total_in_custody",
+                serde_json::json!({
+                    "asset_id": asset_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map(|total| total.is_some())
+            .map_err(|err| format!("{err:?}"))
+    }
+
     async fn ft_balance(
         &self,
         token_id: AccountId,
@@ -442,6 +522,10 @@ pub(crate) struct TestNetworkView {
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
     ft_balances: HashMap<(AccountId, AccountId), Balance>,
+    storage_balance_bounds_errors: HashSet<AccountId>,
+    intear_balances: HashSet<AccountId>,
+    intear_untracked_assets: HashSet<AssetId>,
+    rhea_storage_states: HashMap<AccountId, RheaStorageState>,
 }
 
 #[cfg(test)]
@@ -456,6 +540,10 @@ impl Default for TestNetworkView {
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
             ft_balances: HashMap::new(),
+            storage_balance_bounds_errors: Default::default(),
+            intear_balances: Default::default(),
+            intear_untracked_assets: Default::default(),
+            rhea_storage_states: HashMap::new(),
         }
     }
 }
@@ -479,6 +567,36 @@ impl TestNetworkView {
     pub(crate) fn with_storage_balance_bounds(mut self, contract_id: &str, min: NearToken) -> Self {
         self.storage_balance_bounds
             .insert(contract_id.parse().unwrap(), StorageBalanceBounds { min });
+        self
+    }
+
+    pub(crate) fn with_storage_balance_bounds_error(mut self, contract_id: &str) -> Self {
+        self.storage_balance_bounds_errors
+            .insert(contract_id.parse().unwrap());
+        self
+    }
+
+    /// Rhea's own count of an account's storage, which can use more than its deposit
+    pub(crate) fn with_rhea_storage_state(
+        mut self,
+        account_id: &str,
+        deposit: NearToken,
+        usage: NearToken,
+    ) -> Self {
+        self.rhea_storage_states.insert(
+            account_id.parse().unwrap(),
+            RheaStorageState { deposit, usage },
+        );
+        self
+    }
+
+    pub(crate) fn with_intear_balances(mut self, account_id: &str) -> Self {
+        self.intear_balances.insert(account_id.parse().unwrap());
+        self
+    }
+
+    pub(crate) fn with_intear_asset_untracked(mut self, asset_id: &AssetId) -> Self {
+        self.intear_untracked_assets.insert(asset_id.clone());
         self
     }
 
@@ -590,10 +708,21 @@ impl NetworkView for TestNetworkView {
         &self,
         contract_id: AccountId,
     ) -> Result<StorageBalanceBounds, String> {
-        self.storage_balance_bounds
-            .get(&contract_id)
-            .cloned()
-            .ok_or_else(|| "Failed to get storage balance bounds".to_string())
+        if self.storage_balance_bounds_errors.contains(&contract_id) {
+            return Err("Failed to get storage balance bounds".to_string());
+        }
+        if let Some(bounds) = self.storage_balance_bounds.get(&contract_id) {
+            return Ok(bounds.clone());
+        }
+        let min = match contract_id.as_str() {
+            "dex.intear.near" => NearToken::from_millinear(5),
+            "dclv2.ref-labs.near" => NearToken::from_millinear(500),
+            "v2.ref-finance.near" => {
+                NearToken::from_yoctonear(102 * STORAGE_BYTE_COST.as_yoctonear())
+            }
+            _ => NearToken::from_yoctonear(125 * STORAGE_BYTE_COST.as_yoctonear()),
+        };
+        Ok(StorageBalanceBounds { min })
     }
 
     async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
@@ -608,6 +737,30 @@ impl NetworkView for TestNetworkView {
             .get(&(account_id.clone(), asset_id.clone()))
             .copied()
             .unwrap_or(false)
+    }
+
+    async fn rhea_storage_state(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<RheaStorageState>, String> {
+        if let Some(state) = self.rhea_storage_states.get(account_id) {
+            return Ok(Some(state.clone()));
+        }
+        Ok(self
+            .storage_balances
+            .get(&("v2.ref-finance.near".parse().unwrap(), account_id.clone()))
+            .map(|storage| RheaStorageState {
+                deposit: storage.total,
+                usage: storage.total.saturating_sub(storage.available),
+            }))
+    }
+
+    async fn intear_balances_exist(&self, account_id: &AccountId) -> Result<bool, String> {
+        Ok(self.intear_balances.contains(account_id))
+    }
+
+    async fn is_intear_asset_in_custody(&self, asset_id: &AssetId) -> Result<bool, String> {
+        Ok(!self.intear_untracked_assets.contains(asset_id))
     }
 
     async fn ft_balance(
@@ -631,68 +784,22 @@ impl NetworkView for TestNetworkView {
     }
 }
 
-async fn create_ft_deposit_registrations(
+/// Registers the contract that a deposit of `token_id` goes to on the token, so it can receive it
+async fn register_receiver_on_token(
     network: &impl NetworkView,
     contract_id: &AccountId,
     token_id: &AccountId,
-    trader_account_id: Option<AccountId>,
-) -> Vec<ExecutionInstruction> {
-    let mut actions = vec![];
-    if let Some(trader_account_id) = trader_account_id {
-        if needs_storage_deposit_for_contract(network, &trader_account_id, token_id).await {
-            actions.push(create_nep141_storage_deposit_action(network, token_id, None).await);
-        }
+) -> Option<Vec<ExecutionInstruction>> {
+    if !needs_storage_deposit_for_contract(network, contract_id, token_id).await {
+        return Some(vec![]);
     }
-    if needs_storage_deposit_for_contract(network, contract_id, token_id).await {
-        actions
-            .push(create_nep141_storage_deposit_action(network, token_id, Some(contract_id)).await);
-    }
-    if actions.is_empty() {
-        vec![]
-    } else {
-        vec![ExecutionInstruction::NearTransaction {
-            receiver_id: token_id.clone(),
-            actions,
-            is_fee_transaction: false,
-        }]
-    }
-}
-
-pub async fn needs_storage_deposit(
-    network: &impl NetworkView,
-    account_id: &AccountId,
-    token_id: &TokenId,
-) -> bool {
-    match token_id {
-        TokenId::Near => false,
-        TokenId::Nep141(token_id) => {
-            needs_storage_deposit_for_contract(network, account_id, token_id).await
-        }
-        TokenId::Nep141OnRhea(token_id) => {
-            let is_registered = network.is_rhea_token_registered(account_id, token_id).await;
-            let has_storage_deposit = network
-                .storage_balance("v2.ref-finance.near".parse().unwrap(), account_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.available > NearToken::from_millinear(10))
-                .unwrap_or(false);
-            !has_storage_deposit || !is_registered
-        }
-        TokenId::TokenOnIntearDex(asset_id) => {
-            let is_registered = network
-                .is_intear_asset_registered(account_id, asset_id)
-                .await;
-            let has_storage_deposit = network
-                .storage_balance("dex.intear.near".parse().unwrap(), account_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.available > NearToken::from_millinear(1))
-                .unwrap_or(false);
-            !has_storage_deposit || !is_registered
-        }
-    }
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: token_id.clone(),
+        actions: vec![
+            create_nep141_storage_deposit_action(network, token_id, Some(contract_id)).await?,
+        ],
+        is_fee_transaction: false,
+    }])
 }
 
 pub async fn needs_storage_deposit_for_contract(
@@ -709,89 +816,198 @@ pub async fn needs_storage_deposit_for_contract(
     storage_deposit.total.is_zero()
 }
 
-pub async fn create_storage_deposit_action(
+/// Rhea's storage of an account: 102 bytes, and 148 more for each token it has a balance of
+const RHEA_ACCOUNT_STORAGE_BYTES: u128 = 102;
+const RHEA_TOKEN_STORAGE_BYTES: u128 = 148;
+
+/// Registers the tokens the account has no balance of on Rhea yet, with the storage deposit they
+/// lack. `swap` adds a balance of every token it outputs, also the ones in the middle of a route.
+pub async fn rhea_registration(
     network: &impl NetworkView,
-    token_id: &TokenId,
-) -> Vec<ExecutionInstruction> {
-    match token_id {
-        TokenId::Nep141(token_account_id) => vec![ExecutionInstruction::NearTransaction {
-            receiver_id: token_account_id.clone(),
-            actions: vec![
-                create_nep141_storage_deposit_action(network, token_account_id, None).await,
-            ],
-            is_fee_transaction: false,
-        }],
-        TokenId::Near => panic!("NEAR doesn't need a storage deposit"),
-        TokenId::Nep141OnRhea(token_id) => {
-            vec![ExecutionInstruction::NearTransaction {
-                receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                actions: vec![
-                    create_storage_deposit_action_for_contract(
-                        NearToken::from_millinear(10),
-                        false,
-                    ),
-                    Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "register_tokens".to_string(),
-                        args: serde_json::to_vec(&serde_json::json!({
-                            "token_ids": [token_id],
-                        }))
-                        .unwrap(),
-                        gas: Gas(NearGas::from_tgas(10)),
-                        deposit: NearToken::from_yoctonear(1),
-                    })),
-                ],
-                is_fee_transaction: false,
-            }]
-        }
-        TokenId::TokenOnIntearDex(asset_id) => {
-            vec![ExecutionInstruction::NearTransaction {
-                receiver_id: "dex.intear.near".parse().unwrap(),
-                actions: vec![
-                    Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "storage_deposit".to_string(),
-                        args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
-                        gas: Gas(NearGas::from_tgas(10)),
-                        deposit: "0.005 NEAR".parse().unwrap(),
-                    })),
-                    Action::FunctionCall(Box::new(FunctionCallAction {
-                        method_name: "register_assets".to_string(),
-                        args: serde_json::to_vec(&serde_json::json!({
-                            "asset_ids": [asset_id],
-                        }))
-                        .unwrap(),
-                        gas: Gas(NearGas::from_tgas(10)),
-                        deposit: NearToken::from_yoctonear(1),
-                    })),
-                ],
-                is_fee_transaction: false,
-            }]
+    account_id: &AccountId,
+    token_ids: &[&AccountId],
+) -> Option<Vec<ExecutionInstruction>> {
+    let mut unregistered = Vec::new();
+    for &token_id in token_ids {
+        if !unregistered.contains(&token_id)
+            && !network.is_rhea_token_registered(account_id, token_id).await
+        {
+            unregistered.push(token_id);
         }
     }
+    if unregistered.is_empty() {
+        return Some(vec![]);
+    }
+    // As the contract counts them, so an account that uses more than its deposit pays for that too
+    let (deposit, usage) = match network
+        .rhea_storage_state(account_id)
+        .await
+        .inspect_err(|e| info!("Failed to get the Rhea storage of {account_id}: {e}"))
+        .ok()?
+    {
+        Some(state) => (state.deposit, state.usage),
+        None => (
+            NearToken::from_yoctonear(0),
+            STORAGE_BYTE_COST.saturating_mul(RHEA_ACCOUNT_STORAGE_BYTES),
+        ),
+    };
+    let needed = usage.saturating_add(
+        STORAGE_BYTE_COST.saturating_mul(RHEA_TOKEN_STORAGE_BYTES * unregistered.len() as u128),
+    );
+    let mut actions = Vec::new();
+    if needed > deposit {
+        actions.push(create_storage_deposit_action_for_contract(
+            needed.saturating_sub(deposit),
+            false,
+        ));
+    }
+    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "register_tokens".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({ "token_ids": unregistered })).unwrap(),
+        gas: Gas(NearGas::from_tgas(10)),
+        deposit: NearToken::from_yoctonear(1),
+    })));
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: "v2.ref-finance.near".parse().unwrap(),
+        actions,
+        is_fee_transaction: false,
+    }])
 }
 
-const DEFAULT_TOKEN_STORAGE_DEPOSIT: NearToken = NearToken::from_micronear(1250); // 0.00125 NEAR
-const MAX_TOKEN_STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10); // 0.01 NEAR
+const INTEAR_RECORD_BYTES: u128 = 40;
+const ACCOUNT_ID_LENGTH_BYTES: u128 = 4;
+
+/// Registers the assets the account has no balance of on Intear DEX yet, with the storage deposit
+/// they lack
+pub async fn intear_registration(
+    network: &impl NetworkView,
+    account_id: &AccountId,
+    asset_ids: &[&AssetId],
+) -> Option<Vec<ExecutionInstruction>> {
+    let contract_id: AccountId = "dex.intear.near".parse().unwrap();
+    let mut unregistered = Vec::new();
+    let mut any_registered = false;
+    for &asset_id in asset_ids {
+        if unregistered.contains(&asset_id) {
+            continue;
+        }
+        if network
+            .is_intear_asset_registered(account_id, asset_id)
+            .await
+        {
+            any_registered = true;
+        } else {
+            unregistered.push(asset_id);
+        }
+    }
+    if unregistered.is_empty() {
+        return Some(vec![]);
+    }
+    let storage = network
+        .storage_balance(contract_id.clone(), account_id)
+        .await
+        .inspect_err(|e| info!("Failed to get the storage balance of {account_id}: {e}"))
+        .ok()?;
+    let id = account_id.len() as u128;
+    let account_bytes = match storage {
+        Some(_) => 0,
+        None => INTEAR_RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 32,
+    };
+    // The account's map of balances exists once it has registered any asset
+    let balances_exist = any_registered
+        || (storage.is_some()
+            && network
+                .intear_balances_exist(account_id)
+                .await
+                .inspect_err(|e| info!("Failed to get the balances of {account_id}: {e}"))
+                .ok()?);
+    let balances_bytes = if balances_exist {
+        0
+    } else {
+        let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
+        INTEAR_RECORD_BYTES
+            + (1 + ACCOUNT_ID_LENGTH_BYTES + id)
+            + 4
+            + (4 + key_prefix)
+            + (4 + key_prefix)
+    };
+    let mut assets_bytes = 0;
+    for asset_id in &unregistered {
+        let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
+        let asset = borsh::to_vec(asset_id).unwrap().len() as u128;
+        assets_bytes +=
+            (INTEAR_RECORD_BYTES + key_prefix + 4 + asset) + (INTEAR_RECORD_BYTES + 32 + 16 + 4);
+        if !network
+            .is_intear_asset_in_custody(asset_id)
+            .await
+            .inspect_err(|e| info!("Failed to get the total in custody of {asset_id}: {e}"))
+            .ok()?
+        {
+            assets_bytes += 138 + borsh::to_vec(asset_id).unwrap().len() as u128;
+        }
+    }
+    let needed = STORAGE_BYTE_COST.saturating_mul(account_bytes + balances_bytes + assets_bytes);
+    let available = storage.map_or(NearToken::from_yoctonear(0), |storage| storage.available());
+    let mut actions = Vec::new();
+    if needed > available {
+        // storage_deposit takes no less than the minimum, also from registered accounts
+        let min = network
+            .storage_balance_bounds(contract_id.clone())
+            .await
+            .inspect_err(|e| {
+                info!("Failed to get the storage balance bounds of {contract_id}: {e}")
+            })
+            .ok()?
+            .min();
+        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "storage_deposit".to_string(),
+            args: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            gas: Gas(NearGas::from_tgas(5)),
+            deposit: needed.saturating_sub(available).max(min),
+        })));
+    }
+    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "register_assets".to_string(),
+        args: serde_json::to_vec(&serde_json::json!({ "asset_ids": unregistered })).unwrap(),
+        gas: Gas(NearGas::from_tgas(5)),
+        deposit: NearToken::from_yoctonear(1),
+    })));
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: contract_id,
+        actions,
+        is_fee_transaction: false,
+    }])
+}
+
+const MAX_TOKEN_STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(10);
 
 pub async fn token_storage_deposit_amount(
     network: &impl NetworkView,
     token_id: &AccountIdRef,
-) -> NearToken {
-    match network.storage_balance_bounds(token_id.to_owned()).await {
-        Ok(bounds) if bounds.min < MAX_TOKEN_STORAGE_DEPOSIT => bounds.min,
-        _ => DEFAULT_TOKEN_STORAGE_DEPOSIT,
+) -> Option<NearToken> {
+    let min = network
+        .storage_balance_bounds(token_id.to_owned())
+        .await
+        .inspect_err(|e| info!("Failed to get the storage balance bounds of {token_id}: {e}"))
+        .ok()?
+        .min();
+    if min >= MAX_TOKEN_STORAGE_DEPOSIT {
+        info!("{token_id} takes {min} of storage, not routing through it");
+        return None;
     }
+    Some(min)
 }
 
 pub async fn create_nep141_storage_deposit_action(
     network: &impl NetworkView,
     token_id: &AccountIdRef,
     account_id: Option<&AccountId>,
-) -> Action {
-    let amount = token_storage_deposit_amount(network, token_id).await;
-    match account_id {
+) -> Option<Action> {
+    let amount = token_storage_deposit_amount(network, token_id).await?;
+    Some(match account_id {
         Some(account_id) => create_storage_deposit_action_for_someone(amount, account_id, true),
         None => create_storage_deposit_action_for_contract(amount, true),
-    }
+    })
 }
 
 pub fn create_storage_deposit_action_for_contract(
@@ -1128,14 +1344,19 @@ pub async fn convert_to_nep141(
             Some((transactions, WRAP_NEAR.parse::<AccountId>().unwrap()))
         }
         TokenId::Nep141(token_id) => Some((vec![], token_id.clone())),
-        TokenId::Nep141OnRhea(token_id) => Some((
-            vec![ExecutionInstruction::NearTransaction {
-                receiver_id: "v2.ref-finance.near".parse().unwrap(),
-                actions: vec![create_rhea_withdraw_action(token_id, amount, false)],
-                is_fee_transaction: false,
-            }],
-            token_id.clone(),
-        )),
+        TokenId::Nep141OnRhea(token_id) => {
+            // Rhea withdraws the whole balance for 0, so nothing is withdrawn instead
+            let withdraw = if amount > 0 {
+                vec![ExecutionInstruction::NearTransaction {
+                    receiver_id: "v2.ref-finance.near".parse().unwrap(),
+                    actions: vec![create_rhea_withdraw_action(token_id, amount, false)],
+                    is_fee_transaction: false,
+                }]
+            } else {
+                vec![]
+            };
+            Some((withdraw, token_id.clone()))
+        }
         TokenId::TokenOnIntearDex(asset_id) => {
             let withdraw = if amount > 0 {
                 vec![ExecutionInstruction::NearTransaction {
@@ -1235,33 +1456,71 @@ pub async fn deposit_storage_on_contract_if_needed(
     network: &impl NetworkView,
     contract_id: &AccountIdRef,
     trader_account_id: impl Into<Option<AccountId>>,
-    amount: NearToken,
-) -> Vec<ExecutionInstruction> {
-    if let Some(trader_account_id) = trader_account_id.into() {
-        if needs_storage_deposit_for_contract(network, &trader_account_id, contract_id).await {
-            return vec![ExecutionInstruction::NearTransaction {
-                receiver_id: contract_id.to_owned(),
-                actions: vec![create_storage_deposit_action_for_contract(amount, true)],
-                is_fee_transaction: false,
-            }];
-        }
+) -> Option<Vec<ExecutionInstruction>> {
+    let Some(trader_account_id) = trader_account_id.into() else {
+        return Some(vec![]);
+    };
+    if !needs_storage_deposit_for_contract(network, &trader_account_id, contract_id).await {
+        return Some(vec![]);
     }
-    vec![]
+    let min = network
+        .storage_balance_bounds(contract_id.to_owned())
+        .await
+        .inspect_err(|e| info!("Failed to get the storage balance bounds of {contract_id}: {e}"))
+        .ok()?
+        .min();
+    Some(vec![ExecutionInstruction::NearTransaction {
+        receiver_id: contract_id.to_owned(),
+        actions: vec![create_storage_deposit_action_for_contract(min, true)],
+        is_fee_transaction: false,
+    }])
 }
 
+/// Registers the trader where `token_id` is, with the storage it needs, if they aren't yet.
+/// `None` if what it needs can't be found out.
 pub async fn deposit_storage_if_needed(
     network: &impl NetworkView,
     token_id: &TokenId,
     trader_account_id: impl Into<Option<AccountId>>,
-) -> Vec<ExecutionInstruction> {
-    if let Some(trader_account_id) = trader_account_id.into() {
-        if needs_storage_deposit(network, &trader_account_id, token_id).await {
-            create_storage_deposit_action(network, token_id).await
-        } else {
-            vec![]
+) -> Option<Vec<ExecutionInstruction>> {
+    let Some(trader_account_id) = trader_account_id.into() else {
+        return Some(vec![]);
+    };
+    match token_id {
+        TokenId::Near => Some(vec![]),
+        TokenId::Nep141(token_id) => {
+            if !needs_storage_deposit_for_contract(network, &trader_account_id, token_id).await {
+                return Some(vec![]);
+            }
+            Some(vec![ExecutionInstruction::NearTransaction {
+                receiver_id: token_id.clone(),
+                actions: vec![create_nep141_storage_deposit_action(network, token_id, None).await?],
+                is_fee_transaction: false,
+            }])
         }
-    } else {
-        vec![]
+        TokenId::Nep141OnRhea(token_id) => {
+            rhea_registration(network, &trader_account_id, &[token_id]).await
+        }
+        TokenId::TokenOnIntearDex(asset_id) => {
+            intear_registration(network, &trader_account_id, &[asset_id]).await
+        }
+    }
+}
+
+/// Registers the trader on `input_nep141`, the NEP-141 a route swaps from, when the route withdraws
+/// or wraps `token_in` into their wallet. A wallet-level input is in their wallet already.
+pub async fn register_input_in_wallet(
+    network: &impl NetworkView,
+    token_in: &TokenId,
+    input_nep141: AccountId,
+    trader_account_id: impl Into<Option<AccountId>>,
+) -> Option<Vec<ExecutionInstruction>> {
+    match token_in {
+        TokenId::Nep141(_) => Some(vec![]),
+        TokenId::Near | TokenId::Nep141OnRhea(_) | TokenId::TokenOnIntearDex(_) => {
+            deposit_storage_if_needed(network, &TokenId::Nep141(input_nep141), trader_account_id)
+                .await
+        }
     }
 }
 
@@ -1303,12 +1562,12 @@ pub async fn convert_to(
     to: &TokenId,
     amount: Balance,
     trader_account_id: Option<AccountId>,
-) -> Vec<ExecutionInstruction> {
+) -> Option<Vec<ExecutionInstruction>> {
     if from == to {
-        return vec![];
+        return Some(vec![]);
     }
     let (Some(from_base_token), Some(to_base_token)) = (base_token(from), base_token(to)) else {
-        return vec![];
+        return Some(vec![]);
     };
 
     // Inner balances are withdrawn to their wallet-level token before anything
@@ -1341,17 +1600,38 @@ pub async fn convert_to(
         TokenId::Near | TokenId::Nep141(_) => (vec![], from_base_token),
     };
 
+    let received_in_wallet = match (from, &from_base_token, &to_base_token) {
+        (
+            TokenId::Nep141OnRhea(token_id) | TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)),
+            BaseTokenId::Nep141(_),
+            _,
+        ) => Some(token_id.clone()),
+        (_, BaseTokenId::Near, BaseTokenId::Nep141(_)) => Some(WRAP_NEAR.parse().unwrap()),
+        _ => None,
+    };
+    let register_in_wallet = match received_in_wallet {
+        Some(token_id) => {
+            deposit_storage_if_needed(
+                network,
+                &TokenId::Nep141(token_id),
+                trader_account_id.clone(),
+            )
+            .await?
+        }
+        None => vec![],
+    };
+
     let (register, deposit) = match to {
         TokenId::Nep141OnRhea(token_id) => (
             [
-                deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
-                create_ft_deposit_registrations(
+                deposit_storage_if_needed(network, to, trader_account_id.clone()).await?,
+                register_in_wallet,
+                register_receiver_on_token(
                     network,
                     &"v2.ref-finance.near".parse().unwrap(),
                     token_id,
-                    trader_account_id.clone(),
                 )
-                .await,
+                .await?,
             ]
             .concat(),
             vec![ExecutionInstruction::NearTransaction {
@@ -1365,14 +1645,10 @@ pub async fn convert_to(
         ),
         TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) => (
             [
-                deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
-                create_ft_deposit_registrations(
-                    network,
-                    &"dex.intear.near".parse().unwrap(),
-                    token_id,
-                    trader_account_id.clone(),
-                )
-                .await,
+                deposit_storage_if_needed(network, to, trader_account_id.clone()).await?,
+                register_in_wallet,
+                register_receiver_on_token(network, &"dex.intear.near".parse().unwrap(), token_id)
+                    .await?,
             ]
             .concat(),
             vec![ExecutionInstruction::NearTransaction {
@@ -1385,7 +1661,11 @@ pub async fn convert_to(
             }],
         ),
         TokenId::TokenOnIntearDex(AssetId::Near) => (
-            deposit_storage_if_needed(network, to, trader_account_id.clone()).await,
+            [
+                deposit_storage_if_needed(network, to, trader_account_id.clone()).await?,
+                register_in_wallet,
+            ]
+            .concat(),
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: "dex.intear.near".parse().unwrap(),
                 actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -1397,9 +1677,8 @@ pub async fn convert_to(
                 is_fee_transaction: false,
             }],
         ),
-        TokenId::Near
-        | TokenId::Nep141(_)
-        | TokenId::TokenOnIntearDex(AssetId::Nep245(_, _) | AssetId::Nep171(_, _)) => {
+        TokenId::Near | TokenId::Nep141(_) => (register_in_wallet, vec![]),
+        TokenId::TokenOnIntearDex(AssetId::Nep245(_, _) | AssetId::Nep171(_, _)) => {
             (vec![], vec![])
         }
     };
@@ -1432,7 +1711,7 @@ pub async fn convert_to(
         (BaseTokenId::Nep141(_), BaseTokenId::Near) => vec![],
     };
 
-    [register, withdraw, convert, deposit].concat()
+    Some([register, withdraw, convert, deposit].concat())
 }
 
 /// Gas of the execution instructions: the fees of their transactions and function calls, and

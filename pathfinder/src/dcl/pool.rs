@@ -48,6 +48,8 @@ pub struct Pool {
     fee_charged_x: Balance,
     fee_charged_y: Balance,
     protocol_fee_rate: u32,
+    /// The tax of the swap being simulated, which the protocol takes its portion of at the end
+    tax_charged: Balance,
     /// Limit orders changed by simulated swaps
     filled_orders: BTreeMap<i32, (Balance, Balance)>,
     /// Steps of the swaps simulated on this pool
@@ -83,6 +85,8 @@ pub struct PoolInit {
     pub point_delta: i32,
     pub tax: Option<PoolTax>,
     pub current_point: i32,
+    /// Whether positions start or end at the current point, even if they cancel each other out
+    pub current_point_is_endpoint: bool,
     pub liquidity: Balance,
     pub liquidity_x: Balance,
     pub fee_charged_x: Balance,
@@ -116,11 +120,14 @@ impl Pool {
         }
         // The view cuts segments at every endpoint, at the current point (the left and right walks
         // meet there) and at the query bounds, so every boundary except those two is an endpoint.
+        // The current point is one too if positions start or end there, which the contract steps
+        // on and crosses even when they cancel each other out.
         let endpoints: BTreeMap<i32, i128> = deltas
             .into_iter()
             .filter(|(point, delta)| {
                 point % init.point_delta == 0
                     && (*delta != 0
+                        || (*point == init.current_point && init.current_point_is_endpoint)
                         || ![init.current_point, LEFT_MOST_POINT, RIGHT_MOST_POINT].contains(point))
             })
             .collect();
@@ -151,6 +158,7 @@ impl Pool {
             fee_charged_x: init.fee_charged_x,
             fee_charged_y: init.fee_charged_y,
             protocol_fee_rate: init.protocol_fee_rate,
+            tax_charged: 0,
             filled_orders: BTreeMap::new(),
             work: Work::default(),
         })
@@ -171,13 +179,21 @@ impl Pool {
         token_in: &AccountId,
         amount_in: Balance,
     ) -> SwapResult<Balance> {
-        if *token_in == self.data.token_x {
-            self.swap_x2y(amount_in)
+        let in_token_x = if *token_in == self.data.token_x {
+            true
         } else if *token_in == self.data.token_y {
-            self.swap_y2x(amount_in)
+            false
         } else {
-            Err(SwapError::WrongToken)
-        }
+            return Err(SwapError::WrongToken);
+        };
+        let amount_out = if in_token_x {
+            self.swap_x2y(amount_in)
+        } else {
+            self.swap_y2x(amount_in)
+        };
+        // On every exit, so a failed swap doesn't leave its tax to the next one
+        self.charge_tax_portion(in_token_x)?;
+        amount_out
     }
 
     /// Buys `amount_out` of `token_out`, returns the input amount needed
@@ -186,13 +202,20 @@ impl Pool {
         token_out: &AccountId,
         amount_out: Balance,
     ) -> SwapResult<Balance> {
-        if *token_out == self.data.token_y {
-            self.swap_x2y_desire_y(amount_out)
+        let in_token_x = if *token_out == self.data.token_y {
+            true
         } else if *token_out == self.data.token_x {
-            self.swap_y2x_desire_x(amount_out)
+            false
         } else {
-            Err(SwapError::WrongToken)
-        }
+            return Err(SwapError::WrongToken);
+        };
+        let amount_in = if in_token_x {
+            self.swap_x2y_desire_y(amount_out)
+        } else {
+            self.swap_y2x_desire_x(amount_out)
+        };
+        self.charge_tax_portion(in_token_x)?;
+        amount_in
     }
 
     fn order(&self, point: i32) -> (Balance, Balance) {
@@ -324,26 +347,37 @@ impl Pool {
         )?)
     }
 
-    /// pool.rs:206 / :744: the protocol's part of a fee, in checked u128 math. It takes the whole
-    /// fee when there's no liquidity to give the rest to.
+    /// pool.rs:206 / :744: the protocol's part of a fee, in checked u128 math. With a tax (2.4.0),
+    /// the tax is taken off the fee first and summed for `charge_tax_portion`. The protocol takes
+    /// its rate of the rest, or all of it when there's no liquidity to give it to.
     fn charge_fee(&mut self, in_token_x: bool, fee: Balance) -> SwapResult<()> {
-        let charged = if self.state.liquidity > 0 {
-            // With a tax (2.4.0), the protocol fee rate applies to what the tax leaves of the
-            // fee, and the protocol's portion of the tax is added, as swaps on the staging
-            // contract show
-            match self.data.tax {
-                Some(tax) => {
-                    let taxed = fee_part(fee, tax.tax_rate as u32)?;
-                    checked_add(
-                        fee_part(checked_sub(fee, taxed)?, self.protocol_fee_rate)?,
-                        fee_part(taxed, tax.protocol_portion as u32)?,
-                    )?
-                }
-                None => fee_part(fee, self.protocol_fee_rate)?,
-            }
-        } else {
-            fee
+        let taxed = match self.data.tax {
+            Some(tax) => fee_part(fee, tax.tax_rate as u32)?,
+            None => 0,
         };
+        self.tax_charged = checked_add(self.tax_charged, taxed)?;
+        let untaxed = checked_sub(fee, taxed)?;
+        let charged = if self.state.liquidity > 0 {
+            fee_part(untaxed, self.protocol_fee_rate)?
+        } else {
+            untaxed
+        };
+        self.add_fee_charged(in_token_x, charged)
+    }
+
+    /// The protocol's portion of the tax a swap charged, which the contract takes once at the
+    /// end of each pool's swap, from the summed tax
+    fn charge_tax_portion(&mut self, in_token_x: bool) -> SwapResult<()> {
+        let taxed = std::mem::take(&mut self.tax_charged);
+        match self.data.tax {
+            Some(tax) => {
+                self.add_fee_charged(in_token_x, fee_part(taxed, tax.protocol_portion as u32)?)
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn add_fee_charged(&mut self, in_token_x: bool, charged: Balance) -> SwapResult<()> {
         let total = if in_token_x {
             &mut self.fee_charged_x
         } else {
@@ -674,4 +708,76 @@ fn fee_part(fee: Balance, rate: u32) -> SwapResult<Balance> {
         .checked_mul(rate as u128)
         .ok_or(SwapError::Panic("attempt to multiply with overflow"))?
         / PROTOCOL_FEE_DENOMINATOR)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Swaps emulated with the wasm of ref-dcl.private-mainnet.ref-dev-team.near (2.4.0) on a
+    //! pool of fee 1000, point delta 20 and protocol fee rate 2000, with the current point at
+    //! 397940 and only y there, and positions of 3e10, 4e10 and 5e10 or 5e10 each from 397000,
+    //! 397600 and 397800 to 398500
+
+    use super::*;
+
+    fn pool(tax: PoolTax, liquidities: [Balance; 3]) -> Pool {
+        let [l1, l2, l3] = liquidities;
+        let segments = [
+            (LEFT_MOST_POINT, 397000, 0),
+            (397000, 397600, l1),
+            (397600, 397800, l1 + l2),
+            (397800, 397940, l1 + l2 + l3),
+            (397940, 398500, l1 + l2 + l3),
+            (398500, RIGHT_MOST_POINT, 0),
+        ];
+        Pool::new(
+            PoolInit {
+                id: "x.near|y.near|1000".to_string(),
+                token_x: "x.near".parse().unwrap(),
+                token_y: "y.near".parse().unwrap(),
+                fee: 1000,
+                point_delta: 20,
+                tax: Some(tax),
+                current_point: 397940,
+                current_point_is_endpoint: false,
+                liquidity: l1 + l2 + l3,
+                liquidity_x: 0,
+                fee_charged_x: 0,
+                fee_charged_y: 0,
+                protocol_fee_rate: 2000,
+            },
+            segments,
+            [],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tax_portion_is_taken_once_from_the_summed_tax() {
+        let mut taxed = pool(
+            PoolTax {
+                tax_rate: 7777,
+                protocol_portion: 3333,
+            },
+            [3 * 10u128.pow(10), 4 * 10u128.pow(10), 5 * 10u128.pow(10)],
+        );
+        assert_eq!(
+            taxed.swap_exact_in(&"x.near".parse().unwrap(), 79624),
+            Ok(14945749269361629031909)
+        );
+        // Protocol fee 2 plus 20 of the 61 tax, where flooring per step would give 20 in all
+        assert_eq!(taxed.fee_charged_x, 22);
+
+        let mut taxed = pool(
+            PoolTax {
+                tax_rate: 1000,
+                protocol_portion: 4000,
+            },
+            [5 * 10u128.pow(10); 3],
+        );
+        assert_eq!(
+            taxed.swap_exact_in(&"x.near".parse().unwrap(), 157398),
+            Ok(29085689450957559429942)
+        );
+        assert_eq!(taxed.fee_charged_x, 33);
+    }
 }

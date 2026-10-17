@@ -222,6 +222,8 @@ struct StablePoolInfo {
     decimals: Arc<[u8]>,
     c_amounts: Amounts,
     total_fee: u32,
+    /// The contract's admin fee rate, out of FEE_DIVISOR of the trade fee
+    admin_fee_bps: u32,
     amp: u64,
     /// Invariant of `c_amounts`, `None` until computed
     d: Option<U256>,
@@ -235,7 +237,8 @@ impl StablePoolInfo {
     fn swap(&mut self, in_idx: usize, out_idx: usize, amount_in: Balance) -> Option<Balance> {
         let (amount_swapped, result) = self.quote(in_idx, out_idx, amount_in)?;
         self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
+        // The admin fee is added back as LP shares after the reserve check
+        self.c_amounts[out_idx] = result.new_destination_amount + result.admin_fee;
         self.d = None;
         Some(amount_swapped)
     }
@@ -302,7 +305,7 @@ impl StablePoolInfo {
             c_amount_in,
             token_out,
             &self.c_amounts,
-            &stable::Fees::new(self.total_fee),
+            &stable::Fees::new(self.total_fee, self.admin_fee_bps),
             self.d,
         )
     }
@@ -313,6 +316,8 @@ struct RatedPoolInfo {
     decimals: Arc<[u8]>,
     c_amounts: Amounts,
     total_fee: u32,
+    /// The contract's admin fee rate, out of FEE_DIVISOR of the trade fee
+    admin_fee_bps: u32,
     amp: u64,
     rates: Arc<[Balance]>,
     /// Invariant of `c_amounts`, `None` until computed
@@ -323,7 +328,8 @@ impl RatedPoolInfo {
     fn swap(&mut self, in_idx: usize, out_idx: usize, amount_in: Balance) -> Option<Balance> {
         let (amount_swapped, result) = self.quote(in_idx, out_idx, amount_in)?;
         self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
+        // The admin fee is added back as LP shares after the reserve check
+        self.c_amounts[out_idx] = result.new_destination_amount + result.admin_fee;
         self.d = None;
         Some(amount_swapped)
     }
@@ -341,7 +347,7 @@ impl RatedPoolInfo {
             c_amount_in,
             out_idx,
             &self.c_amounts,
-            &rated::Fees::new(self.total_fee),
+            &rated::Fees::new(self.total_fee, self.admin_fee_bps),
             self.d,
         )?;
         let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
@@ -373,6 +379,8 @@ struct DegenPoolInfo {
     decimals: Arc<[u8]>,
     c_amounts: Amounts,
     total_fee: u32,
+    /// The contract's admin fee rate, out of FEE_DIVISOR of the trade fee
+    admin_fee_bps: u32,
     amp: u64,
     degens: Arc<[Balance]>,
     /// Invariant of `c_amounts`, `None` until computed
@@ -383,7 +391,8 @@ impl DegenPoolInfo {
     fn swap(&mut self, in_idx: usize, out_idx: usize, amount_in: Balance) -> Option<Balance> {
         let (amount_swapped, result) = self.quote(in_idx, out_idx, amount_in)?;
         self.c_amounts[in_idx] = result.new_source_amount;
-        self.c_amounts[out_idx] = result.new_destination_amount;
+        // The admin fee is added back as LP shares after the reserve check
+        self.c_amounts[out_idx] = result.new_destination_amount + result.admin_fee;
         self.d = None;
         Some(amount_swapped)
     }
@@ -401,7 +410,7 @@ impl DegenPoolInfo {
             c_amount_in,
             out_idx,
             &self.c_amounts,
-            &degen::Fees::new(self.total_fee),
+            &degen::Fees::new(self.total_fee, self.admin_fee_bps),
             self.d,
         )?;
         let amount_swapped = self.c_amount_to_amount(result.amount_swapped, out_idx);
@@ -632,4 +641,163 @@ pub fn find_path_in(
         pools.block_height
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pools as they were at block 220410272 (220409387 for pool 6063), when Rhea's
+    //! admin_fee_bps was 2000. The largest amounts in are the ones predict_swap_actions accepted,
+    //! one more panicked with E69, and the balances after swaps are the stored ones.
+
+    use super::*;
+
+    const ADMIN_FEE_BPS: u32 = 2000;
+
+    fn stable_3364() -> StablePoolInfo {
+        StablePoolInfo {
+            decimals: [8, 18].into(),
+            c_amounts: [4728633852979921, 2132136082966149134]
+                .into_iter()
+                .collect(),
+            total_fee: 5,
+            admin_fee_bps: ADMIN_FEE_BPS,
+            amp: 240,
+            d: None,
+        }
+    }
+
+    fn rated_6555() -> RatedPoolInfo {
+        RatedPoolInfo {
+            decimals: [8, 6].into(),
+            c_amounts: [10093117847152207451007248, 187317906690495280563184]
+                .into_iter()
+                .collect(),
+            total_fee: 5,
+            admin_fee_bps: ADMIN_FEE_BPS,
+            amp: 240,
+            rates: [rated::PRECISION, rated::PRECISION].into(),
+            d: None,
+        }
+    }
+
+    fn rated_5442() -> RatedPoolInfo {
+        RatedPoolInfo {
+            decimals: [18, 6].into(),
+            c_amounts: [1876992073846267069397942, 835317192937631297879702]
+                .into_iter()
+                .collect(),
+            total_fee: 5,
+            admin_fee_bps: ADMIN_FEE_BPS,
+            amp: 50,
+            rates: [7349129361886197798869, rated::PRECISION].into(),
+            d: None,
+        }
+    }
+
+    fn degen_5949() -> DegenPoolInfo {
+        DegenPoolInfo {
+            decimals: [8, 24].into(),
+            c_amounts: [98854474005878566674618, 1581482389019972205941446576]
+                .into_iter()
+                .collect(),
+            total_fee: 30,
+            admin_fee_bps: ADMIN_FEE_BPS,
+            amp: 10,
+            degens: [81461590000000000000000000000, 4974390980000000000000000].into(),
+            d: None,
+        }
+    }
+
+    fn degen_6063() -> DegenPoolInfo {
+        DegenPoolInfo {
+            decimals: [24, 6].into(),
+            c_amounts: [
+                44765685592100102719570412788,
+                214496408673817124584898056474,
+            ]
+            .into_iter()
+            .collect(),
+            total_fee: 30,
+            admin_fee_bps: ADMIN_FEE_BPS,
+            amp: 15,
+            degens: [4956421690000000000000000, 998710000000000000000000].into(),
+            d: None,
+        }
+    }
+
+    #[test]
+    fn stable_reserve_check_takes_off_the_admin_fee() {
+        let pool = stable_3364();
+        assert_eq!(
+            pool.quote(1, 0, 535475272052493974)
+                .map(|(amount_out, _)| amount_out),
+            Some(372826)
+        );
+        // Enough reserve without the admin fee, not with it
+        assert!(pool.quote(1, 0, 535475272052493975).is_none());
+        assert!(pool.quote(1, 0, 535688159890984265).is_none());
+    }
+
+    #[test]
+    fn stable_swap_keeps_the_admin_fee_in_the_pool() {
+        let mut pool = stable_3364();
+        assert_eq!(pool.swap(1, 0, 10u128.pow(17)), Some(174562));
+        assert_eq!(
+            pool.c_amounts.as_slice(),
+            [2983006903108461, 2232136082966149134]
+        );
+    }
+
+    #[test]
+    fn rated_reserve_check_takes_off_the_admin_fee() {
+        let pool = rated_6555();
+        assert_eq!(
+            pool.quote(0, 1, 1285429751)
+                .map(|(amount_out, _)| amount_out),
+            Some(186299)
+        );
+        assert!(pool.quote(0, 1, 1285429752).is_none());
+        assert!(pool.quote(0, 1, 1302259774).is_none());
+
+        let pool = rated_5442();
+        assert!(pool.quote(1, 0, 18185064).is_some());
+        assert!(pool.quote(1, 0, 18185065).is_none());
+        assert!(pool.quote(1, 0, 37040665).is_none());
+    }
+
+    #[test]
+    fn rated_swap_rates_back_the_admin_fee_separately() {
+        let mut pool = rated_5442();
+        assert_eq!(pool.swap(1, 0, 10000000), Some(1875259620710702099));
+        assert_eq!(
+            pool.c_amounts.as_slice(),
+            [1732453135564970295753, 10835317192937631297879702]
+        );
+    }
+
+    #[test]
+    fn degen_reserve_check_takes_off_the_admin_fee() {
+        let pool = degen_5949();
+        assert_eq!(
+            pool.quote(1, 0, 4305575812476891564929063435)
+                .map(|(amount_out, _)| amount_out),
+            Some(9779562)
+        );
+        assert!(pool.quote(1, 0, 4305575812476891564929063436).is_none());
+        assert!(pool.quote(1, 0, 4461406343133028890162344986).is_none());
+    }
+
+    #[test]
+    fn degen_swaps_in_a_row_keep_the_stored_balances() {
+        let mut pool = degen_6063();
+        pool.swap(1, 0, 16596280).unwrap();
+        pool.swap(1, 0, 10275843).unwrap();
+        assert_eq!(
+            pool.c_amounts.as_slice(),
+            [
+                44760281050521462864333929217,
+                214523280796817124584898056472
+            ]
+        );
+    }
 }

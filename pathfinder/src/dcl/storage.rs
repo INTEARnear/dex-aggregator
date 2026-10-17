@@ -70,10 +70,12 @@ struct StoredContract {
     _counters: (u128, u128),
 }
 
-/// Fields that version 4 inserted between the counters of `StoredContract`
+/// Fields that version 4 inserted between the counters of `StoredContract`, as
+/// ref-dcl.private-mainnet.ref-dev-team.near (2.4.0) stores them
 #[derive(BorshDeserialize)]
 struct StoredContractV4Fields {
-    _create_pool_with_tax_whitelist: StoredUnorderedMap,
+    /// Lost-and-found amount of each token
+    _lostfound_totals: StoredUnorderedMap,
     _whitelisted_tokens: StoredUnorderedSet,
 }
 
@@ -155,6 +157,9 @@ struct StoredPointOrder {
 pub(super) struct PointData {
     pub segments: Vec<(i32, i32, Balance)>,
     pub orders: Vec<(i32, Balance, Balance)>,
+    /// Whether the current point is an endpoint, which the segments can't tell apart from the
+    /// split at the current point when its net delta is zero
+    pub current_point_is_endpoint: bool,
 }
 
 /// Metadata and frozen tokens
@@ -314,5 +319,9 @@ pub(super) fn point_data(
     if end_liquidity != 0 {
         anyhow::bail!("Liquidity {end_liquidity} doesn't end at the last point");
     }
-    Ok(PointData { segments, orders })
+    Ok(PointData {
+        segments,
+        orders,
+        current_point_is_endpoint: deltas.contains_key(&current_point),
+    })
 }

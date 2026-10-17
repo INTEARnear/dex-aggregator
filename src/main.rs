@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::task::{AbortHandle, JoinHandle};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -132,6 +133,13 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
         ));
     }
 
+    if let Amount::AmountIn(0) | Amount::AmountOut(0) = request.amount {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Amount must be greater than 0".to_string(),
+        ));
+    }
+
     if request.dexes.as_ref().is_some_and(|dexes| dexes.is_empty()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -140,6 +148,16 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
     }
 
     Ok(())
+}
+
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Quotes of every requested DEX, best first
@@ -187,14 +205,17 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         }));
     }
 
-    let (route_stats, routes): (Vec<_>, Vec<_>) = futures_util::future::join_all(routes)
+    let _abort_routes_on_drop = AbortOnDrop(routes.iter().map(JoinHandle::abort_handle).collect());
+    let (mut route_stats, routes): (Vec<_>, Vec<_>) = futures_util::future::join_all(routes)
         .await
         .into_iter()
-        .map(|result| result.expect("Route tasks catch panics and are never aborted"))
+        .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
         .unzip();
-    let mut routes = routes.into_iter().flatten().collect::<Vec<_>>();
-
-    for route in routes.iter_mut() {
+    let mut converted_routes = Vec::new();
+    for (stats, route) in route_stats.iter_mut().zip(routes) {
+        let Some(mut route) = route else {
+            continue;
+        };
         if !route.deprecated_needs_unwrap_always_false {
             let amount_out = match (
                 request.amount,
@@ -218,16 +239,24 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
                     "Converting from {:?} to {:?} with amount {}",
                     route.token_output, request.token_out, amount_out
                 );
-                route.execution_instructions.extend(
-                    convert_to(
-                        &Mainnet,
-                        &route.token_output,
-                        &request.token_out,
-                        amount_out,
-                        request.trader_account_id.clone(),
-                    )
-                    .await,
-                );
+                let conversion = convert_to(
+                    &Mainnet,
+                    &route.token_output,
+                    &request.token_out,
+                    amount_out,
+                    request.trader_account_id.clone(),
+                )
+                .await;
+                let Some(conversion) = conversion else {
+                    error!(
+                        "No conversion of the {} route from {} to {}, leaving it out",
+                        route.dex_id, route.token_output, request.token_out
+                    );
+                    stats.outcome = RouteOutcome::NotFound;
+                    stats.estimated_amount = None;
+                    continue;
+                };
+                route.execution_instructions.extend(conversion);
                 route.token_output = request.token_out.clone();
             }
         }
@@ -247,9 +276,10 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
             });
         route.execution_instructions =
             optimize_execution_instructions([swap_transactions, fee_transactions].concat());
+        converted_routes.push(route);
     }
 
-    let mut quotes = routes
+    let mut quotes = converted_routes
         .into_iter()
         .map(|route| Quote {
             estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),

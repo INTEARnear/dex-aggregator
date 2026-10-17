@@ -12,8 +12,8 @@ use crate::{
     shared_utils::{
         convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
         deposit_storage_on_contract_if_needed, get_slippage, needs_storage_deposit_for_contract,
-        payable_referral_fees, price_raw, referrer_fees_of_total, swap_call_gas, total_fee_amount,
-        Mainnet, NetworkView, ReferrerFee,
+        payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
+        swap_call_gas, total_fee_amount, Mainnet, NetworkView, ReferrerFee,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -23,8 +23,6 @@ pub struct RheaDclProvider;
 
 const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 const RESERVED_GAS: NearGas = NearGas::from_tgas(62);
-/// The contract takes no less storage deposit than this
-const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(500);
 
 trait RheaDclQuotes: Send + Sync {
     fn find_path(
@@ -213,18 +211,19 @@ async fn route(
         network,
         &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
         request.trader_account_id.clone(),
-        STORAGE_DEPOSIT,
     )
-    .await;
+    .await?;
     let transactions = [
         storage_deposit,
-        deposit_storage_if_needed(network, &token_output, request.trader_account_id.clone()).await,
-        deposit_storage_if_needed(
+        deposit_storage_if_needed(network, &token_output, request.trader_account_id.clone())
+            .await?,
+        register_input_in_wallet(
             network,
-            &TokenId::Nep141(input_nep141),
+            &request.token_in,
+            input_nep141,
             request.trader_account_id.clone(),
         )
-        .await,
+        .await?,
         input_to_nep141,
         swap_transactions,
         send_fees,
@@ -438,14 +437,6 @@ mod tests {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
                         actions: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
-                            true
-                        )],
-                        is_fee_transaction: false,
-                    },
-                    ExecutionInstruction::NearTransaction {
-                        receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            "0.00125 NEAR".parse().unwrap(),
                             true
                         )],
                         is_fee_transaction: false,

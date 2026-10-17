@@ -182,12 +182,12 @@ fn is_tradable(info: &PoolInfo) -> bool {
 /// selling y), as `get_liquidity_range` and `get_pointorder_range` return them
 fn build_pool(
     info: PoolInfo,
-    segments: impl IntoIterator<Item = (i32, i32, Balance)>,
-    orders: impl IntoIterator<Item = (i32, Balance, Balance)>,
+    point_data: storage::PointData,
     protocol_fee_rate: u32,
 ) -> Result<Pool, anyhow::Error> {
     Pool::new(
         PoolInit {
+            current_point_is_endpoint: point_data.current_point_is_endpoint,
             id: info.pool_id,
             token_x: info.token_x,
             token_y: info.token_y,
@@ -201,8 +201,8 @@ fn build_pool(
             fee_charged_y: info.total_fee_y_charged,
             protocol_fee_rate,
         },
-        segments,
-        orders,
+        point_data.segments,
+        point_data.orders,
     )
 }
 
@@ -242,12 +242,7 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
         }
         let pool_id = info.pool_id.clone();
         let point_data = storage::point_data(state, &pool_id, info.current_point)?;
-        match build_pool(
-            info,
-            point_data.segments,
-            point_data.orders,
-            metadata.protocol_fee_rate,
-        ) {
+        match build_pool(info, point_data, metadata.protocol_fee_rate) {
             Ok(pool) => built.push(pool),
             // Pool::new checks that liquidity at the current point matches the pool
             Err(e) => error!("Failed to load pool {pool_id} at block {block_height}: {e}"),

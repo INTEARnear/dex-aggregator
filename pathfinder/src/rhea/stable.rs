@@ -7,17 +7,25 @@ pub const MIN_RESERVE: u128 = 10u128.pow(TARGET_DECIMAL as u32) / 1_000_u128;
 
 pub struct Fees {
     pub trade_fee: u32,
+    /// The contract's share of the trade fee, which it takes out of the pool before checking
+    /// the reserve, then adds back as LP shares
+    pub admin_fee_bps: u32,
 }
 
 impl Fees {
-    pub fn new(total_fee: u32) -> Self {
+    pub fn new(total_fee: u32, admin_fee_bps: u32) -> Self {
         Self {
             trade_fee: total_fee,
+            admin_fee_bps,
         }
     }
 
     pub fn trade_fee(&self, amount: Balance) -> Balance {
         u128_ratio(amount, self.trade_fee as u128, FEE_DIVISOR as u128)
+    }
+
+    pub fn admin_trade_fee(&self, trade_fee: Balance) -> Balance {
+        u128_ratio(trade_fee, self.admin_fee_bps as u128, FEE_DIVISOR as u128)
     }
 }
 
@@ -26,10 +34,12 @@ impl Fees {
 pub struct SwapResult {
     /// New amount of source token.
     pub new_source_amount: Balance,
-    /// New amount of destination token.
+    /// New amount of destination token without the admin fee, which MIN_RESERVE applies to
     pub new_destination_amount: Balance,
     /// Amount of destination token swapped.
     pub amount_swapped: Balance,
+    /// Admin fee in the destination token, added back to the pool after the reserve check
+    pub admin_fee: Balance,
 }
 
 /// The StableSwap invariant calculator.
@@ -177,16 +187,19 @@ impl StableSwap {
             .saturating_sub(1);
 
         let trade_fee = fees.trade_fee(dy);
+        let admin_fee = fees.admin_trade_fee(trade_fee);
         let amount_swapped = dy.checked_sub(trade_fee)?;
 
-        let new_destination_amount =
-            current_c_amounts[token_out_idx].checked_sub(amount_swapped)?;
+        let new_destination_amount = current_c_amounts[token_out_idx]
+            .checked_sub(amount_swapped)?
+            .checked_sub(admin_fee)?;
         let new_source_amount = current_c_amounts[token_in_idx].checked_add(token_in_amount)?;
 
         Some(SwapResult {
             new_source_amount,
             new_destination_amount,
             amount_swapped,
+            admin_fee,
         })
     }
 }

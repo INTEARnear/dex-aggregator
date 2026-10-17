@@ -102,7 +102,7 @@ pub struct SwapRequest {
     /// The public key to use for signing.
     pub signing_public_key: Option<PublicKey>,
     /// The account ID of the referrer. If provided, the route will include referral
-    /// parameter for DEXes that support it (DexId::Rhea, DexId::Aidols, DexId::Plach)
+    /// parameter for DEXes that support it (DexId::Rhea, DexId::Plach)
     pub referrer_id: Option<AccountId>,
     /// Fees the route pays to referrers, as a JSON object of referrer account IDs and
     /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Plach charges them
@@ -300,10 +300,7 @@ pub enum DexId {
     ///
     /// Supports AmountIn, doesn't support AmountOut
     Rhea,
-    /// https://aidols.bot/
-    /// bonding-curve launchpad
-    ///
-    /// Supports both AmountIn and AmountOut, only *.aidols.near tokens
+    /// Removed, still parses so requests that name it don't break, but never has a route
     Aidols,
     /// Directly wrap NEAR to wNEAR, or unwrap wNEAR to NEAR
     ///
@@ -314,25 +311,13 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     RheaDcl,
-    /// https://metapool.app/
-    /// Liquid Staking provider
-    ///
-    /// Supports NEAR -> STNEAR and STNEAR -> NEAR, both AmountIn and AmountOut
+    /// Removed, still parses so requests that name it don't break, but never has a route
     MetaPool,
-    /// https://linearprotocol.org/
-    /// Liquid Staking provider
-    ///
-    /// Supports NEAR -> LiNEAR and LiNEAR -> NEAR, both AmountIn and AmountOut
+    /// Removed, still parses so requests that name it don't break, but never has a route
     Linear,
-    /// https://app.rhea.finance/stake
-    /// Staked $RHEA
-    ///
-    /// Supports RHEA -> XRHEA and XRHEA -> RHEA, both AmountIn and AmountOut
+    /// Removed, still parses so requests that name it don't break, but never has a route
     XRhea,
-    /// https://app.rhea.finance/stake
-    /// Liquid Staking Provider
-    ///
-    /// Supports NEAR -> rNEAR and rNEAR -> NEAR, both AmountIn and AmountOut
+    /// Removed, still parses so requests that name it don't break, but never has a route
     RNear,
     /// https://dex.intea.rs/
     /// AMM DEX

@@ -15,6 +15,8 @@ const POOLS_PREFIX: &[u8] = &[0];
 const RATES_KEY: &[u8] = b"custom_rate_key";
 const DEGENS_KEY: &[u8] = b"custom_degen_key";
 const DEGEN_ORACLES_KEY: &[u8] = b"custom_degen_oracle_config_key";
+/// The contract's state, where admin_fee_bps is
+const STATE_KEY: &[u8] = b"STATE";
 /// Rated pools refuse swaps with a rate this old
 const RATE_EXPIRY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
@@ -26,6 +28,7 @@ pub fn watch() -> Watch {
             RATES_KEY.to_vec(),
             DEGENS_KEY.to_vec(),
             DEGEN_ORACLES_KEY.to_vec(),
+            STATE_KEY.to_vec(),
         ],
     }
 }
@@ -132,6 +135,26 @@ enum StoredDegenOracle {
     },
 }
 
+/// The first fields of the contract's state, the rest follow admin_fee_bps
+#[derive(BorshDeserialize)]
+struct StoredContractHead {
+    _owner_id: AccountId,
+    _boost_farm_id: AccountId,
+    _burrowland_id: AccountId,
+    admin_fee_bps: u32,
+}
+
+/// The share of curve pools' trade fees that the contract takes, out of FEE_DIVISOR
+fn admin_fee_bps(state: &AccountState) -> Result<u32, anyhow::Error> {
+    let value = state
+        .entries
+        .get(STATE_KEY)
+        .ok_or_else(|| anyhow::anyhow!("STATE is missing"))?;
+    let head = StoredContractHead::deserialize(&mut value.as_slice())
+        .map_err(|e| anyhow::anyhow!("Invalid STATE {value:02x?}: {e}"))?;
+    Ok(head.admin_fee_bps)
+}
+
 /// Rate of tokens without a stored rate
 const DEFAULT_RATE: Balance = rated::PRECISION;
 
@@ -140,6 +163,7 @@ type Price = Option<Balance>;
 
 pub(super) fn pools(state: &AccountState) -> Result<Vec<Pool>, anyhow::Error> {
     let timestamp = state.block.timestamp_nanosec;
+    let admin_fee_bps = admin_fee_bps(state)?;
     let rates = match state.entries.get(RATES_KEY) {
         Some(value) => borsh::from_slice::<Vec<(AccountId, StoredRate)>>(value)
             .map_err(|e| anyhow::anyhow!("Invalid {}: {e}", String::from_utf8_lossy(RATES_KEY)))?
@@ -185,7 +209,7 @@ pub(super) fn pools(state: &AccountState) -> Result<Vec<Pool>, anyhow::Error> {
         }
         let pool = borsh::from_slice::<StoredPool>(value)
             .map_err(|e| anyhow::anyhow!("Invalid pool {index}: {e}"))?;
-        let Some((tokens, detail)) = pool_detail(pool, timestamp, &rates, &degens)
+        let Some((tokens, detail)) = pool_detail(pool, timestamp, admin_fee_bps, &rates, &degens)
             .map_err(|e| anyhow::anyhow!("Pool {index}: {e}"))?
         else {
             continue;
@@ -225,6 +249,7 @@ fn pyth_expiry(state: &AccountState) -> Result<u64, anyhow::Error> {
 fn pool_detail(
     pool: StoredPool,
     timestamp: u64,
+    admin_fee_bps: u32,
     rates: &HashMap<AccountId, Price>,
     degens: &HashMap<AccountId, Price>,
 ) -> Result<Option<(Vec<AccountId>, PoolDetailInfo)>, anyhow::Error> {
@@ -261,6 +286,7 @@ fn pool_detail(
             decimals: pool.token_decimals.into(),
             c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
+            admin_fee_bps,
             amp,
             d: None,
         }),
@@ -277,6 +303,7 @@ fn pool_detail(
             decimals: pool.token_decimals.into(),
             c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
+            admin_fee_bps,
             amp,
             d: None,
         }),
@@ -298,6 +325,7 @@ fn pool_detail(
             decimals: pool.token_decimals.into(),
             c_amounts: pool.c_amounts.into(),
             total_fee: pool.total_fee,
+            admin_fee_bps,
             amp,
             d: None,
         }),
