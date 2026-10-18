@@ -82,7 +82,7 @@ async fn route(
 
     let token_in_ref = &token_in;
     let payable_referral_fees =
-        payable_referral_fees(&request.referral_fees, |referrer_id| async move {
+        payable_referral_fees(&request.fees, |referrer_id| async move {
             if fast_path {
                 network
                     .is_rhea_token_registered(&referrer_id, token_in_ref)
@@ -359,7 +359,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -443,7 +443,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -514,7 +514,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -602,7 +602,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -691,7 +691,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default()
                     .with_test_prices()
@@ -774,7 +774,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -835,7 +835,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -915,7 +915,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -986,7 +986,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1011,7 +1011,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1036,7 +1036,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::none(),
@@ -1061,7 +1061,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::empty_routes(),
@@ -1086,7 +1086,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1111,7 +1111,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1179,7 +1179,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: Some("ref.near".parse().unwrap()),
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaQuotes::default(),
@@ -1281,7 +1281,7 @@ mod tests {
             trader_account_id: None,
             signing_public_key: None,
             referrer_id: Some("ref.near".parse().unwrap()),
-            referral_fees: "{\"ref.near\":0.01}".parse().unwrap(),
+            fees: "{\"ref.near\":0.01}".parse().unwrap(),
         }
     }
 
@@ -1496,7 +1496,7 @@ mod tests {
     async fn each_referrer_that_can_receive_the_input_gets_its_fee() {
         let route = route(
             SwapRequest {
-                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02,"nostorage.near":0.01}"#
+                fees: r#"{"ref.near":0.01,"ref2.near":0.02,"nostorage.near":0.01}"#
                     .parse()
                     .unwrap(),
                 ..referred_request(
@@ -1557,7 +1557,7 @@ mod tests {
     async fn each_referrer_fee_in_near_is_its_own_wnear_transfer() {
         let route = route(
             SwapRequest {
-                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02}"#.parse().unwrap(),
+                fees: r#"{"ref.near":0.01,"ref2.near":0.02}"#.parse().unwrap(),
                 ..referred_request(TokenId::Near, TokenId::Nep141("ft".parse().unwrap()))
             },
             &TestNetworkView::default()
@@ -1612,7 +1612,7 @@ mod tests {
         let route = route(
             SwapRequest {
                 trader_account_id: Some("trader.near".parse().unwrap()),
-                referral_fees: r#"{"ref.near":0.01,"ref2.near":0.02,"unregistered.near":0.01}"#
+                fees: r#"{"ref.near":0.01,"ref2.near":0.02,"unregistered.near":0.01}"#
                     .parse()
                     .unwrap(),
                 ..referred_request(

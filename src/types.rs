@@ -108,21 +108,21 @@ pub struct SwapRequest {
     /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Plach charges them
     /// itself, Rhea and Rhea DCL routes send them in the input token after the swap call.
     #[serde(default)]
-    pub referral_fees: ReferralFees,
+    pub fees: QuoteFees,
 }
 
 /// Referrers and the fee each charges, in fractions of [`FULL_FEE_FRACTION`]. At most
 /// `MAX_REFERRERS`, adding up to at most [`MAX_REFERRAL_FEE_FRACTION`], as Plach allows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReferralFees(pub Vec<(AccountId, FeeFraction)>);
+pub struct QuoteFees(pub Vec<(AccountId, FeeFraction)>);
 
-impl From<&ReferralFees> for xyk_dex_types::ReferralFees {
-    fn from(referral_fees: &ReferralFees) -> Self {
-        Self(referral_fees.0.clone())
+impl From<&QuoteFees> for xyk_dex_types::ReferralFees {
+    fn from(fees: &QuoteFees) -> Self {
+        Self(fees.0.clone())
     }
 }
 
-impl FromStr for ReferralFees {
+impl FromStr for QuoteFees {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -155,7 +155,7 @@ impl FromStr for ReferralFees {
                 Ok((referrer_id, fee_fraction))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let referral_fees = ReferralFees(fees);
+        let referral_fees = QuoteFees(fees);
         xyk_dex_types::ReferralFees::from(&referral_fees)
             .validate()
             .map_err(|error| error.to_string())?;
@@ -163,7 +163,7 @@ impl FromStr for ReferralFees {
     }
 }
 
-impl<'de> Deserialize<'de> for ReferralFees {
+impl<'de> Deserialize<'de> for QuoteFees {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer)?
             .parse()

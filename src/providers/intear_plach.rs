@@ -24,7 +24,7 @@ use crate::{
         intear_registration, is_near, price_raw, register_input_in_wallet, swap_call_gas, Mainnet,
         NetworkView, DEFAULT_REFERRER_ID,
     },
-    types::{ExecutionInstruction, ReferralFees, TokenId},
+    types::{ExecutionInstruction, QuoteFees, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
 
@@ -196,9 +196,9 @@ async fn route(
     }
 
     // Referrers without a fee are never paid, but the DEX would still check them in every hop
-    let referral_fees = ReferralFees(
+    let referral_fees = QuoteFees(
         request
-            .referral_fees
+            .fees
             .0
             .iter()
             .filter(|(_, fee_fraction)| *fee_fraction > 0)
@@ -703,7 +703,7 @@ mod tests {
                 trader_account_id: None,
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: Default::default(),
+                fees: Default::default(),
             },
             &TestNetworkView::default().with_test_prices(),
             &TestPlachQuotes::default(),
@@ -779,7 +779,7 @@ mod tests {
                 trader_account_id: Some("trader.near".parse().unwrap()),
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: Default::default(),
+                fees: Default::default(),
             },
             &TestNetworkView::default()
                 .with_test_prices()
@@ -812,7 +812,7 @@ mod tests {
                 trader_account_id: Some("trader.near".parse().unwrap()),
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: Default::default(),
+                fees: Default::default(),
             },
             &TestNetworkView::default()
                 .with_test_prices()
@@ -886,7 +886,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -985,7 +985,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1089,7 +1089,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1197,7 +1197,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1276,7 +1276,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1371,7 +1371,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1482,7 +1482,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1586,7 +1586,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1681,7 +1681,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1758,7 +1758,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1784,7 +1784,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::none(),
@@ -1810,7 +1810,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::empty_routes(),
@@ -1836,7 +1836,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1902,7 +1902,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: Some("ref.near".parse().unwrap()),
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
@@ -1957,7 +1957,7 @@ mod tests {
     async fn referral_fees_are_passed_to_plach() {
         use base64::Engine;
 
-        let referral_fees: crate::types::ReferralFees =
+        let referral_fees: crate::types::QuoteFees =
             r#"{"ref.near":0.01,"ref2.near":0.005}"#.parse().unwrap();
         let route = route(
             SwapRequest {
@@ -1971,7 +1971,7 @@ mod tests {
                 trader_account_id: None,
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: referral_fees.clone(),
+                fees: referral_fees.clone(),
             },
             &TestNetworkView::default().with_test_prices(),
             &TestPlachQuotes::default(),

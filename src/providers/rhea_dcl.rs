@@ -74,7 +74,7 @@ async fn route(
     // The fees come out of the input. Exact-in quotes the rest of it, exact-out adds the fees on
     // top of the estimated input once it's quoted.
     let nep141_in = &token_in;
-    let referral_fees = payable_referral_fees(&request.referral_fees, |referrer_id| async move {
+    let referral_fees = payable_referral_fees(&request.fees, |referrer_id| async move {
         !needs_storage_deposit_for_contract(network, &referrer_id, nep141_in).await
     })
     .await;
@@ -336,7 +336,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -422,7 +422,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -487,7 +487,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -573,7 +573,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -598,7 +598,7 @@ mod tests {
                     trader_account_id: Some("trader.near".parse().unwrap()),
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::none(),
@@ -623,7 +623,7 @@ mod tests {
                     trader_account_id: None,
                     signing_public_key: None,
                     referrer_id: None,
-                    referral_fees: Default::default(),
+                    fees: Default::default(),
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestRheaDclQuotes::default(),
@@ -684,7 +684,7 @@ mod tests {
                 trader_account_id: None,
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: "{\"ref.near\":0.05}".parse().unwrap(),
+                fees: "{\"ref.near\":0.05}".parse().unwrap(),
             },
             &TestNetworkView::default()
                 .with_test_prices()
@@ -766,7 +766,7 @@ mod tests {
                 trader_account_id: None,
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: "{\"ref.near\":0.01}".parse().unwrap(),
+                fees: "{\"ref.near\":0.01}".parse().unwrap(),
             },
             &TestNetworkView::default()
                 .with_test_prices()
@@ -825,7 +825,7 @@ mod tests {
                 trader_account_id: None,
                 signing_public_key: None,
                 referrer_id: None,
-                referral_fees: r#"{"ref.near":0.02,"ref2.near":0.03}"#.parse().unwrap(),
+                fees: r#"{"ref.near":0.02,"ref2.near":0.03}"#.parse().unwrap(),
             },
             &TestNetworkView::default()
                 .with_test_prices()

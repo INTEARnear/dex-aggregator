@@ -31,7 +31,7 @@ use xyk_dex_types::{
 
 use crate::{
     providers::intear_plach::AssetId,
-    types::{ExecutionInstruction, ReferralFees, Slippage, TokenId},
+    types::{ExecutionInstruction, QuoteFees, Slippage, TokenId},
 };
 
 pub const WRAP_NEAR: &str = "wrap.near";
@@ -282,9 +282,9 @@ pub struct ReferrerFee {
 /// others are skipped. Like the xyk DEX, [`REFERRAL_FEE_PROTOCOL_SHARE`] of each fee goes to the
 /// protocol fee receiver instead of the referrer, if it can be paid too.
 pub async fn payable_referral_fees<Fut: Future<Output = bool>>(
-    referral_fees: &ReferralFees,
+    referral_fees: &QuoteFees,
     can_receive: impl Fn(AccountId) -> Fut,
-) -> ReferralFees {
+) -> QuoteFees {
     let mut payable = Vec::new();
     let mut protocol_share = 0;
     for (referrer_id, fee_fraction) in &referral_fees.0 {
@@ -317,11 +317,11 @@ pub async fn payable_referral_fees<Fut: Future<Output = bool>>(
             );
         }
     }
-    ReferralFees(payable)
+    QuoteFees(payable)
 }
 
 /// Each referrer's fee out of `total`, without the ones rounded down to nothing
-pub fn referrer_fees_of_total(referral_fees: &ReferralFees, total: Balance) -> Vec<ReferrerFee> {
+pub fn referrer_fees_of_total(referral_fees: &QuoteFees, total: Balance) -> Vec<ReferrerFee> {
     referral_fees
         .0
         .iter()

@@ -2062,7 +2062,7 @@ fn estimated_gas_usage_excludes_swap_margin() {
 
 #[tokio::test]
 async fn protocol_gets_its_share_of_each_payable_referral_fee() {
-    let referral_fees: ReferralFees = r#"{"ref.near":0.01,"ref2.near":0.02,"cant.near":0.01}"#
+    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"ref2.near":0.02,"cant.near":0.01}"#
         .parse()
         .unwrap();
     let payable = payable_referral_fees(&referral_fees, |account_id| async move {
@@ -2083,7 +2083,7 @@ async fn protocol_gets_its_share_of_each_payable_referral_fee() {
 
 #[tokio::test]
 async fn protocol_share_adds_to_the_protocol_as_a_referrer() {
-    let referral_fees: ReferralFees =
+    let referral_fees: QuoteFees =
         r#"{"ref.near":0.01,"plach.intear.near":0.01}"#.parse().unwrap();
     let payable = payable_referral_fees(&referral_fees, |_| async { true }).await;
     assert_eq!(
@@ -2098,7 +2098,7 @@ async fn protocol_share_adds_to_the_protocol_as_a_referrer() {
 
 #[tokio::test]
 async fn protocol_share_is_not_charged_when_the_protocol_cant_receive() {
-    let referral_fees: ReferralFees = r#"{"ref.near":0.01}"#.parse().unwrap();
+    let referral_fees: QuoteFees = r#"{"ref.near":0.01}"#.parse().unwrap();
     let payable = payable_referral_fees(&referral_fees, |account_id| async move {
         account_id != xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID
     })
