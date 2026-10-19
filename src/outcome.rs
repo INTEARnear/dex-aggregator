@@ -1,0 +1,719 @@
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::LazyLock,
+    time::Duration,
+};
+
+use axum::http::StatusCode;
+use futures_util::future::try_join_all;
+use near_min_api::{
+    types::{
+        AccountId, ActionError, ActionErrorKind, ActionView, Balance, BlockHeight, BlockId,
+        BlockReference, CryptoHash, ExecutionStatusView, FinalExecutionOutcomeWithReceiptView,
+        FunctionCallError, ReceiptEnumView, TxExecutionError, TxExecutionStatus,
+    },
+    QueryFinality, RpcClient,
+};
+use near_sdk::{json_types::U128, NearToken};
+use tokio::time::Instant;
+
+use crate::{
+    providers::intear_plach::AssetId,
+    shared_utils::{
+        base_token, convert_to, is_near, optimize_execution_instructions, BaseTokenId, Mainnet,
+        NetworkView, RPC_CLIENT, WRAP_NEAR,
+    },
+    types::{BalanceChange, OutcomeRequest, SwapOutcome, TokenId},
+};
+
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
+const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const BALANCES_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_TRANSACTIONS: usize = 20;
+const STORAGE_METHODS: &[&str] = &["storage_deposit", "storage_withdraw", "storage_unregister"];
+
+const SLIPPAGE: &str = "The price moved more than your slippage allows while the transaction was on its way. Try again, or increase the slippage.";
+const NOT_ENOUGH_LIQUIDITY: &str =
+    "The pool doesn't have enough liquidity for this trade. Try a smaller amount.";
+const NOT_ENOUGH_TOKENS: &str = "You don't have enough tokens for this trade.";
+const NOT_REGISTERED: &str = "Your account isn't registered for one of the tokens. Try again.";
+const NOT_ENOUGH_STORAGE: &str = "Your account doesn't have enough NEAR for storage. Try again.";
+
+/// Substrings of errors that happen in normal use, and what to tell the trader about them. The
+/// first error of the transactions that has one of these is described.
+const KNOWN_FAILURES: &[(&str, &str)] = &[
+    // Rhea
+    ("E68: slippage error", SLIPPAGE),
+    ("E22: not enough tokens in deposit", NOT_ENOUGH_TOKENS),
+    ("E10: account not registered", NOT_REGISTERED),
+    ("E11: insufficient $NEAR storage deposit", NOT_ENOUGH_STORAGE),
+    // Rhea DCL
+    ("E204: slippage error", SLIPPAGE),
+    // Intear DEX
+    ("Output amount is less than constraint", SLIPPAGE),
+    ("Input amount is greater than constraint", SLIPPAGE),
+    ("Amount must be less than out balance", NOT_ENOUGH_LIQUIDITY),
+    ("Pool is empty", NOT_ENOUGH_LIQUIDITY),
+    (
+        "liquidity can't go lower than the initial phantom liquidity",
+        NOT_ENOUGH_LIQUIDITY,
+    ),
+    ("Insufficient balance", NOT_ENOUGH_TOKENS),
+    ("doesn't have a registered balance for this asset", NOT_REGISTERED),
+    ("is not registered for", NOT_REGISTERED),
+    ("exceeds total", NOT_ENOUGH_STORAGE),
+    (
+        "Fee discount expired",
+        "The quote expired before the transaction executed. Request a new route and try again.",
+    ),
+    // Fungible tokens
+    ("The account doesn't have enough balance", NOT_ENOUGH_TOKENS),
+    ("is not registered", NOT_REGISTERED),
+    // Runtime
+    (
+        "Exceeded the prepaid gas",
+        "The transaction ran out of gas. Try again with a smaller amount.",
+    ),
+    (
+        "wouldn't have enough balance to cover storage",
+        "Your account doesn't have enough NEAR left for gas and storage. Deposit some NEAR and try again.",
+    ),
+];
+
+static TX_STATUS_RPC_CLIENT: LazyLock<RpcClient> =
+    LazyLock::new(|| RPC_CLIENT.clone().with_max_retries(0));
+
+/// A block that a transaction or receipt executed in
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockInfo {
+    pub height: BlockHeight,
+    pub prev_hash: CryptoHash,
+}
+
+pub trait ChainView: Send + Sync {
+    /// The transaction and its receipts, `None` until they all executed, at least optimistically
+    fn executed_transaction(
+        &self,
+        tx_hash: CryptoHash,
+    ) -> impl Future<Output = Result<Option<FinalExecutionOutcomeWithReceiptView>, String>> + Send;
+
+    fn block(
+        &self,
+        block_hash: CryptoHash,
+    ) -> impl Future<Output = Result<BlockInfo, String>> + Send;
+
+    /// The balance of a fungible token in the wallet or of an inner balance after a block. Not
+    /// called for native NEAR.
+    fn balance(
+        &self,
+        token_id: &TokenId,
+        account_id: &AccountId,
+        block_hash: CryptoHash,
+    ) -> impl Future<Output = Result<Balance, String>> + Send;
+}
+
+impl ChainView for Mainnet {
+    async fn executed_transaction(
+        &self,
+        tx_hash: CryptoHash,
+    ) -> Result<Option<FinalExecutionOutcomeWithReceiptView>, String> {
+        let details = TX_STATUS_RPC_CLIENT
+            .EXPERIMENTAL_tx_status(tx_hash)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        // The RPC waits for optimistic execution, but answers earlier if that takes too long
+        Ok(match details.final_execution_status {
+            TxExecutionStatus::ExecutedOptimistic
+            | TxExecutionStatus::Executed
+            | TxExecutionStatus::Final => details.final_execution_outcome,
+            TxExecutionStatus::None
+            | TxExecutionStatus::Included
+            | TxExecutionStatus::IncludedFinal => None,
+        })
+    }
+
+    async fn block(&self, block_hash: CryptoHash) -> Result<BlockInfo, String> {
+        RPC_CLIENT
+            .block(BlockReference::BlockId(BlockId::Hash(block_hash)))
+            .await
+            .map(|block| BlockInfo {
+                height: block.header.height,
+                prev_hash: block.header.prev_hash,
+            })
+            .map_err(|err| format!("Failed to get block {block_hash}: {err:?}"))
+    }
+
+    async fn balance(
+        &self,
+        token_id: &TokenId,
+        account_id: &AccountId,
+        block_hash: CryptoHash,
+    ) -> Result<Balance, String> {
+        let at_block = || QueryFinality::BlockId(BlockId::Hash(block_hash));
+        match token_id {
+            TokenId::Near => unreachable!("Native NEAR is added up from receipts"),
+            TokenId::Nep141(contract_id) => RPC_CLIENT
+                .call::<U128>(
+                    contract_id.clone(),
+                    "ft_balance_of",
+                    serde_json::json!({ "account_id": account_id }),
+                    at_block(),
+                )
+                .await
+                .map(|balance| balance.0),
+            TokenId::Nep141OnRhea(contract_id) => RPC_CLIENT
+                .call::<U128>(
+                    "v2.ref-finance.near".parse().unwrap(),
+                    "get_deposit",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "token_id": contract_id,
+                    }),
+                    at_block(),
+                )
+                .await
+                .map(|balance| balance.0),
+            TokenId::TokenOnIntearDex(asset_id) => RPC_CLIENT
+                .call::<Option<U128>>(
+                    "dex.intear.near".parse().unwrap(),
+                    "asset_balance_of",
+                    serde_json::json!({
+                        "of": { "Account": account_id },
+                        "asset_id": asset_id,
+                    }),
+                    at_block(),
+                )
+                .await
+                .map(|balance| balance.map_or(0, |balance| balance.0)),
+        }
+        .map_err(|err| format!("Failed to get the {token_id} balance of {account_id}: {err:?}"))
+    }
+}
+
+/// What the outcome needs to know about an executed transaction
+#[derive(Debug, Clone, PartialEq)]
+struct ExecutedTransaction {
+    hash: CryptoHash,
+    signer_id: AccountId,
+    /// The block the transaction was included in
+    block_hash: CryptoHash,
+    /// The blocks its receipts executed in
+    receipt_block_hashes: Vec<CryptoHash>,
+    /// NEAR the signer attached to the calls of the transaction, unless they failed and it was
+    /// refunded
+    native_spent: Balance,
+    /// NEAR contracts transferred to the signer, other than storage deposits they sent back
+    native_received: Balance,
+    /// Errors of the transaction and its receipts, in the order they executed
+    failures: Vec<String>,
+}
+
+impl ExecutedTransaction {
+    fn from_view(view: &FinalExecutionOutcomeWithReceiptView) -> Result<Self, String> {
+        let outcome = &view.final_outcome;
+        let transaction = &outcome.transaction;
+        let statuses = outcome
+            .receipts_outcome
+            .iter()
+            .map(|receipt| (receipt.id, &receipt.outcome.status))
+            .collect::<HashMap<_, _>>();
+        let parents = outcome
+            .receipts_outcome
+            .iter()
+            .flat_map(|receipt| {
+                receipt
+                    .outcome
+                    .receipt_ids
+                    .iter()
+                    .map(|child_id| (*child_id, receipt.id))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut actions = view
+            .receipts
+            .iter()
+            .filter_map(|receipt| match &receipt.receipt {
+                ReceiptEnumView::Action { actions, .. } => {
+                    Some((receipt.receipt_id, actions.as_slice()))
+                }
+                ReceiptEnumView::Data { .. }
+                | ReceiptEnumView::GlobalContractDistribution { .. } => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let succeeded = |receipt_id: &CryptoHash| match statuses.get(receipt_id) {
+            Some(ExecutionStatusView::Failure(_)) => Ok(false),
+            Some(
+                ExecutionStatusView::SuccessValue(_) | ExecutionStatusView::SuccessReceiptId(_),
+            ) => Ok(true),
+            Some(ExecutionStatusView::Unknown) | None => Err(format!(
+                "Receipt {receipt_id} of transaction {} hasn't executed",
+                transaction.hash
+            )),
+        };
+
+        // The transaction is converted to a receipt with its actions, which refunds the deposits
+        // if it fails. wrap.near sends the yoctoNEAR of `near_withdraw` back with the NEAR, so it
+        // counts as spent.
+        let native_spent = match &outcome.transaction_outcome.outcome.status {
+            ExecutionStatusView::SuccessReceiptId(receipt_id) => {
+                actions.insert(*receipt_id, transaction.actions.as_slice());
+                if succeeded(receipt_id)? {
+                    transaction
+                        .actions
+                        .iter()
+                        .map(|action| match action {
+                            ActionView::FunctionCall {
+                                method_name,
+                                deposit,
+                                ..
+                            } if (*deposit > NearToken::from_yoctonear(1)
+                                || method_name == "near_withdraw")
+                                && !STORAGE_METHODS.contains(&method_name.as_str()) =>
+                            {
+                                deposit.as_yoctonear()
+                            }
+                            _ => 0,
+                        })
+                        .sum()
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        let mut native_received = 0;
+        for receipt in &view.receipts {
+            let ReceiptEnumView::Action {
+                actions: receipt_actions,
+                ..
+            } = &receipt.receipt
+            else {
+                continue;
+            };
+            // Gas and failed deposits are refunded by the system, and the transaction's own
+            // receipt is sent by the signer
+            if receipt.receiver_id != transaction.signer_id
+                || receipt.predecessor_id.as_str() == "system"
+                || receipt.predecessor_id == transaction.signer_id
+                || !succeeded(&receipt.receipt_id)?
+            {
+                continue;
+            }
+            let parent_id = parents.get(&receipt.receipt_id).ok_or_else(|| {
+                format!(
+                    "Receipt {} of transaction {} has no parent",
+                    receipt.receipt_id, transaction.hash
+                )
+            })?;
+            let parent_actions = actions.get(parent_id).ok_or_else(|| {
+                format!(
+                    "Receipt {parent_id} of transaction {} is missing",
+                    transaction.hash
+                )
+            })?;
+            // A receipt that also does other things than storage can't be told apart from its
+            // storage refunds, but routes only make storage deposits that are refunded nothing
+            let refunds_storage = parent_actions.iter().all(|action| {
+                matches!(
+                    action,
+                    ActionView::FunctionCall { method_name, .. }
+                        if STORAGE_METHODS.contains(&method_name.as_str())
+                )
+            });
+            if refunds_storage {
+                continue;
+            }
+            native_received += receipt_actions
+                .iter()
+                .map(|action| match action {
+                    ActionView::Transfer { deposit } => deposit.as_yoctonear(),
+                    _ => 0,
+                })
+                .sum::<Balance>();
+        }
+
+        let failures = std::iter::once(&outcome.transaction_outcome)
+            .chain(&outcome.receipts_outcome)
+            .filter_map(|execution| match &execution.outcome.status {
+                ExecutionStatusView::Failure(error) => Some(failure_message(error)),
+                ExecutionStatusView::Unknown
+                | ExecutionStatusView::SuccessValue(_)
+                | ExecutionStatusView::SuccessReceiptId(_) => None,
+            })
+            .collect();
+
+        Ok(Self {
+            hash: transaction.hash,
+            signer_id: transaction.signer_id.clone(),
+            block_hash: outcome.transaction_outcome.block_hash,
+            receipt_block_hashes: outcome
+                .receipts_outcome
+                .iter()
+                .map(|receipt| receipt.block_hash)
+                .collect(),
+            native_spent,
+            native_received,
+            failures,
+        })
+    }
+}
+
+/// The panic message of a contract, or what the runtime says about another error
+fn failure_message(error: &TxExecutionError) -> String {
+    match error {
+        TxExecutionError::ActionError(ActionError {
+            kind: ActionErrorKind::FunctionCallError(FunctionCallError::ExecutionError(message)),
+            ..
+        }) => message.clone(),
+        error => error.to_string(),
+    }
+}
+
+/// What to tell the trader about why the swap failed
+fn describe_failure(failures: &[&str]) -> String {
+    let known = failures.iter().find_map(|failure| {
+        KNOWN_FAILURES
+            .iter()
+            .find(|(pattern, _)| failure.contains(*pattern))
+            .map(|(_, description)| description.to_string())
+    });
+    match (known, failures.first()) {
+        (Some(description), _) => description,
+        (None, Some(&failure)) => format!("The swap failed: {}", panic_message(failure)),
+        (None, None) => "The swap didn't give any tokens".to_string(),
+    }
+}
+
+/// What a contract panicked with, without what the runtime adds around it
+fn panic_message(failure: &str) -> &str {
+    let message = failure
+        .strip_prefix("Smart contract panicked: ")
+        .unwrap_or(failure);
+    // Contracts built with older Rust, like Rhea, also tell where they panicked
+    match message
+        .strip_prefix("panicked at '")
+        .and_then(|message| message.rsplit_once("', "))
+    {
+        Some((message, _location)) => message,
+        None => message,
+    }
+}
+
+/// Every place a token can be held, where its balance is compared: the wallet (native NEAR or
+/// the NEP-141), Rhea's inner balance, and Intear DEX's
+fn locations(token_id: &TokenId) -> Vec<TokenId> {
+    if is_near(token_id) {
+        let wrap_near: AccountId = WRAP_NEAR.parse().unwrap();
+        return vec![
+            TokenId::Near,
+            TokenId::Nep141(wrap_near.clone()),
+            TokenId::Nep141OnRhea(wrap_near.clone()),
+            TokenId::TokenOnIntearDex(AssetId::Near),
+            TokenId::TokenOnIntearDex(AssetId::Nep141(wrap_near)),
+        ];
+    }
+    match base_token(token_id) {
+        Some(BaseTokenId::Nep141(contract_id)) => vec![
+            TokenId::Nep141(contract_id.clone()),
+            TokenId::Nep141OnRhea(contract_id.clone()),
+            TokenId::TokenOnIntearDex(AssetId::Nep141(contract_id)),
+        ],
+        Some(BaseTokenId::Near) => unreachable!("NEAR is handled above"),
+        // Only held on Intear DEX
+        None => vec![token_id.clone()],
+    }
+}
+
+/// Where the fee transactions of a route pay from: the wallet NEP-141 of the input token, wNEAR
+/// for NEAR
+fn fee_location(token_in: &TokenId) -> Option<TokenId> {
+    if is_near(token_in) {
+        return Some(TokenId::Nep141(WRAP_NEAR.parse().unwrap()));
+    }
+    match base_token(token_in)? {
+        BaseTokenId::Nep141(contract_id) => Some(TokenId::Nep141(contract_id)),
+        BaseTokenId::Near => unreachable!("NEAR is handled above"),
+    }
+}
+
+fn signed_difference(minuend: Balance, subtrahend: Balance) -> Result<i128, (StatusCode, String)> {
+    match (i128::try_from(minuend), i128::try_from(subtrahend)) {
+        (Ok(minuend), Ok(subtrahend)) => Ok(minuend - subtrahend),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Balances {minuend} and {subtrahend} are too large to compare"),
+        )),
+    }
+}
+
+/// How much a balance of the trader changed from before the transactions to after them
+async fn balance_change(
+    chain: &impl ChainView,
+    transactions: &[ExecutedTransaction],
+    location: &TokenId,
+    account_id: &AccountId,
+    before: CryptoHash,
+    after: CryptoHash,
+) -> Result<i128, (StatusCode, String)> {
+    match location {
+        TokenId::Near => signed_difference(
+            transactions.iter().map(|tx| tx.native_received).sum(),
+            transactions.iter().map(|tx| tx.native_spent).sum(),
+        ),
+        _ => {
+            let (balance_before, balance_after) = tokio::try_join!(
+                chain.balance(location, account_id, before),
+                chain.balance(location, account_id, after),
+            )
+            .map_err(|err| (StatusCode::BAD_GATEWAY, err))?;
+            signed_difference(balance_after, balance_before)
+        }
+    }
+}
+
+async fn wait_for_execution(
+    chain: &impl ChainView,
+    tx_hash: CryptoHash,
+    deadline: Instant,
+) -> Result<ExecutedTransaction, (StatusCode, String)> {
+    let mut pending_reason = "still executing".to_string();
+    loop {
+        // The RPC itself waits for the execution, so it's cut off at the deadline too
+        match tokio::time::timeout_at(deadline, chain.executed_transaction(tx_hash)).await {
+            Ok(Ok(Some(view))) => {
+                return ExecutedTransaction::from_view(&view)
+                    .map_err(|err| (StatusCode::BAD_GATEWAY, err))
+            }
+            Ok(Ok(None)) => pending_reason = "still executing".to_string(),
+            Ok(Err(err)) => pending_reason = err,
+            Err(_elapsed) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Transaction {tx_hash} didn't execute in {}s: {pending_reason}",
+                    EXECUTION_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(EXECUTION_POLL_INTERVAL).await;
+    }
+}
+
+/// Waits for the transactions of a route to execute and finds out what they did
+pub async fn swap_outcome(
+    network: &impl NetworkView,
+    chain: &impl ChainView,
+    request: OutcomeRequest,
+) -> Result<SwapOutcome, (StatusCode, String)> {
+    let tx_hashes = request.tx_hashes.as_deref().unwrap_or_default();
+    if tx_hashes.is_empty() || tx_hashes.len() > MAX_TRANSACTIONS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("tx_hashes must have 1 to {MAX_TRANSACTIONS} transaction hashes"),
+        ));
+    }
+    if tx_hashes.iter().collect::<HashSet<_>>().len() != tx_hashes.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "tx_hashes must not repeat a transaction".to_string(),
+        ));
+    }
+    if request.token_in == request.token_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Token in and token out must be different".to_string(),
+        ));
+    }
+    let fee_amount = i128::try_from(request.fee_amount).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "fee_amount is too large".to_string(),
+        )
+    })?;
+
+    let deadline = Instant::now() + EXECUTION_TIMEOUT;
+    let transactions = try_join_all(
+        tx_hashes
+            .iter()
+            .map(|tx_hash| wait_for_execution(chain, *tx_hash, deadline)),
+    )
+    .await?;
+
+    tokio::time::timeout(
+        BALANCES_TIMEOUT,
+        outcome_of(network, chain, &request, fee_amount, &transactions),
+    )
+    .await
+    .map_err(|_elapsed| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "Reading the balances took more than {}s",
+                BALANCES_TIMEOUT.as_secs()
+            ),
+        )
+    })?
+}
+
+/// What the executed transactions of a route did
+async fn outcome_of(
+    network: &impl NetworkView,
+    chain: &impl ChainView,
+    request: &OutcomeRequest,
+    fee_amount: i128,
+    transactions: &[ExecutedTransaction],
+) -> Result<SwapOutcome, (StatusCode, String)> {
+    let trader_account_id = &request.trader_account_id;
+    if let Some(transaction) = transactions
+        .iter()
+        .find(|transaction| &transaction.signer_id != trader_account_id)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Transaction {} is signed by {}, not {trader_account_id}",
+                transaction.hash, transaction.signer_id
+            ),
+        ));
+    }
+
+    // Balances are compared before the first transaction and after the last receipt
+    let mut block_hashes = transactions
+        .iter()
+        .flat_map(|transaction| {
+            std::iter::once(transaction.block_hash)
+                .chain(transaction.receipt_block_hashes.iter().copied())
+        })
+        .collect::<Vec<_>>();
+    block_hashes.sort();
+    block_hashes.dedup();
+    let blocks = try_join_all(block_hashes.iter().map(|block_hash| async move {
+        chain
+            .block(*block_hash)
+            .await
+            .map(|block| (*block_hash, block))
+    }))
+    .await
+    .map_err(|err| (StatusCode::BAD_GATEWAY, err))?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
+    let before = transactions
+        .iter()
+        .map(|transaction| blocks[&transaction.block_hash])
+        .min_by_key(|block| block.height)
+        .expect("Checked that there are transactions")
+        .prev_hash;
+    let after = *blocks
+        .iter()
+        .max_by_key(|(_, block)| block.height)
+        .expect("Checked that there are transactions")
+        .0;
+
+    let input_locations = locations(&request.token_in);
+    let output_locations = locations(&request.token_out);
+    // A conversion between two places of the same token, like a Wrap route
+    let same_token = input_locations == output_locations;
+    let mut all_locations = input_locations.clone();
+    all_locations.extend(
+        output_locations
+            .iter()
+            .filter(|location| !input_locations.contains(location))
+            .cloned(),
+    );
+    let changes = try_join_all(all_locations.iter().map(|location| {
+        balance_change(
+            chain,
+            transactions,
+            location,
+            trader_account_id,
+            before,
+            after,
+        )
+    }))
+    .await?;
+    let changes = all_locations.into_iter().zip(changes).collect::<Vec<_>>();
+    let change_of = |token_id: &TokenId| {
+        changes
+            .iter()
+            .find(|(location, _)| location == token_id)
+            .map_or(0, |(_, change)| *change)
+    };
+
+    let (input_change, output_change) = if same_token {
+        (change_of(&request.token_in), change_of(&request.token_out))
+    } else {
+        (
+            input_locations.iter().map(change_of).sum::<i128>(),
+            output_locations.iter().map(change_of).sum::<i128>(),
+        )
+    };
+    let amount_in = (-input_change).max(0).unsigned_abs();
+    let amount_out = output_change.max(0).unsigned_abs();
+    let charge_fee = amount_out > 0;
+
+    // Whatever of a token ended up elsewhere is moved to where the trader asked for it, but for
+    // what the fee transactions pay out of the wallet after a swap that went through
+    let fee_location = charge_fee
+        .then(|| fee_location(&request.token_in))
+        .flatten();
+    let targets = if same_token {
+        vec![(&output_locations, &request.token_out)]
+    } else {
+        vec![
+            (&input_locations, &request.token_in),
+            (&output_locations, &request.token_out),
+        ]
+    };
+    let mut next_steps = Vec::new();
+    for (token_locations, target) in targets {
+        for location in token_locations {
+            let mut change = change_of(location);
+            if fee_location.as_ref() == Some(location) {
+                change = change.saturating_sub(fee_amount);
+            }
+            if location == target || change <= 0 {
+                continue;
+            }
+            let conversion = convert_to(
+                network,
+                location,
+                target,
+                change.unsigned_abs(),
+                Some(trader_account_id.clone()),
+            )
+            .await
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to build moving {change} of {location} to {target}"),
+                )
+            })?;
+            next_steps.extend(conversion);
+        }
+    }
+
+    let error = (!charge_fee).then(|| {
+        describe_failure(
+            &transactions
+                .iter()
+                .flat_map(|transaction| transaction.failures.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+        )
+    });
+
+    Ok(SwapOutcome {
+        charge_fee,
+        amount_in,
+        amount_out,
+        balance_changes: changes
+            .into_iter()
+            .filter(|(_, change)| *change != 0)
+            .map(|(token, change)| BalanceChange { token, change })
+            .collect(),
+        next_steps: optimize_execution_instructions(next_steps),
+        error,
+    })
+}

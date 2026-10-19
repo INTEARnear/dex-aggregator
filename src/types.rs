@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
-    types::{near_crypto::PublicKey, AccountId, Action, Balance, NearToken},
+    types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash, NearToken},
     utils::dec_format,
 };
 use num_traits::{ToPrimitive, Zero};
@@ -277,6 +277,10 @@ pub struct Quote {
     /// Same as `storage_deposits`, since no route withdraws storage deposits anymore. Kept so
     /// integrations that read it don't break.
     pub max_storage_deposits: NearToken,
+    /// What the fee transactions pay out of the wallet balance of the input token (wNEAR for
+    /// NEAR), to pass to `/route/outcome`
+    #[serde(with = "dec_format")]
+    pub fee_amount: Balance,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -285,12 +289,74 @@ pub enum ExecutionInstruction {
     NearTransaction {
         receiver_id: AccountId,
         actions: Vec<Action>,
-        /// Pays referral fees after the swap. The swap is done once the transactions before it
-        /// succeed, so a frontend can show it as done without waiting for this one. Fee
-        /// transactions are always the last ones of a route.
+        /// Pays referral fees after the swap. Fee transactions are always the last ones of a
+        /// route. A swap that fails on-chain still lets the transaction carrying it succeed, so
+        /// send them only if `/route/outcome` of the transactions before them says `charge_fee`.
         #[serde(default)]
         is_fee_transaction: bool,
     },
+}
+
+/// The transactions of a route that a trader executed, to find out what they did
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutcomeRequest {
+    /// `token_in` of the route request
+    pub token_in: TokenId,
+    /// `token_out` of the route request
+    pub token_out: TokenId,
+    /// The account that signed the transactions
+    pub trader_account_id: AccountId,
+    /// Hashes of the transactions of the route that aren't fee transactions, comma-separated
+    #[serde(with = "comma_separated", default)]
+    pub tx_hashes: Option<Vec<CryptoHash>>,
+    /// `fee_amount` of the quote, which `next_steps` leave in the wallet for the fee transactions
+    #[serde(with = "dec_format", default)]
+    pub fee_amount: Balance,
+}
+
+/// What the transactions of a route did, once they executed
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SwapOutcome {
+    /// Whether the swap went through, so the fee transactions of the route should be sent
+    pub charge_fee: bool,
+    /// How much of the input token the transactions spent, wherever it was held. NEAR doesn't
+    /// count gas and storage deposits. Fees that the fee transactions pay aren't spent yet.
+    #[serde(with = "dec_format")]
+    pub amount_in: Balance,
+    /// How much of the output token the transactions gave, wherever it ended up
+    #[serde(with = "dec_format")]
+    pub amount_out: Balance,
+    /// The balances of the input and output tokens that changed, in every place a token can be
+    /// held. Native NEAR doesn't count gas and storage deposits.
+    pub balance_changes: Vec<BalanceChange>,
+    /// Moves tokens that ended up somewhere else than `token_in` or `token_out` there, like
+    /// wNEAR of a swap from NEAR that failed, or output a DEX left in its inner balance. Execute
+    /// them sequentially after the fee transactions, if any.
+    pub next_steps: Vec<ExecutionInstruction>,
+    /// Why the swap failed, to show to the trader. Present when `charge_fee` is false.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BalanceChange {
+    pub token: TokenId,
+    /// Signed, negative if the balance went down
+    #[serde(with = "signed_dec_format")]
+    pub change: i128,
+}
+
+mod signed_dec_format {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &i128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]

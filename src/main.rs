@@ -27,13 +27,17 @@ use tracing_subscriber::FmtSubscriber;
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
-        convert_to, estimated_gas_usage, max_gas_cost, optimize_execution_instructions, price_raw,
-        storage_deposits, Mainnet,
+        convert_to, estimated_gas_usage, fee_transactions_amount, max_gas_cost,
+        optimize_execution_instructions, price_raw, storage_deposits, Mainnet,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
-    types::{Amount, DexId, ExecutionInstruction, Quote, Route, Slippage, SwapRequest, TokenId},
+    types::{
+        Amount, DexId, ExecutionInstruction, OutcomeRequest, Quote, Route, Slippage, SwapOutcome,
+        SwapRequest, TokenId,
+    },
 };
 
+mod outcome;
 mod providers;
 mod rate_limit;
 mod shared_utils;
@@ -68,6 +72,15 @@ async fn route_handler(
     );
 
     Ok(Json(quotes))
+}
+
+async fn outcome_handler(
+    Query(request): Query<OutcomeRequest>,
+) -> Result<Json<SwapOutcome>, (StatusCode, String)> {
+    info!("Received outcome request: {:?}", request);
+    outcome::swap_outcome(&Mainnet, &Mainnet, request)
+        .await
+        .map(Json)
 }
 
 fn record_stats(
@@ -286,6 +299,7 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
             estimated_gas_usage: estimated_gas_usage(&route.execution_instructions),
             storage_deposits: storage_deposits(&route.execution_instructions),
             max_storage_deposits: storage_deposits(&route.execution_instructions),
+            fee_amount: fee_transactions_amount(&route.execution_instructions),
             route,
         })
         .collect::<Vec<_>>();
@@ -354,6 +368,7 @@ async fn main() {
     let app = Router::new()
         .route("/route", get(route_handler))
         .route("/route/subscribe", get(subscription::subscribe_handler))
+        .route("/route/outcome", get(outcome_handler))
         .with_state(stats)
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),

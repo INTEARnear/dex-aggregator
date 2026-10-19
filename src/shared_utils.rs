@@ -1538,12 +1538,12 @@ pub fn is_near(token_id: &TokenId) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BaseTokenId {
+pub enum BaseTokenId {
     Near,
     Nep141(AccountId),
 }
 
-fn base_token(token_id: &TokenId) -> Option<BaseTokenId> {
+pub fn base_token(token_id: &TokenId) -> Option<BaseTokenId> {
     match token_id {
         TokenId::Near => Some(BaseTokenId::Near),
         TokenId::Nep141(account_id) => Some(BaseTokenId::Nep141(account_id.clone())),
@@ -1755,6 +1755,34 @@ pub fn estimated_gas_usage(execution_instructions: &[ExecutionInstruction]) -> N
         call.gas.as_gas().saturating_sub(SWAP_GAS_MARGIN.as_gas())
     });
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
+}
+
+/// What the fee transactions of a route transfer, all in the NEP-141 of its input token
+pub fn fee_transactions_amount(execution_instructions: &[ExecutionInstruction]) -> Balance {
+    #[derive(Deserialize)]
+    struct FtTransferArgs {
+        #[serde(with = "dec_format")]
+        amount: Balance,
+    }
+    execution_instructions
+        .iter()
+        .flat_map(|instruction| match instruction {
+            ExecutionInstruction::NearTransaction {
+                actions,
+                is_fee_transaction: true,
+                ..
+            } => actions.as_slice(),
+            ExecutionInstruction::NearTransaction { .. } => &[],
+        })
+        .map(|action| match action {
+            Action::FunctionCall(call) if call.method_name == "ft_transfer" => {
+                serde_json::from_slice::<FtTransferArgs>(&call.args)
+                    .expect("Fee transfers are built with an amount")
+                    .amount
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 /// NEAR the execution instructions attach to storage deposits

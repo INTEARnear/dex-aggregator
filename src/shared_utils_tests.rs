@@ -2022,6 +2022,26 @@ fn storage_deposits_add_up_every_deposit() {
 }
 
 #[test]
+fn fee_transactions_amount_adds_up_fee_transfers_only() {
+    let execution_instructions = vec![
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("ft"),
+            actions: vec![create_fee_ft_transfer_action(&account("trader.near"), 1000)],
+            is_fee_transaction: false,
+        },
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("ft"),
+            actions: vec![
+                create_fee_ft_transfer_action(&account("ref.near"), 8),
+                create_fee_ft_transfer_action(&account("plach.intear.near"), 2),
+            ],
+            is_fee_transaction: true,
+        },
+    ];
+    assert_eq!(fee_transactions_amount(&execution_instructions), 10);
+}
+
+#[test]
 fn estimated_gas_usage_excludes_swap_margin() {
     let call = |gas: NearGas| {
         Action::FunctionCall(Box::new(FunctionCallAction {
