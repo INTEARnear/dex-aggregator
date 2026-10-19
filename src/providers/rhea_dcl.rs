@@ -13,7 +13,7 @@ use crate::{
         convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
         deposit_storage_on_contract_if_needed, get_slippage, needs_storage_deposit_for_contract,
         payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
-        swap_call_gas, total_fee_amount, Mainnet, NetworkView, ReferrerFee,
+        swap_call_gas, total_fee_amount, Mainnet, NetworkView, ReferrerFee, DEFAULT_REFERRER_ID,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -120,6 +120,7 @@ async fn route(
                     "output_token": token_out,
                     "min_output_amount": route.min_amount_out.0.to_string(),
                     "skip_unwrap_near": !unwrapping_near,
+                    "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                 }
             });
             (
@@ -145,6 +146,7 @@ async fn route(
                     "output_token": token_out,
                     "output_amount": route.amount_out.0.to_string(),
                     "skip_unwrap_near": !unwrapping_near,
+                    "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                 }
             });
             // Each referrer's share of the estimated input with all fees, not the worst case, so
@@ -389,6 +391,7 @@ mod tests {
                                         "output_token": "ft",
                                         "min_output_amount": "79",
                                         "skip_unwrap_near": true,
+                                        "referral_id": DEFAULT_REFERRER_ID,
                                     }
                                 }))
                                 .unwrap(),
@@ -454,6 +457,7 @@ mod tests {
                                         "output_token": WRAP_NEAR,
                                         "min_output_amount": "79",
                                         "skip_unwrap_near": false,
+                                        "referral_id": DEFAULT_REFERRER_ID,
                                     }
                                 }))
                                 .unwrap(),
@@ -540,6 +544,7 @@ mod tests {
                                         "output_token": "ft",
                                         "output_amount": "80",
                                         "skip_unwrap_near": true,
+                                        "referral_id": DEFAULT_REFERRER_ID,
                                     }
                                 }))
                                 .unwrap(),
@@ -652,6 +657,7 @@ mod tests {
                                         "output_token": "ft",
                                         "output_amount": "80",
                                         "skip_unwrap_near": true,
+                                        "referral_id": DEFAULT_REFERRER_ID,
                                     }
                                 }))
                                 .unwrap(),
@@ -729,6 +735,7 @@ mod tests {
                                     "output_token": "ft",
                                     "output_amount": "80",
                                     "skip_unwrap_near": true,
+                                    "referral_id": DEFAULT_REFERRER_ID,
                                 }
                             }))
                             .unwrap(),

@@ -81,17 +81,16 @@ async fn route(
         && matches!(request.token_out, TokenId::Nep141OnRhea(_));
 
     let token_in_ref = &token_in;
-    let payable_referral_fees =
-        payable_referral_fees(&request.fees, |referrer_id| async move {
-            if fast_path {
-                network
-                    .is_rhea_token_registered(&referrer_id, token_in_ref)
-                    .await
-            } else {
-                !needs_storage_deposit_for_contract(network, &referrer_id, token_in_ref).await
-            }
-        })
-        .await;
+    let payable_referral_fees = payable_referral_fees(&request.fees, |referrer_id| async move {
+        if fast_path {
+            network
+                .is_rhea_token_registered(&referrer_id, token_in_ref)
+                .await
+        } else {
+            !needs_storage_deposit_for_contract(network, &referrer_id, token_in_ref).await
+        }
+    })
+    .await;
     let referrer_fees = referrer_fees_of_total(&payable_referral_fees, exact_amount_in);
     // The fees come out of the input, so the rest is what's quoted and swapped
     let swap_amount_in = exact_amount_in - total_fee_amount(&referrer_fees);
