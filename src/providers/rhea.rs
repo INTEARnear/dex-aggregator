@@ -21,7 +21,7 @@ use crate::{
 
 pub struct RheaProvider;
 
-const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
+pub const RHEA_CONTRACT_ID: &str = "v2.ref-finance.near";
 const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(57);
 const SWAP_RESERVED_GAS: NearGas = NearGas::from_tgas(10);
 trait RheaQuotes: Send + Sync {

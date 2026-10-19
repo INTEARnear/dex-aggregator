@@ -281,6 +281,21 @@ pub struct Quote {
     /// NEAR), to pass to `/route/outcome`
     #[serde(with = "dec_format")]
     pub fee_amount: Balance,
+    /// What to sign the transactions with, so they can be sent without asking an RPC first: with
+    /// `trader_account_id` and `signing_public_key` in the request, once the key is found
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing: Option<SigningContext>,
+}
+
+/// The nonce and block hash to sign a route's transactions with
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct SigningContext {
+    /// The nonce `signing_public_key` is at, as of the latest block: the first transaction takes
+    /// the one after. Read when the routes were found, so a transaction the key sent since makes
+    /// it stale; sign from the higher of it and the last nonce you used.
+    pub nonce: u64,
+    /// A recent final block, which transactions signed for stay valid for 86400 blocks after
+    pub block_hash: CryptoHash,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -312,6 +327,22 @@ pub struct OutcomeRequest {
     /// `fee_amount` of the quote, which `next_steps` leave in the wallet for the fee transactions
     #[serde(with = "dec_format", default)]
     pub fee_amount: Balance,
+    /// When to answer, `executed` by default
+    #[serde(default)]
+    pub wait_until: OutcomeWaitUntil,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeWaitUntil {
+    /// Once every transaction and receipt executed, at least optimistically, with the balances
+    /// compared
+    #[default]
+    Executed,
+    /// As soon as the swaps executed optimistically, from what the DEXes logged of them: before
+    /// the output reaches the trader, callbacks and gas refunds. A swap that failed, or a route
+    /// without a swap, is still answered once everything executed.
+    Swap,
 }
 
 /// What the transactions of a route did, once they executed
@@ -335,6 +366,11 @@ pub struct SwapOutcome {
     pub next_steps: Vec<ExecutionInstruction>,
     /// Why the swap failed, to show to the trader. Present when `charge_fee` is false.
     pub error: Option<String>,
+    /// Whether every transaction and receipt executed and the balances were compared. False for
+    /// an answer at the swap (`wait_until=swap`), whose amounts are what the DEXes logged and
+    /// whose `balance_changes` and `next_steps` are empty: ask again with
+    /// `wait_until=executed` for them.
+    pub settled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

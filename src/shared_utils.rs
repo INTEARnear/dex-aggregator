@@ -14,8 +14,8 @@ use intear_dex_types::DirectWithdrawAmount;
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
-        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, Finality,
-        FunctionCallAction, Gas, NearGas, NearToken,
+        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, CryptoHash,
+        Finality, FunctionCallAction, Gas, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -1048,32 +1048,41 @@ lazy_static! {
         .user_agent("Intear Swap Router")
         .build()
         .unwrap();
-    pub static ref RPC_CLIENT: RpcClient = RpcClient::new(
-        std::env::var("RPC_URLS")
-            .unwrap_or_else(|_| {
-                "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
-                    .to_string()
-            })
-            .split(',')
-            .map(|url| url.to_string())
-            .collect::<Vec<_>>(),
-    );
+    /// The RPCs to use, in order: a request goes to the next one when one fails
+    pub static ref RPC_URLS: Vec<String> = std::env::var("RPC_URLS")
+        .unwrap_or_else(|_| {
+            "https://rpc.intea.rs,https://rpc.shitzuapes.xyz,https://free.rpc.fastnear.com"
+                .to_string()
+        })
+        .split(',')
+        .map(|url| url.to_string())
+        .collect();
+    pub static ref RPC_CLIENT: RpcClient = RpcClient::new(RPC_URLS.iter());
 
     static ref TOKEN_INFOS: RwLock<Result<Arc<HashMap<TokenId, TokenInfo>>, String>> =
         RwLock::new(Err("Token infos are not loaded yet".to_string()));
     static ref BLOCK_HEIGHT: RwLock<Result<BlockHeight, String>> =
         RwLock::new(Err("Block height is not loaded yet".to_string()));
+    static ref FINAL_BLOCK_HASH: RwLock<Result<CryptoHash, String>> =
+        RwLock::new(Err("Final block hash is not loaded yet".to_string()));
 }
 
 const TOKEN_INFOS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const BLOCK_HEIGHT_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+const FINAL_BLOCK_HASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Loads token infos and the current block height, then keeps refreshing them in
-/// the background, so requests never wait for them.
+/// A recent final block's hash, for quotes to sign their transactions with
+pub fn final_block_hash() -> Result<CryptoHash, String> {
+    FINAL_BLOCK_HASH.read().unwrap().clone()
+}
+
+/// Loads token infos, the current block height and a final block's hash, then keeps refreshing
+/// them in the background, so requests never wait for them.
 pub async fn start_background_refresh() {
     tokio::join!(
         refresh(&TOKEN_INFOS, fetch_token_infos),
         refresh(&BLOCK_HEIGHT, fetch_current_block_height),
+        refresh(&FINAL_BLOCK_HASH, fetch_final_block_hash),
     );
     tokio::spawn(refresh_loop(
         &TOKEN_INFOS,
@@ -1084,6 +1093,11 @@ pub async fn start_background_refresh() {
         &BLOCK_HEIGHT,
         fetch_current_block_height,
         BLOCK_HEIGHT_REFRESH_INTERVAL,
+    ));
+    tokio::spawn(refresh_loop(
+        &FINAL_BLOCK_HASH,
+        fetch_final_block_hash,
+        FINAL_BLOCK_HASH_REFRESH_INTERVAL,
     ));
 }
 
@@ -1285,6 +1299,14 @@ async fn fetch_current_block_height() -> Result<BlockHeight, String> {
         .await
         .map(|block| block.header.height)
         .map_err(|err| format!("Failed to get current block: {err:?}"))
+}
+
+async fn fetch_final_block_hash() -> Result<CryptoHash, String> {
+    RPC_CLIENT
+        .block(BlockReference::Finality(Finality::Final))
+        .await
+        .map(|block| block.header.hash)
+        .map_err(|err| format!("Failed to get the final block: {err:?}"))
 }
 
 /// Merge all neighboring NearTransactions with the same receiver_id

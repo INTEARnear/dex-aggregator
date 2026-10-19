@@ -10,13 +10,14 @@ use axum::{
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
+use near_min_api::{types::Finality, QueryFinality, RpcClient};
 use std::{
     env,
     future::Future,
     net::{IpAddr, SocketAddr},
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 use tokio::task::{AbortHandle, JoinHandle};
@@ -27,15 +28,18 @@ use tracing_subscriber::FmtSubscriber;
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
-        convert_to, estimated_gas_usage, fee_transactions_amount, max_gas_cost,
-        optimize_execution_instructions, price_raw, storage_deposits, Mainnet,
+        convert_to, estimated_gas_usage, fee_transactions_amount, final_block_hash, max_gas_cost,
+        optimize_execution_instructions, price_raw, storage_deposits, Mainnet, RPC_CLIENT,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
-        Amount, DexId, ExecutionInstruction, OutcomeRequest, Quote, Route, Slippage, SwapOutcome,
-        SwapRequest, TokenId,
+        Amount, DexId, ExecutionInstruction, OutcomeRequest, Quote, Route, SigningContext,
+        Slippage, SwapOutcome, SwapRequest, TokenId,
     },
 };
+
+static ACCESS_KEY_RPC_CLIENT: LazyLock<RpcClient> =
+    LazyLock::new(|| RPC_CLIENT.clone().with_max_retries(3));
 
 mod outcome;
 mod providers;
@@ -219,8 +223,12 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
     }
 
     let _abort_routes_on_drop = AbortOnDrop(routes.iter().map(JoinHandle::abort_handle).collect());
-    let (mut route_stats, routes): (Vec<_>, Vec<_>) = futures_util::future::join_all(routes)
-        .await
+    // The nonce is read while the routes are found, so it doesn't add to the wait
+    let (routes, signing) = tokio::join!(
+        futures_util::future::join_all(routes),
+        signing_context(request)
+    );
+    let (mut route_stats, routes): (Vec<_>, Vec<_>) = routes
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
         .unzip();
@@ -300,6 +308,7 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
             storage_deposits: storage_deposits(&route.execution_instructions),
             max_storage_deposits: storage_deposits(&route.execution_instructions),
             fee_amount: fee_transactions_amount(&route.execution_instructions),
+            signing: signing.clone(),
             route,
         })
         .collect::<Vec<_>>();
@@ -319,6 +328,40 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
     tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
 
     (quotes, route_stats)
+}
+
+/// The nonce of the trader's signing key and a recent final block's hash, to sign the routes'
+/// transactions with. None without both in the request.
+async fn signing_context(request: &SwapRequest) -> Option<SigningContext> {
+    let (Some(account_id), Some(public_key)) =
+        (&request.trader_account_id, &request.signing_public_key)
+    else {
+        return None;
+    };
+    let access_key = ACCESS_KEY_RPC_CLIENT
+        .get_access_key(
+            account_id.clone(),
+            public_key.clone(),
+            QueryFinality::Finality(Finality::None),
+        )
+        .await;
+    let access_key = match access_key {
+        Ok(access_key) => access_key,
+        Err(err) => {
+            info!("No nonce of {public_key} for {account_id}: {err:?}");
+            return None;
+        }
+    };
+    match final_block_hash() {
+        Ok(block_hash) => Some(SigningContext {
+            nonce: access_key.nonce,
+            block_hash,
+        }),
+        Err(err) => {
+            error!("No block hash to sign with: {err}");
+            None
+        }
+    }
 }
 
 /// What a quote gets net of its costs, higher is better: the output minus the costs for exact-in,

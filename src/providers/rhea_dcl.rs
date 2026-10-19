@@ -21,7 +21,7 @@ use crate::{
 
 pub struct RheaDclProvider;
 
-const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
+pub const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 const RESERVED_GAS: NearGas = NearGas::from_tgas(62);
 
 trait RheaDclQuotes: Send + Sync {

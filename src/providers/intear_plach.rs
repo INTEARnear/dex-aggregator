@@ -30,7 +30,7 @@ use crate::{
 
 pub struct IntearPlachProvider;
 
-const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
+pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
 const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);

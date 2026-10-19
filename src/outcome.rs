@@ -13,22 +13,29 @@ use near_min_api::{
         BlockReference, CryptoHash, ExecutionStatusView, FinalExecutionOutcomeWithReceiptView,
         FunctionCallError, ReceiptEnumView, TxExecutionError, TxExecutionStatus,
     },
-    QueryFinality, RpcClient,
+    ExperimentalTxDetails, QueryFinality, RpcClient,
 };
 use near_sdk::{json_types::U128, NearToken};
+use serde::Deserialize;
 use tokio::time::Instant;
 
 use crate::{
-    providers::intear_plach::AssetId,
+    providers::{
+        intear_plach::{AssetId, INTEAR_DEX_CONTRACT_ID},
+        rhea::RHEA_CONTRACT_ID,
+        rhea_dcl::RHEA_DCL_CONTRACT_ID,
+    },
     shared_utils::{
         base_token, convert_to, is_near, optimize_execution_instructions, BaseTokenId, Mainnet,
-        NetworkView, RPC_CLIENT, WRAP_NEAR,
+        NetworkView, REQWEST_CLIENT, RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
-    types::{BalanceChange, OutcomeRequest, SwapOutcome, TokenId},
+    types::{BalanceChange, OutcomeRequest, OutcomeWaitUntil, SwapOutcome, TokenId},
 };
 
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
 const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Blocks are about 600ms apart, so a swap is seen at most this long after its block
+const SWAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BALANCES_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TRANSACTIONS: usize = 20;
 const STORAGE_METHODS: &[&str] = &["storage_deposit", "storage_withdraw", "storage_unregister"];
@@ -98,6 +105,14 @@ pub trait ChainView: Send + Sync {
         tx_hash: CryptoHash,
     ) -> impl Future<Output = Result<Option<FinalExecutionOutcomeWithReceiptView>, String>> + Send;
 
+    /// The transaction and the receipts of it that executed so far, at least optimistically, and
+    /// whether that's all of them. `None` until it's included.
+    fn transaction_progress(
+        &self,
+        tx_hash: CryptoHash,
+        signer_id: &AccountId,
+    ) -> impl Future<Output = Result<Option<(FinalExecutionOutcomeWithReceiptView, bool)>, String>> + Send;
+
     fn block(
         &self,
         block_hash: CryptoHash,
@@ -131,6 +146,63 @@ impl ChainView for Mainnet {
             | TxExecutionStatus::Included
             | TxExecutionStatus::IncludedFinal => None,
         })
+    }
+
+    async fn transaction_progress(
+        &self,
+        tx_hash: CryptoHash,
+        signer_id: &AccountId,
+    ) -> Result<Option<(FinalExecutionOutcomeWithReceiptView, bool)>, String> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "dontcare",
+            "method": "EXPERIMENTAL_tx_status",
+            "params": {
+                "tx_hash": tx_hash,
+                "sender_account_id": signer_id,
+                "wait_until": TxExecutionStatus::Included,
+            },
+        });
+        let mut errors = Vec::new();
+        for url in RPC_URLS.iter() {
+            let response = match REQWEST_CLIENT.post(url).json(&request).send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    errors.push(format!("{url}: {err}"));
+                    continue;
+                }
+            };
+            let body = match response.json::<serde_json::Value>().await {
+                Ok(body) => body,
+                Err(err) => {
+                    errors.push(format!("{url}: {err}"));
+                    continue;
+                }
+            };
+            if let Some(error) = body.get("error") {
+                // Not seen yet, or not included before the RPC stopped waiting
+                if matches!(
+                    error["cause"]["name"].as_str(),
+                    Some("UNKNOWN_TRANSACTION" | "TIMEOUT_ERROR")
+                ) {
+                    return Ok(None);
+                }
+                errors.push(format!("{url}: {error}"));
+                continue;
+            }
+            let details: ExperimentalTxDetails = serde_json::from_value(body["result"].clone())
+                .map_err(|err| format!("Failed to read transaction {tx_hash}: {err}"))?;
+            let executed = matches!(
+                details.final_execution_status,
+                TxExecutionStatus::ExecutedOptimistic
+                    | TxExecutionStatus::Executed
+                    | TxExecutionStatus::Final
+            );
+            return Ok(details
+                .final_execution_outcome
+                .map(|outcome| (outcome, executed)));
+        }
+        Err(errors.join(", "))
     }
 
     async fn block(&self, block_hash: CryptoHash) -> Result<BlockInfo, String> {
@@ -502,7 +574,227 @@ async fn wait_for_execution(
     }
 }
 
-/// Waits for the transactions of a route to execute and finds out what they did
+/// A swap that a DEX logged, with its tokens as they're held in the wallet or on that DEX
+#[derive(Debug, Clone, PartialEq)]
+struct LoggedSwap {
+    token_in: TokenId,
+    token_out: TokenId,
+    amount_in: Balance,
+    amount_out: Balance,
+}
+
+/// The `data` of an Intear DEX `swap` event
+#[derive(Deserialize)]
+struct IntearDexSwap {
+    request: IntearDexSwapRequest,
+    amount_in: U128,
+    amount_out: U128,
+    trader: AccountId,
+}
+
+#[derive(Deserialize)]
+struct IntearDexSwapRequest {
+    asset_in: String,
+    asset_out: String,
+}
+
+/// An item of the `data` of a Rhea DCL `swap` event
+#[derive(Deserialize)]
+struct RheaDclSwap {
+    swapper: AccountId,
+    token_in: AccountId,
+    token_out: AccountId,
+    amount_in: U128,
+    amount_out: U128,
+}
+
+/// The swaps of `trader` that a log of a receipt executed by `executor_id` tells of: Intear DEX's
+/// and Rhea DCL's `swap` events, and Rhea's `Swapped <in> <token> for <out> <token>`
+fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<LoggedSwap> {
+    let event = |standard: &str| {
+        let event: serde_json::Value =
+            serde_json::from_str(log.strip_prefix("EVENT_JSON:")?).ok()?;
+        (event["standard"] == standard && event["event"] == "swap").then(|| event["data"].clone())
+    };
+    match executor_id.as_str() {
+        INTEAR_DEX_CONTRACT_ID => event("inteardex")
+            .and_then(|data| serde_json::from_value::<IntearDexSwap>(data).ok())
+            .filter(|swap| &swap.trader == trader)
+            .and_then(|swap| {
+                Some(LoggedSwap {
+                    token_in: TokenId::TokenOnIntearDex(swap.request.asset_in.parse().ok()?),
+                    token_out: TokenId::TokenOnIntearDex(swap.request.asset_out.parse().ok()?),
+                    amount_in: swap.amount_in.0,
+                    amount_out: swap.amount_out.0,
+                })
+            })
+            .into_iter()
+            .collect(),
+        RHEA_DCL_CONTRACT_ID => event("dcl.ref")
+            .and_then(|data| serde_json::from_value::<Vec<RheaDclSwap>>(data).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|swap| &swap.swapper == trader)
+            .map(|swap| LoggedSwap {
+                token_in: TokenId::Nep141(swap.token_in),
+                token_out: TokenId::Nep141(swap.token_out),
+                amount_in: swap.amount_in.0,
+                amount_out: swap.amount_out.0,
+            })
+            .collect(),
+        // Rhea doesn't log the trader, but these are the trader's own transactions
+        RHEA_CONTRACT_ID => (|| {
+            let words = log.strip_prefix("Swapped ")?.split(' ').collect::<Vec<_>>();
+            let [amount_in, token_in, "for", amount_out, token_out] = words.as_slice() else {
+                return None;
+            };
+            Some(LoggedSwap {
+                token_in: TokenId::Nep141(token_in.parse().ok()?),
+                token_out: TokenId::Nep141(token_out.parse().ok()?),
+                amount_in: amount_in.parse().ok()?,
+                amount_out: amount_out.parse().ok()?,
+            })
+        })()
+        .into_iter()
+        .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What the swaps of a route did, from what the DEXes logged of them, once each transaction has
+/// either executed or swapped, nothing failed, and some of the output came out. None until then.
+/// Each route swaps in one call to its DEX, which logs every hop of it at once, so a transaction
+/// that logged a swap has no other swap still to execute.
+fn swapped(
+    request: &OutcomeRequest,
+    transactions: &[(FinalExecutionOutcomeWithReceiptView, bool)],
+) -> Result<Option<SwapOutcome>, (StatusCode, String)> {
+    let trader_account_id = &request.trader_account_id;
+    let input_locations = locations(&request.token_in);
+    let output_locations = locations(&request.token_out);
+    let mut amount_in: Balance = 0;
+    let mut amount_out: Balance = 0;
+    for (view, executed) in transactions {
+        let outcome = &view.final_outcome;
+        if &outcome.transaction.signer_id != trader_account_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Transaction {} is signed by {}, not {trader_account_id}",
+                    outcome.transaction.hash, outcome.transaction.signer_id
+                ),
+            ));
+        }
+        let mut swaps = Vec::new();
+        for execution in
+            std::iter::once(&outcome.transaction_outcome).chain(&outcome.receipts_outcome)
+        {
+            // Why it failed is told once everything executed
+            if let ExecutionStatusView::Failure(_) = execution.outcome.status {
+                return Ok(None);
+            }
+            for log in &execution.outcome.logs {
+                swaps.extend(logged_swaps(
+                    &execution.outcome.executor_id,
+                    log,
+                    trader_account_id,
+                ));
+            }
+        }
+        if !executed && swaps.is_empty() {
+            return Ok(None);
+        }
+        for swap in swaps {
+            if input_locations.contains(&swap.token_in) {
+                amount_in = amount_in.saturating_add(swap.amount_in);
+            }
+            if output_locations.contains(&swap.token_out) {
+                amount_out = amount_out.saturating_add(swap.amount_out);
+            }
+        }
+    }
+    Ok((amount_out > 0).then_some(SwapOutcome {
+        charge_fee: true,
+        amount_in,
+        amount_out,
+        balance_changes: Vec::new(),
+        next_steps: Vec::new(),
+        error: None,
+        settled: false,
+    }))
+}
+
+/// How far waiting for a route's swaps got
+enum SwapProgress {
+    /// Before everything executed
+    Swapped(SwapOutcome),
+    /// Everything executed first, or nothing swapped
+    Executed(Vec<ExecutedTransaction>),
+}
+
+/// Waits until the swaps of the transactions executed, or until everything did
+async fn wait_for_swap(
+    chain: &impl ChainView,
+    request: &OutcomeRequest,
+    tx_hashes: &[CryptoHash],
+    deadline: Instant,
+) -> Result<SwapProgress, (StatusCode, String)> {
+    let mut pending_reason = "not included yet".to_string();
+    loop {
+        let progress =
+            tokio::time::timeout_at(
+                deadline,
+                try_join_all(tx_hashes.iter().map(|tx_hash| {
+                    chain.transaction_progress(*tx_hash, &request.trader_account_id)
+                })),
+            )
+            .await;
+        match progress {
+            Ok(Ok(progress)) => {
+                let included = progress.iter().zip(tx_hashes).try_fold(
+                    Vec::new(),
+                    |mut included, (progress, tx_hash)| match progress {
+                        Some(progress) => {
+                            included.push(progress.clone());
+                            Ok(included)
+                        }
+                        None => Err(format!("transaction {tx_hash} isn't included yet")),
+                    },
+                );
+                match included {
+                    Ok(included) if included.iter().all(|(_, executed)| *executed) => {
+                        return included
+                            .iter()
+                            .map(|(view, _)| ExecutedTransaction::from_view(view))
+                            .collect::<Result<_, _>>()
+                            .map(SwapProgress::Executed)
+                            .map_err(|err| (StatusCode::BAD_GATEWAY, err));
+                    }
+                    Ok(included) => match swapped(request, &included)? {
+                        Some(outcome) => return Ok(SwapProgress::Swapped(outcome)),
+                        None => pending_reason = "still executing".to_string(),
+                    },
+                    Err(reason) => pending_reason = reason,
+                }
+            }
+            Ok(Err(err)) => pending_reason = err,
+            Err(_elapsed) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "The transactions didn't execute in {}s: {pending_reason}",
+                    EXECUTION_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(SWAP_POLL_INTERVAL).await;
+    }
+}
+
+/// Waits for the transactions of a route to execute, or only their swaps with
+/// `wait_until=swap`, and finds out what they did
 pub async fn swap_outcome(
     network: &impl NetworkView,
     chain: &impl ChainView,
@@ -535,12 +827,22 @@ pub async fn swap_outcome(
     })?;
 
     let deadline = Instant::now() + EXECUTION_TIMEOUT;
-    let transactions = try_join_all(
-        tx_hashes
-            .iter()
-            .map(|tx_hash| wait_for_execution(chain, *tx_hash, deadline)),
-    )
-    .await?;
+    let transactions = match request.wait_until {
+        OutcomeWaitUntil::Executed => {
+            try_join_all(
+                tx_hashes
+                    .iter()
+                    .map(|tx_hash| wait_for_execution(chain, *tx_hash, deadline)),
+            )
+            .await?
+        }
+        OutcomeWaitUntil::Swap => {
+            match wait_for_swap(chain, &request, tx_hashes, deadline).await? {
+                SwapProgress::Swapped(outcome) => return Ok(outcome),
+                SwapProgress::Executed(transactions) => transactions,
+            }
+        }
+    };
 
     tokio::time::timeout(
         BALANCES_TIMEOUT,
@@ -715,5 +1017,6 @@ async fn outcome_of(
             .collect(),
         next_steps: optimize_execution_instructions(next_steps),
         error,
+        settled: true,
     })
 }
