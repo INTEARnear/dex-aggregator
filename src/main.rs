@@ -306,7 +306,6 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
             estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
             estimated_gas_usage: estimated_gas_usage(&route.execution_instructions),
             storage_deposits: storage_deposits(&route.execution_instructions),
-            max_storage_deposits: storage_deposits(&route.execution_instructions),
             fee_amount: fee_transactions_amount(&route.execution_instructions),
             signing: signing.clone(),
             route,
@@ -373,7 +372,7 @@ fn net_amount(quote: &Quote, prices_raw: Option<&(BigDecimal, BigDecimal)>) -> B
         |(near_price_raw, quoted_token_price_raw)| {
             BigDecimal::from(
                 quote
-                    .estimated_max_gas_cost
+                    .estimated_gas_usage
                     .saturating_add(quote.storage_deposits)
                     .as_yoctonear(),
             ) * near_price_raw

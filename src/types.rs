@@ -274,9 +274,6 @@ pub struct Quote {
     /// NEAR the execution instructions attach to storage deposits, usually only needed for the
     /// first swap of a token.
     pub storage_deposits: NearToken,
-    /// Same as `storage_deposits`, since no route withdraws storage deposits anymore. Kept so
-    /// integrations that read it don't break.
-    pub max_storage_deposits: NearToken,
     /// What the fee transactions pay out of the wallet balance of the input token (wNEAR for
     /// NEAR), to pass to `/route/outcome`
     #[serde(with = "dec_format")]
