@@ -1,6 +1,8 @@
 use std::{future::Future, pin::Pin};
 
-use intear_dex_types::{Operation, SwapOperationAmount, SwapRequestAmount, WithdrawAmount};
+use intear_dex_types::{
+    Operation, ReferralFees, SwapOperationAmount, SwapRequestAmount, WithdrawAmount,
+};
 use lazy_static::lazy_static;
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
@@ -21,10 +23,10 @@ use xyk_dex_types::{
 use crate::{
     shared_utils::{
         convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage,
-        intear_registration, is_near, price_raw, register_input_in_wallet, swap_call_gas, Mainnet,
-        NetworkView, DEFAULT_REFERRER_ID,
+        intear_registration, is_near, payable_referral_fees, price_raw, register_input_in_wallet,
+        swap_call_gas, Mainnet, NetworkView, DEFAULT_REFERRER_ID,
     },
-    types::{ExecutionInstruction, QuoteFees, TokenId},
+    types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
 };
 
@@ -195,16 +197,10 @@ async fn route(
         return None;
     }
 
-    // Referrers without a fee are never paid, but the DEX would still check them in every hop
-    let referral_fees = QuoteFees(
-        request
-            .fees
-            .0
-            .iter()
-            .filter(|(_, fee_fraction)| *fee_fraction > 0)
-            .cloned()
-            .collect(),
-    );
+    // The engine takes them out of the input before the DEX gets it, and only pays referrers that
+    // registered the input, which the route does for them
+    let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
+    let fees_total = |fees: Vec<(AccountId, U128)>| fees.iter().map(|(_, fee)| fee.0).sum::<u128>();
 
     let fee_discount = match (fee_discounter, &request.trader_account_id) {
         (Some(fee_discounter), Some(trader_account_id)) => {
@@ -223,7 +219,9 @@ async fn route(
             token_in: token_in.clone(),
             token_out: token_out.clone(),
             amount: match request.amount {
-                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
+                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(
+                    amount_in - fees_total(referral_fees.amounts_out_of(U128(amount_in))),
+                ),
                 Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
             },
             max_hops: MaxHops::Four,
@@ -236,7 +234,6 @@ async fn route(
                     Amount::AmountOut(_) => &request.token_in,
                 },
             )?,
-            referral_fees: (&referral_fees).into(),
             fee_discount: fee_discount.map_or(0, |(_, fee_discount)| fee_discount),
         })
         .await?;
@@ -249,53 +246,64 @@ async fn route(
         SplitRouteApiResponse::ExactIn { discount, .. } => Amount::AmountOut(discount.0),
         SplitRouteApiResponse::ExactOut { discount, .. } => Amount::AmountIn(discount.0),
     });
-    let (swap_routes, swap_amount, constraint, estimated_amount, worst_case_amount) = match response
-    {
-        SplitRouteApiResponse::ExactIn {
-            routes,
-            amount_in,
-            amount_out,
-            ..
-        } => {
-            let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
-            let swap_routes = routes
-                .into_iter()
-                .map(|route| SwapRoute {
-                    fraction: route.split_fraction,
-                    pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
-                })
-                .collect::<Vec<_>>();
-            (
-                swap_routes,
-                SwapRequestAmount::ExactIn(U128(amount_in.0)),
-                total_min_amount_out,
-                Amount::AmountOut(amount_out.0),
-                Amount::AmountOut(total_min_amount_out),
-            )
-        }
-        SplitRouteApiResponse::ExactOut {
-            routes,
-            amount_in,
-            max_amount_in,
-            amount_out,
-            ..
-        } => {
-            let swap_routes = routes
-                .into_iter()
-                .map(|route| SwapRoute {
-                    fraction: route.split_fraction,
-                    pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
-                })
-                .collect::<Vec<_>>();
-            (
-                swap_routes,
-                SwapRequestAmount::ExactOut(U128(amount_out.0)),
-                max_amount_in.0,
-                Amount::AmountIn(amount_in.0),
-                Amount::AmountIn(max_amount_in.0),
-            )
-        }
-    };
+    // `dex_amount` is what the DEX swaps, `swap_amount` what the engine takes with the fees
+    let (swap_routes, dex_amount, swap_amount, constraint, estimated_amount, worst_case_amount) =
+        match response {
+            SplitRouteApiResponse::ExactIn {
+                routes,
+                amount_in,
+                amount_out,
+                ..
+            } => {
+                let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
+                let swap_routes = routes
+                    .into_iter()
+                    .map(|route| SwapRoute {
+                        fraction: route.split_fraction,
+                        pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
+                    })
+                    .collect::<Vec<_>>();
+                let Amount::AmountIn(amount_in_with_fees) = request.amount else {
+                    unreachable!("Exact in is quoted for an amount in");
+                };
+                (
+                    swap_routes,
+                    SwapRequestAmount::ExactIn(U128(amount_in.0)),
+                    SwapRequestAmount::ExactIn(U128(amount_in_with_fees)),
+                    total_min_amount_out,
+                    Amount::AmountOut(amount_out.0),
+                    Amount::AmountOut(total_min_amount_out),
+                )
+            }
+            SplitRouteApiResponse::ExactOut {
+                routes,
+                amount_in,
+                max_amount_in,
+                amount_out,
+                ..
+            } => {
+                let swap_routes = routes
+                    .into_iter()
+                    .map(|route| SwapRoute {
+                        fraction: route.split_fraction,
+                        pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
+                    })
+                    .collect::<Vec<_>>();
+                // Fees on top of the input the DEX takes, so the most it can take with them is the
+                // constraint
+                let with_fees = |amount_in: u128| {
+                    amount_in + fees_total(referral_fees.amounts_on_top_of(U128(amount_in)))
+                };
+                (
+                    swap_routes,
+                    SwapRequestAmount::ExactOut(U128(amount_out.0)),
+                    SwapRequestAmount::ExactOut(U128(amount_out.0)),
+                    with_fees(max_amount_in.0),
+                    Amount::AmountIn(with_fees(amount_in.0)),
+                    Amount::AmountIn(with_fees(max_amount_in.0)),
+                )
+            }
+        };
     if swap_routes.is_empty() {
         return None;
     }
@@ -310,7 +318,7 @@ async fn route(
                 asset_in: token_in.clone(),
                 asset_out: token_out.clone(),
                 trader_id: request.trader_account_id.clone(),
-                amount: swap_amount,
+                amount: dex_amount,
                 fee_discount,
                 expiration_block_height: current_block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
             }))
@@ -323,7 +331,6 @@ async fn route(
             borsh::to_vec(&SwapArgs {
                 routes: swap_routes,
                 fee_discount,
-                referral_fees: (&referral_fees).into(),
             })
             .unwrap(),
         ),
@@ -389,9 +396,20 @@ async fn route(
         } else {
             &[&token_out]
         };
+    let fee_receivers = referral_fees
+        .0
+        .iter()
+        .map(|(receiver_id, _)| (receiver_id, &token_in))
+        .collect::<Vec<_>>();
     let registration_transactions = match request.trader_account_id.as_ref() {
         Some(trader_account_id) => {
-            intear_registration(network, trader_account_id, registered_assets).await?
+            intear_registration(
+                network,
+                trader_account_id,
+                registered_assets,
+                &fee_receivers,
+            )
+            .await?
         }
         None => vec![],
     };
@@ -409,6 +427,7 @@ async fn route(
                         args: serde_json::to_vec(&serde_json::json!({
                             "operations": operations,
                             "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                            "referral_fees": referral_fees,
                         }))
                         .unwrap(),
                         gas: swap_call_gas(swap_gas, reserved_gas, false),
@@ -452,6 +471,7 @@ async fn route(
                                 "operations": {
                                     "operations": operations,
                                     "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                                    "referral_fees": referral_fees,
                                 },
                             }))
                             .unwrap(),
@@ -495,6 +515,7 @@ async fn route(
                                     "msg": serde_json::to_string(&serde_json::json!({
                                         "operations": operations,
                                         "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                                        "referral_fees": referral_fees,
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
@@ -583,7 +604,7 @@ mod tests {
     use super::*;
     use crate::shared_utils::{
         create_rhea_withdraw_action, create_storage_deposit_action_for_contract,
-        create_unwrap_action, TestNetworkView, WRAP_NEAR,
+        create_unwrap_action, TestNetworkView, AGGREGATOR_FEE_RECEIVER_ID, WRAP_NEAR,
     };
     use crate::types::Slippage;
 
@@ -640,23 +661,23 @@ mod tests {
                 _ => 5,
             });
             match request.amount {
-                QuoteAmount::ExactIn(_) => Some(SplitRouteApiResponse::ExactIn {
+                QuoteAmount::ExactIn(amount_in) => Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![plach::ExactInRoute {
                         split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
                         pools: vec![plach::ExactInPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
                             token_out: token_out.clone(),
-                            amount_in: near_min_api::types::U128(100),
+                            amount_in: near_min_api::types::U128(amount_in),
                             min_amount_out: near_min_api::types::U128(79),
                         }],
-                        amount_in: near_min_api::types::U128(100),
+                        amount_in: near_min_api::types::U128(amount_in),
                         min_amount_out: near_min_api::types::U128(79),
                         amount_out: near_min_api::types::U128(80),
                     }],
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
-                    amount_in: near_min_api::types::U128(100),
+                    amount_in: near_min_api::types::U128(amount_in),
                     amount_out: near_min_api::types::U128(80),
                     discount,
                     swap_gas: NearGas::from_tgas(34),
@@ -744,6 +765,7 @@ mod tests {
                         },
                     ],
                     "referrer": DEFAULT_REFERRER_ID,
+                    "referral_fees": [],
                 },
             })
         );
@@ -952,6 +974,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 },
                             }))
                             .unwrap(),
@@ -1056,6 +1079,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 },
                             }))
                             .unwrap(),
@@ -1164,6 +1188,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 },
                             }))
                             .unwrap(),
@@ -1244,6 +1269,7 @@ mod tests {
                                     constraint: Some(U128::from(79)),
                                 }],
                                 "referrer": DEFAULT_REFERRER_ID,
+                                "referral_fees": [],
                             }))
                             .unwrap(),
                             gas: Gas(NearGas::from_tgas(54)),
@@ -1337,6 +1363,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 }))
                                 .unwrap(),
                             }))
@@ -1448,6 +1475,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 }))
                                 .unwrap(),
                             }))
@@ -1553,6 +1581,7 @@ mod tests {
                                         },
                                     ],
                                     "referrer": DEFAULT_REFERRER_ID,
+                                    "referral_fees": [],
                                 },
                             }))
                             .unwrap(),
@@ -1649,6 +1678,7 @@ mod tests {
                                     },
                                 ],
                                 "referrer": DEFAULT_REFERRER_ID,
+                                "referral_fees": [],
                             }))
                             .unwrap(),
                             gas: Gas(NearGas::from_tgas(69)),
@@ -1728,6 +1758,7 @@ mod tests {
                                     constraint: Some(U128::from(101)),
                                 }],
                                 "referrer": DEFAULT_REFERRER_ID,
+                                "referral_fees": [],
                             }))
                             .unwrap(),
                             gas: Gas(NearGas::from_tgas(54)),
@@ -1872,6 +1903,7 @@ mod tests {
                                     },
                                 ],
                                 "referrer": DEFAULT_REFERRER_ID,
+                                "referral_fees": [],
                             },
                         }))
                         .unwrap(),
@@ -1938,6 +1970,7 @@ mod tests {
                                     },
                                 ],
                                 "referrer": "ref.near",
+                                "referral_fees": [],
                             },
                         }))
                         .unwrap(),
@@ -1954,31 +1987,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn referral_fees_are_passed_to_plach() {
-        use base64::Engine;
-
-        let referral_fees: crate::types::QuoteFees =
-            r#"{"ref.near":0.01,"ref2.near":0.005}"#.parse().unwrap();
+    async fn referral_fees_are_taken_by_the_engine_and_their_receivers_registered() {
         let route = route(
             SwapRequest {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
-                amount: Amount::AmountIn(100),
+                amount: Amount::AmountIn(1_000_000),
                 slippage: Slippage::Fixed {
                     slippage: "0.01".parse().unwrap(),
                 },
                 dexes: None,
-                trader_account_id: None,
+                trader_account_id: Some("trader.near".parse().unwrap()),
                 signing_public_key: None,
                 referrer_id: None,
-                fees: referral_fees.clone(),
+                fees: r#"{"ref.near":0.01,"ref2.near":0.005}"#.parse().unwrap(),
             },
-            &TestNetworkView::default().with_test_prices(),
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_storage(
+                    INTEAR_DEX_CONTRACT_ID,
+                    "trader.near",
+                    NearToken::from_near(1),
+                    NearToken::from_near(1),
+                )
+                .with_intear_registered(
+                    "trader.near",
+                    &AssetId::Nep141("ft".parse().unwrap()),
+                    true,
+                )
+                .with_intear_registered("ref2.near", &AssetId::Near, true),
             &TestPlachQuotes::default(),
             None,
         )
         .await
         .unwrap();
+        // ref.near and the aggregator haven't registered NEAR, so the trader registers it for them
+        let ExecutionInstruction::NearTransaction {
+            receiver_id,
+            actions,
+            ..
+        } = &route.execution_instructions[0];
+        assert_eq!(receiver_id, INTEAR_DEX_CONTRACT_ID);
+        let registered_for = actions
+            .iter()
+            .map(|action| match action {
+                Action::FunctionCall(call) => {
+                    assert_eq!(call.method_name, "register_assets");
+                    serde_json::from_slice::<serde_json::Value>(&call.args).unwrap()
+                }
+                _ => panic!("Not a function call"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered_for,
+            vec![
+                serde_json::json!({ "asset_ids": ["near"], "for": { "Account": "ref.near" } }),
+                serde_json::json!({
+                    "asset_ids": ["near"],
+                    "for": { "Account": AGGREGATOR_FEE_RECEIVER_ID },
+                }),
+            ]
+        );
+
         let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
             route.execution_instructions.last()
         else {
@@ -1988,21 +2058,58 @@ mod tests {
             panic!("Swap transaction isn't a single function call");
         };
         let args = serde_json::from_slice::<serde_json::Value>(&deposit_near.args).unwrap();
-        let message = base64::engine::general_purpose::STANDARD
-            .decode(
-                args["operations"]["operations"][0]["SwapSimple"]["message"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-        let swap_args = borsh::from_slice::<SwapArgs>(&message).unwrap();
-        assert!(
-            swap_args.referral_fees
-                == xyk_dex_types::ReferralFees(vec![
-                    ("ref.near".parse().unwrap(), 10_000),
-                    ("ref2.near".parse().unwrap(), 5_000),
-                ])
+        // 80% of each fee to its referrer, 20% of both to the aggregator
+        assert_eq!(
+            args["operations"]["referral_fees"],
+            serde_json::json!([
+                ["ref.near", 8_000],
+                ["ref2.near", 4_000],
+                [AGGREGATOR_FEE_RECEIVER_ID, 3_000],
+            ])
         );
-        assert_eq!(args["operations"]["referrer"], DEFAULT_REFERRER_ID);
+        // The engine takes the whole input and the fees out of it, the DEX swaps the rest
+        assert_eq!(
+            args["operations"]["operations"][0]["SwapSimple"]["amount"],
+            serde_json::json!({ "Amount": { "ExactIn": "1000000" } })
+        );
+        assert_eq!(deposit_near.deposit, NearToken::from_yoctonear(1_000_000));
+        let message = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            args["operations"]["operations"][0]["SwapSimple"]["message"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let swap_args = borsh::from_slice::<SwapArgs>(&message).unwrap();
+        assert_eq!(swap_args.routes[0].pool_ids, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn exact_out_referral_fees_go_on_top_of_the_input() {
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountOut(80),
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: None,
+                signing_public_key: None,
+                referrer_id: None,
+                fees: r#"{"ref.near":0.05}"#.parse().unwrap(),
+            },
+            &TestNetworkView::default().with_test_prices(),
+            &TestPlachQuotes::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        // The referrer's 4% and the aggregator's 1% of the total, rounded up like the engine:
+        // 100 / 95% * 4% = 4.21 -> 5 and 100 / 95% * 1% = 1.05 -> 2
+        assert_eq!(route.estimated_amount, Amount::AmountIn(100 + 5 + 2));
+        // And of the most the DEX can take: 4.25 -> 5 and 1.06 -> 2
+        assert_eq!(route.worst_case_amount, Amount::AmountIn(101 + 5 + 2));
     }
 }

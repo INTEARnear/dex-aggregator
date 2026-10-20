@@ -11,6 +11,7 @@ use std::{
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
 use intear_dex_types::DirectWithdrawAmount;
+use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
@@ -24,10 +25,7 @@ use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
 use tracing::{error, info, warn};
-use xyk_dex_types::{
-    FULL_FEE_FRACTION, FULL_FEE_FRACTION_FRACTION, PROTOCOL_FEE_RECEIVER_ID,
-    REFERRAL_FEE_PROTOCOL_SHARE,
-};
+use xyk_dex_types::{FeeFractionFraction, FULL_FEE_FRACTION_FRACTION};
 
 use crate::{
     providers::intear_plach::AssetId,
@@ -36,6 +34,12 @@ use crate::{
 
 pub const WRAP_NEAR: &str = "wrap.near";
 pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
+/// Gets the aggregator's share of every referral fee of Rhea and Rhea DCL routes
+pub const AGGREGATOR_FEE_RECEIVER_ID: &AccountIdRef =
+    AccountIdRef::new_or_panic("dex-aggregator.intear.near");
+/// The part of each referral fee that goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the
+/// referrer
+const AGGREGATOR_FEE_SHARE: FeeFractionFraction = FULL_FEE_FRACTION_FRACTION / 5; // 20%
 pub const STORAGE_BYTE_COST: NearToken = NearToken::from_yoctonear(10u128.pow(19));
 
 // Fees burnt on top of the gas attached to actions, `send_not_sir` + `execution` of mainnet's
@@ -278,43 +282,28 @@ pub struct ReferrerFee {
     pub amount: Balance,
 }
 
-/// The referral fees of the request that `can_receive` says the referrer can be paid, the
-/// others are skipped. Like the xyk DEX, [`REFERRAL_FEE_PROTOCOL_SHARE`] of each fee goes to the
-/// protocol fee receiver instead of the referrer, if it can be paid too.
-pub async fn payable_referral_fees<Fut: Future<Output = bool>>(
-    referral_fees: &QuoteFees,
-    can_receive: impl Fn(AccountId) -> Fut,
-) -> QuoteFees {
+/// The referral fees of the request, without the ones of 0. [`AGGREGATOR_FEE_SHARE`] of each fee
+/// goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the referrer.
+pub fn payable_referral_fees(referral_fees: &QuoteFees) -> QuoteFees {
     let mut payable = Vec::new();
     let mut protocol_share = 0;
     for (referrer_id, fee_fraction) in &referral_fees.0 {
-        // A fee of 0 pays nothing, so there's no need to check
         if *fee_fraction == 0 {
             continue;
         }
-        if can_receive(referrer_id.clone()).await {
-            // Rounded down, like the xyk DEX
-            let share = (u64::from(*fee_fraction) * u64::from(REFERRAL_FEE_PROTOCOL_SHARE)
-                / u64::from(FULL_FEE_FRACTION_FRACTION)) as u32;
-            protocol_share += share;
-            payable.push((referrer_id.clone(), fee_fraction - share));
-        } else {
-            info!("Referrer {referrer_id} can't receive the input token, routing without its fee");
-        }
+        // Rounded down
+        let share = (u64::from(*fee_fraction) * u64::from(AGGREGATOR_FEE_SHARE)
+            / u64::from(FULL_FEE_FRACTION)) as FeeFraction;
+        protocol_share += share;
+        payable.push((referrer_id.clone(), fee_fraction - share));
     }
     if protocol_share > 0 {
-        if can_receive(PROTOCOL_FEE_RECEIVER_ID.to_owned()).await {
-            match payable
-                .iter_mut()
-                .find(|(referrer_id, _)| referrer_id == PROTOCOL_FEE_RECEIVER_ID)
-            {
-                Some((_, fee_fraction)) => *fee_fraction += protocol_share,
-                None => payable.push((PROTOCOL_FEE_RECEIVER_ID.to_owned(), protocol_share)),
-            }
-        } else {
-            info!(
-                "{PROTOCOL_FEE_RECEIVER_ID} can't receive the input token, routing without the protocol share of referral fees"
-            );
+        match payable
+            .iter_mut()
+            .find(|(referrer_id, _)| referrer_id == AGGREGATOR_FEE_RECEIVER_ID)
+        {
+            Some((_, fee_fraction)) => *fee_fraction += protocol_share,
+            None => payable.push((AGGREGATOR_FEE_RECEIVER_ID.to_owned(), protocol_share)),
         }
     }
     QuoteFees(payable)
@@ -341,9 +330,10 @@ pub fn total_fee_amount(fees: &[ReferrerFee]) -> Balance {
 }
 
 /// [`convert_to_nep141`] of `total`, and the fee transaction that sends `fees` of it to the
-/// referrers with `ft_transfer`, to go after the swap. NEAR is wrapped whole, so its fees are paid
-/// in wNEAR too.
+/// referrers with `ft_transfer`, to go after the swap. Referrers without storage on the NEP-141
+/// get it in the same transaction first. NEAR is wrapped whole, so its fees are paid in wNEAR too.
 pub async fn convert_to_nep141_with_fees(
+    network: &impl NetworkView,
     token_id: &TokenId,
     trader_account_id: Option<AccountId>,
     total: Balance,
@@ -357,12 +347,22 @@ pub async fn convert_to_nep141_with_fees(
     let send_fees = if fees.is_empty() {
         Vec::new()
     } else {
+        let mut actions = Vec::new();
+        for fee in fees {
+            if needs_storage_deposit_for_contract(network, &fee.referrer_id, &nep141).await {
+                actions.push(
+                    create_nep141_storage_deposit_action(network, &nep141, Some(&fee.referrer_id))
+                        .await?,
+                );
+            }
+        }
+        actions.extend(
+            fees.iter()
+                .map(|fee| create_fee_ft_transfer_action(&fee.referrer_id, fee.amount)),
+        );
         vec![ExecutionInstruction::NearTransaction {
             receiver_id: nep141.clone(),
-            actions: fees
-                .iter()
-                .map(|fee| create_fee_ft_transfer_action(&fee.referrer_id, fee.amount))
-                .collect(),
+            actions,
             is_fee_transaction: true,
         }]
     };
@@ -820,6 +820,30 @@ pub async fn needs_storage_deposit_for_contract(
 const RHEA_ACCOUNT_STORAGE_BYTES: u128 = 102;
 const RHEA_TOKEN_STORAGE_BYTES: u128 = 148;
 
+/// NEAR the account lacks on Rhea for a balance of `new_tokens` more tokens.
+async fn rhea_storage_lacking(
+    network: &impl NetworkView,
+    account_id: &AccountId,
+    new_tokens: usize,
+) -> Option<NearToken> {
+    let (deposit, usage) = match network
+        .rhea_storage_state(account_id)
+        .await
+        .inspect_err(|e| info!("Failed to get the Rhea storage of {account_id}: {e}"))
+        .ok()?
+    {
+        Some(state) => (state.deposit, state.usage),
+        None => (
+            NearToken::from_yoctonear(0),
+            STORAGE_BYTE_COST.saturating_mul(RHEA_ACCOUNT_STORAGE_BYTES),
+        ),
+    };
+    let needed = usage.saturating_add(
+        STORAGE_BYTE_COST.saturating_mul(RHEA_TOKEN_STORAGE_BYTES * new_tokens as u128),
+    );
+    Some(needed.saturating_sub(deposit))
+}
+
 /// Registers the tokens the account has no balance of on Rhea yet, with the storage deposit they
 /// lack. `swap` adds a balance of every token it outputs, also the ones in the middle of a route.
 pub async fn rhea_registration(
@@ -838,28 +862,10 @@ pub async fn rhea_registration(
     if unregistered.is_empty() {
         return Some(vec![]);
     }
-    // As the contract counts them, so an account that uses more than its deposit pays for that too
-    let (deposit, usage) = match network
-        .rhea_storage_state(account_id)
-        .await
-        .inspect_err(|e| info!("Failed to get the Rhea storage of {account_id}: {e}"))
-        .ok()?
-    {
-        Some(state) => (state.deposit, state.usage),
-        None => (
-            NearToken::from_yoctonear(0),
-            STORAGE_BYTE_COST.saturating_mul(RHEA_ACCOUNT_STORAGE_BYTES),
-        ),
-    };
-    let needed = usage.saturating_add(
-        STORAGE_BYTE_COST.saturating_mul(RHEA_TOKEN_STORAGE_BYTES * unregistered.len() as u128),
-    );
+    let lacking = rhea_storage_lacking(network, account_id, unregistered.len()).await?;
     let mut actions = Vec::new();
-    if needed > deposit {
-        actions.push(create_storage_deposit_action_for_contract(
-            needed.saturating_sub(deposit),
-            false,
-        ));
+    if !lacking.is_zero() {
+        actions.push(create_storage_deposit_action_for_contract(lacking, false));
     }
     actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "register_tokens".to_string(),
@@ -874,15 +880,73 @@ pub async fn rhea_registration(
     }])
 }
 
+/// Storage deposits for the referrers that have no balance of `token_id` on Rhea yet, for the
+/// storage a balance of it takes. Only the account itself can `register_tokens`, but a transfer
+/// adds the balance when the account has the storage for it.
+pub async fn rhea_fee_receivers_registration(
+    network: &impl NetworkView,
+    token_id: &AccountId,
+    fees: &[ReferrerFee],
+) -> Option<Vec<Action>> {
+    let mut actions = Vec::new();
+    for fee in fees {
+        if network
+            .is_rhea_token_registered(&fee.referrer_id, token_id)
+            .await
+        {
+            continue;
+        }
+        let lacking = rhea_storage_lacking(network, &fee.referrer_id, 1).await?;
+        if !lacking.is_zero() {
+            actions.push(create_storage_deposit_action_for_someone(
+                lacking,
+                &fee.referrer_id,
+                false,
+            ));
+        }
+    }
+    Some(actions)
+}
+
 const INTEAR_RECORD_BYTES: u128 = 40;
 const ACCOUNT_ID_LENGTH_BYTES: u128 = 4;
 
-/// Registers the assets the account has no balance of on Intear DEX yet, with the storage deposit
-/// they lack
+/// Bytes of a balance of each of `asset_ids` for `account_id` on Intear DEX, and of its map of
+/// balances when it has none yet
+fn intear_balances_bytes(
+    account_id: &AccountId,
+    asset_ids: &[&AssetId],
+    balances_exist: bool,
+) -> u128 {
+    let id = account_id.len() as u128;
+    let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
+    let balances_bytes = if balances_exist {
+        0
+    } else {
+        INTEAR_RECORD_BYTES
+            + (1 + ACCOUNT_ID_LENGTH_BYTES + id)
+            + 4
+            + (4 + key_prefix)
+            + (4 + key_prefix)
+    };
+    let assets_bytes = asset_ids
+        .iter()
+        .map(|asset_id| {
+            let asset = borsh::to_vec(asset_id).unwrap().len() as u128;
+            (INTEAR_RECORD_BYTES + key_prefix + 4 + asset) + (INTEAR_RECORD_BYTES + 32 + 16 + 4)
+        })
+        .sum::<u128>();
+    balances_bytes + assets_bytes
+}
+
+/// Registers the assets the account has no balance of on Intear DEX yet, and each fee receiver's
+/// asset it hasn't registered, so the engine pays it its fee. The account deposits the storage
+/// all of them lack.
 pub async fn intear_registration(
     network: &impl NetworkView,
     account_id: &AccountId,
     asset_ids: &[&AssetId],
+    fee_receivers: &[(&AccountId, &AssetId)],
 ) -> Option<Vec<ExecutionInstruction>> {
     let contract_id: AccountId = "dex.intear.near".parse().unwrap();
     let mut unregistered = Vec::new();
@@ -900,7 +964,18 @@ pub async fn intear_registration(
             unregistered.push(asset_id);
         }
     }
-    if unregistered.is_empty() {
+    let mut unregistered_fee_receivers = Vec::new();
+    for &fee_receiver in fee_receivers {
+        let (receiver_id, asset_id) = fee_receiver;
+        if !unregistered_fee_receivers.contains(&fee_receiver)
+            && !network
+                .is_intear_asset_registered(receiver_id, asset_id)
+                .await
+        {
+            unregistered_fee_receivers.push(fee_receiver);
+        }
+    }
+    if unregistered.is_empty() && unregistered_fee_receivers.is_empty() {
         return Some(vec![]);
     }
     let storage = network
@@ -908,45 +983,47 @@ pub async fn intear_registration(
         .await
         .inspect_err(|e| info!("Failed to get the storage balance of {account_id}: {e}"))
         .ok()?;
-    let id = account_id.len() as u128;
-    let account_bytes = match storage {
+    let mut bytes = match storage {
         Some(_) => 0,
-        None => INTEAR_RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + id) + 32,
+        None => INTEAR_RECORD_BYTES + (1 + ACCOUNT_ID_LENGTH_BYTES + account_id.len() as u128) + 32,
     };
-    // The account's map of balances exists once it has registered any asset
-    let balances_exist = any_registered
-        || (storage.is_some()
-            && network
-                .intear_balances_exist(account_id)
-                .await
-                .inspect_err(|e| info!("Failed to get the balances of {account_id}: {e}"))
-                .ok()?);
-    let balances_bytes = if balances_exist {
-        0
-    } else {
-        let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
-        INTEAR_RECORD_BYTES
-            + (1 + ACCOUNT_ID_LENGTH_BYTES + id)
-            + 4
-            + (4 + key_prefix)
-            + (4 + key_prefix)
-    };
-    let mut assets_bytes = 0;
-    for asset_id in &unregistered {
-        let key_prefix = 1 + ACCOUNT_ID_LENGTH_BYTES + id + 1;
-        let asset = borsh::to_vec(asset_id).unwrap().len() as u128;
-        assets_bytes +=
-            (INTEAR_RECORD_BYTES + key_prefix + 4 + asset) + (INTEAR_RECORD_BYTES + 32 + 16 + 4);
+    if !unregistered.is_empty() {
+        // The account's map of balances exists once it has registered any asset
+        let balances_exist = any_registered
+            || (storage.is_some()
+                && network
+                    .intear_balances_exist(account_id)
+                    .await
+                    .inspect_err(|e| info!("Failed to get the balances of {account_id}: {e}"))
+                    .ok()?);
+        bytes += intear_balances_bytes(account_id, &unregistered, balances_exist);
+    }
+    for &(receiver_id, asset_id) in &unregistered_fee_receivers {
+        // Others can register assets for an account without storage, so it can have balances
+        let balances_exist = network
+            .intear_balances_exist(receiver_id)
+            .await
+            .inspect_err(|e| info!("Failed to get the balances of {receiver_id}: {e}"))
+            .ok()?;
+        bytes += intear_balances_bytes(receiver_id, &[asset_id], balances_exist);
+    }
+    let mut new_assets = unregistered.clone();
+    for &(_, asset_id) in &unregistered_fee_receivers {
+        if !new_assets.contains(&asset_id) {
+            new_assets.push(asset_id);
+        }
+    }
+    for asset_id in new_assets {
         if !network
             .is_intear_asset_in_custody(asset_id)
             .await
             .inspect_err(|e| info!("Failed to get the total in custody of {asset_id}: {e}"))
             .ok()?
         {
-            assets_bytes += 138 + borsh::to_vec(asset_id).unwrap().len() as u128;
+            bytes += 138 + borsh::to_vec(asset_id).unwrap().len() as u128;
         }
     }
-    let needed = STORAGE_BYTE_COST.saturating_mul(account_bytes + balances_bytes + assets_bytes);
+    let needed = STORAGE_BYTE_COST.saturating_mul(bytes);
     let available = storage.map_or(NearToken::from_yoctonear(0), |storage| storage.available());
     let mut actions = Vec::new();
     if needed > available {
@@ -966,12 +1043,26 @@ pub async fn intear_registration(
             deposit: needed.saturating_sub(available).max(min),
         })));
     }
-    actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "register_assets".to_string(),
-        args: serde_json::to_vec(&serde_json::json!({ "asset_ids": unregistered })).unwrap(),
-        gas: Gas(NearGas::from_tgas(5)),
-        deposit: NearToken::from_yoctonear(1),
-    })));
+    if !unregistered.is_empty() {
+        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "register_assets".to_string(),
+            args: serde_json::to_vec(&serde_json::json!({ "asset_ids": unregistered })).unwrap(),
+            gas: Gas(NearGas::from_tgas(5)),
+            deposit: NearToken::from_yoctonear(1),
+        })));
+    }
+    for (receiver_id, asset_id) in unregistered_fee_receivers {
+        actions.push(Action::FunctionCall(Box::new(FunctionCallAction {
+            method_name: "register_assets".to_string(),
+            args: serde_json::to_vec(&serde_json::json!({
+                "asset_ids": [asset_id],
+                "for": { "Account": receiver_id },
+            }))
+            .unwrap(),
+            gas: Gas(NearGas::from_tgas(5)),
+            deposit: NearToken::from_yoctonear(1),
+        })));
+    }
     Some(vec![ExecutionInstruction::NearTransaction {
         receiver_id: contract_id,
         actions,
@@ -1524,7 +1615,7 @@ pub async fn deposit_storage_if_needed(
             rhea_registration(network, &trader_account_id, &[token_id]).await
         }
         TokenId::TokenOnIntearDex(asset_id) => {
-            intear_registration(network, &trader_account_id, &[asset_id]).await
+            intear_registration(network, &trader_account_id, &[asset_id], &[]).await
         }
     }
 }

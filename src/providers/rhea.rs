@@ -10,8 +10,8 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_nep141, convert_to_nep141_with_fees, create_rhea_fee_mft_transfer_action,
-        deposit_storage_if_needed, get_slippage, needs_storage_deposit_for_contract,
-        payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
+        deposit_storage_if_needed, get_slippage, payable_referral_fees, price_raw,
+        referrer_fees_of_total, register_input_in_wallet, rhea_fee_receivers_registration,
         rhea_registration, swap_call_gas, total_fee_amount, Mainnet, NetworkView,
         DEFAULT_REFERRER_ID,
     },
@@ -80,18 +80,8 @@ async fn route(
     let fast_path = matches!(request.token_in, TokenId::Nep141OnRhea(_))
         && matches!(request.token_out, TokenId::Nep141OnRhea(_));
 
-    let token_in_ref = &token_in;
-    let payable_referral_fees = payable_referral_fees(&request.fees, |referrer_id| async move {
-        if fast_path {
-            network
-                .is_rhea_token_registered(&referrer_id, token_in_ref)
-                .await
-        } else {
-            !needs_storage_deposit_for_contract(network, &referrer_id, token_in_ref).await
-        }
-    })
-    .await;
-    let referrer_fees = referrer_fees_of_total(&payable_referral_fees, exact_amount_in);
+    let referrer_fees =
+        referrer_fees_of_total(&payable_referral_fees(&request.fees), exact_amount_in);
     // The fees come out of the input, so the rest is what's quoted and swapped
     let swap_amount_in = exact_amount_in - total_fee_amount(&referrer_fees);
 
@@ -169,6 +159,8 @@ async fn route(
             deposit: NearToken::from_yoctonear(1),
         }));
 
+        let fee_receivers_registration =
+            rhea_fee_receivers_registration(network, &token_in, &referrer_fees).await?;
         let fee_actions = referrer_fees
             .iter()
             .map(|fee| create_rhea_fee_mft_transfer_action(&token_in, &fee.referrer_id, fee.amount))
@@ -177,7 +169,7 @@ async fn route(
             registration_transactions,
             vec![ExecutionInstruction::NearTransaction {
                 receiver_id: RHEA_CONTRACT_ID.parse().unwrap(),
-                actions: [vec![swap_action], fee_actions].concat(),
+                actions: [vec![swap_action], fee_receivers_registration, fee_actions].concat(),
                 is_fee_transaction: false,
             }],
         ]
@@ -219,6 +211,7 @@ async fn route(
     }];
 
     let (input_to_nep141, send_fees, input_nep141) = convert_to_nep141_with_fees(
+        network,
         &request.token_in,
         request.trader_account_id.clone(),
         exact_amount_in,
@@ -274,10 +267,10 @@ mod tests {
     use crate::shared_utils::{
         create_fee_ft_transfer_action, create_intear_dex_withdraw_action,
         create_rhea_fee_mft_transfer_action, create_rhea_withdraw_action,
-        create_storage_deposit_action_for_contract, create_wrap_action, TestNetworkView, WRAP_NEAR,
+        create_storage_deposit_action_for_contract, create_storage_deposit_action_for_someone,
+        create_wrap_action, TestNetworkView, AGGREGATOR_FEE_RECEIVER_ID, WRAP_NEAR,
     };
     use crate::types::Slippage;
-    use xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestRheaQuotes {
@@ -1298,7 +1291,7 @@ mod tests {
                 )
                 .with_storage(
                     WRAP_NEAR,
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -1328,7 +1321,7 @@ mod tests {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
                         create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1353,7 +1346,7 @@ mod tests {
                 )
                 .with_storage(
                     "ft",
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -1376,7 +1369,7 @@ mod tests {
                     receiver_id: "ft".parse().unwrap(),
                     actions: vec![
                         create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1385,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn referrer_without_storage_on_input_gets_no_fee() {
+    async fn referrer_without_storage_on_input_is_registered_before_its_fee() {
         let route = route(
             referred_request(
                 TokenId::Nep141("ft".parse().unwrap()),
@@ -1398,14 +1391,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             route.execution_instructions,
-            vec![ExecutionInstruction::NearTransaction {
-                receiver_id: "ft".parse().unwrap(),
-                actions: vec![ft_transfer_call_to_rhea(
-                    "1000",
-                    rhea_swap_msg("ft", "other", "1000", "ref.near"),
-                )],
-                is_fee_transaction: false,
-            }]
+            vec![
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    actions: vec![ft_transfer_call_to_rhea(
+                        "990",
+                        rhea_swap_msg("ft", "other", "990", "ref.near"),
+                    )],
+                    is_fee_transaction: false,
+                },
+                ExecutionInstruction::NearTransaction {
+                    receiver_id: "ft".parse().unwrap(),
+                    actions: vec![
+                        create_storage_deposit_action_for_someone(
+                            "0.00125 NEAR".parse().unwrap(),
+                            &"ref.near".parse().unwrap(),
+                            true,
+                        ),
+                        create_storage_deposit_action_for_someone(
+                            "0.00125 NEAR".parse().unwrap(),
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            true,
+                        ),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
+                    ],
+                    is_fee_transaction: true,
+                },
+            ]
         );
     }
 
@@ -1424,7 +1437,7 @@ mod tests {
                 .with_rhea_registered("trader.near", "ft", true)
                 .with_rhea_registered("trader.near", "other", true)
                 .with_rhea_registered("ref.near", "ft", true)
-                .with_rhea_registered(PROTOCOL_FEE_RECEIVER_ID.as_str(), "ft", true),
+                .with_rhea_registered(AGGREGATOR_FEE_RECEIVER_ID.as_str(), "ft", true),
             &TestRheaQuotes::default(),
         )
         .await
@@ -1459,7 +1472,7 @@ mod tests {
                     ),
                     create_rhea_fee_mft_transfer_action(
                         &"ft".parse().unwrap(),
-                        &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
+                        &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                         2,
                     ),
                 ],
@@ -1469,7 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn referrer_without_rhea_registration_gets_no_fee_on_fast_path() {
+    async fn referrer_without_rhea_registration_gets_storage_for_its_fee_on_fast_path() {
         let route = route(
             SwapRequest {
                 trader_account_id: Some("trader.near".parse().unwrap()),
@@ -1488,11 +1501,37 @@ mod tests {
         .unwrap();
         let ExecutionInstruction::NearTransaction { actions, .. } =
             &route.execution_instructions[0];
-        assert_eq!(actions.len(), 1, "Only the swap, no fee transfer");
+        // A new Rhea account with a balance of one token
+        let account_with_token = NearToken::from_yoctonear(250 * 10u128.pow(19));
+        assert_eq!(
+            actions[1..],
+            [
+                create_storage_deposit_action_for_someone(
+                    account_with_token,
+                    &"ref.near".parse().unwrap(),
+                    false,
+                ),
+                create_storage_deposit_action_for_someone(
+                    account_with_token,
+                    &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                    false,
+                ),
+                create_rhea_fee_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &"ref.near".parse().unwrap(),
+                    8,
+                ),
+                create_rhea_fee_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                    2,
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn each_referrer_that_can_receive_the_input_gets_its_fee() {
+    async fn each_referrer_gets_its_fee() {
         let route = route(
             SwapRequest {
                 fees: r#"{"ref.near":0.01,"ref2.near":0.02,"nostorage.near":0.01}"#
@@ -1519,7 +1558,7 @@ mod tests {
                 )
                 .with_storage(
                     "ft",
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -1533,18 +1572,24 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: "ft".parse().unwrap(),
                     actions: vec![ft_transfer_call_to_rhea(
-                        "970",
-                        rhea_swap_msg("ft", "other", "970", "ref.near"),
+                        "960",
+                        rhea_swap_msg("ft", "other", "960", "ref.near"),
                     )],
                     is_fee_transaction: false,
                 },
                 ExecutionInstruction::NearTransaction {
                     receiver_id: "ft".parse().unwrap(),
-                    // 80% of each fee to its referrer, the protocol's 20% of both together
+                    // 80% of each fee to its referrer, the protocol's 20% of all of them together
                     actions: vec![
+                        create_storage_deposit_action_for_someone(
+                            "0.00125 NEAR".parse().unwrap(),
+                            &"nostorage.near".parse().unwrap(),
+                            true,
+                        ),
+                        create_fee_ft_transfer_action(&"nostorage.near".parse().unwrap(), 8),
                         create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
                         create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 8),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1575,7 +1620,7 @@ mod tests {
                 )
                 .with_storage(
                     WRAP_NEAR,
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -1599,7 +1644,7 @@ mod tests {
                 actions: vec![
                     create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
                     create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                    create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6),
+                    create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 6),
                 ],
                 is_fee_transaction: true,
             }
@@ -1607,7 +1652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_path_moves_rhea_balance_to_each_registered_referrer() {
+    async fn fast_path_moves_rhea_balance_to_each_referrer() {
         let route = route(
             SwapRequest {
                 trader_account_id: Some("trader.near".parse().unwrap()),
@@ -1625,7 +1670,7 @@ mod tests {
                 .with_rhea_registered("trader.near", "other", true)
                 .with_rhea_registered("ref.near", "ft", true)
                 .with_rhea_registered("ref2.near", "ft", true)
-                .with_rhea_registered(PROTOCOL_FEE_RECEIVER_ID.as_str(), "ft", true),
+                .with_rhea_registered(AGGREGATOR_FEE_RECEIVER_ID.as_str(), "ft", true),
             &TestRheaQuotes::default(),
         )
         .await
@@ -1635,6 +1680,11 @@ mod tests {
         assert_eq!(
             actions[1..],
             [
+                create_storage_deposit_action_for_someone(
+                    NearToken::from_yoctonear(250 * 10u128.pow(19)),
+                    &"unregistered.near".parse().unwrap(),
+                    false,
+                ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &"ref.near".parse().unwrap(),
@@ -1647,8 +1697,13 @@ mod tests {
                 ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
-                    &PROTOCOL_FEE_RECEIVER_ID.to_owned(),
-                    6,
+                    &"unregistered.near".parse().unwrap(),
+                    8,
+                ),
+                create_rhea_fee_mft_transfer_action(
+                    &"ft".parse().unwrap(),
+                    &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                    8,
                 ),
             ]
         );

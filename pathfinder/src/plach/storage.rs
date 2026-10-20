@@ -6,15 +6,12 @@ use near_sdk::json_types::U128;
 use pool_indexer::{AccountState, Watch};
 use xyk_dex_types::{AssetWithBalance, CurrentFees, FeeConfiguration, SharesBalance};
 
-use super::{AssetId, FeeAssets, INTEAR_DEX_CONTRACT_ID, PLACH_DEX_ID, PoolsSource};
+use super::{INTEAR_DEX_CONTRACT_ID, PLACH_DEX_ID, PoolsSource};
 
 /// `dex_storage: LookupMap<(DexId, Vec<u8>), Vec<u8>>` of the DEX engine
 const DEX_STORAGE_PREFIX: u8 = 1;
 /// `pools: Vector<Pool>` of the xyk DEX, keys are the prefix and u32 index
 const POOLS_PREFIX: u8 = 0;
-/// `fees_collected_by_users: LookupMap<(AccountId, AssetId), U128>` of the xyk DEX: an account
-/// only collects fees in the assets it has an entry for
-const FEES_COLLECTED_BY_USERS_PREFIX: u8 = 2;
 
 /// Keys of the Plach DEX in the engine's storage
 fn storage_prefix() -> Vec<u8> {
@@ -109,60 +106,5 @@ pub(super) fn pools_source(state: &AccountState) -> Result<PoolsSource, anyhow::
         block_height: state.block.height,
         timestamp: state.block.timestamp_nanosec,
         pools,
-        fee_assets: fee_assets(&storage)?,
     })
-}
-
-/// The assets each account collects fees in
-fn fee_assets(storage: &HashMap<Vec<u8>, Vec<u8>>) -> Result<FeeAssets, anyhow::Error> {
-    let mut fee_assets = FeeAssets::new();
-    for key in storage.keys() {
-        if let Some((&FEES_COLLECTED_BY_USERS_PREFIX, entry)) = key.split_first() {
-            let (account_id, asset_id) = borsh::from_slice::<(AccountId, AssetId)>(entry)
-                .map_err(|e| anyhow::anyhow!("Invalid collected fees key {key:02x?}: {e}"))?;
-            fee_assets.entry(account_id).or_default().insert(asset_id);
-        }
-    }
-    Ok(fee_assets)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    fn key(prefix: u8, entry: impl borsh::BorshSerialize) -> Vec<u8> {
-        [vec![prefix], borsh::to_vec(&entry).unwrap()].concat()
-    }
-
-    #[test]
-    fn every_account_comes_with_the_assets_it_collects_fees_in() {
-        let referrer: AccountId = "ref.near".parse().unwrap();
-        let other: AccountId = "pool-owner.near".parse().unwrap();
-        let usdt = AssetId::Nep141("usdt.tether-token.near".parse().unwrap());
-        let storage = HashMap::from([
-            (
-                key(FEES_COLLECTED_BY_USERS_PREFIX, (&referrer, &AssetId::Near)),
-                borsh::to_vec(&0u128).unwrap(),
-            ),
-            (
-                key(FEES_COLLECTED_BY_USERS_PREFIX, (&referrer, &usdt)),
-                borsh::to_vec(&5u128).unwrap(),
-            ),
-            (
-                key(FEES_COLLECTED_BY_USERS_PREFIX, (&other, &usdt)),
-                borsh::to_vec(&5u128).unwrap(),
-            ),
-            // Referral settings the DEX had before referral fees came with swaps
-            (key(3, &referrer), vec![0; 9]),
-        ]);
-        assert_eq!(
-            fee_assets(&storage).unwrap(),
-            FeeAssets::from([
-                (referrer, HashSet::from([AssetId::Near, usdt.clone()])),
-                (other, HashSet::from([usdt])),
-            ])
-        );
-    }
 }

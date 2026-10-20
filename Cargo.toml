@@ -28,8 +28,8 @@ base64 = "0.21.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate", "chrono"] }
 pathfinder = { path = "pathfinder" }
-intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "25c30dfe89a2b7e79ef29162f67ee070a7a47704", features = ["json"] }
-xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "25c30dfe89a2b7e79ef29162f67ee070a7a47704" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "aadcb400e63316c9dc11c4486242ab881543b63a", features = ["json"] }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "aadcb400e63316c9dc11c4486242ab881543b63a" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
 

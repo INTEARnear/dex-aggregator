@@ -10,7 +10,7 @@ use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::intear_plach::AssetId;
-use xyk_dex_types::{FeeFraction, FULL_FEE_FRACTION, MAX_REFERRAL_FEE_FRACTION};
+use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -105,18 +105,25 @@ pub struct SwapRequest {
     /// parameter for DEXes that support it (DexId::Rhea, DexId::Plach)
     pub referrer_id: Option<AccountId>,
     /// Fees the route pays to referrers, as a JSON object of referrer account IDs and
-    /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Plach charges them
-    /// itself, Rhea and Rhea DCL routes send them in the input token after the swap call.
+    /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Intear DEX takes them out
+    /// of Plach swaps' input into the referrers' balances on it, Rhea fast-path makes an
+    /// internal balance transfer, and Rhea slow-path and Rhea DCL routes send them in the
+    /// input token after the swap call. Routes register the referrers to receive them, so
+    /// the first swap on a new token for a referrer can be slower.
     #[serde(default)]
     pub fees: QuoteFees,
 }
 
-/// Referrers and the fee each charges, in fractions of [`FULL_FEE_FRACTION`]. At most
-/// `MAX_REFERRERS`, adding up to at most [`MAX_REFERRAL_FEE_FRACTION`], as Plach allows.
+const MAX_REFERRAL_FEE_FRACTION: FeeFraction = FULL_FEE_FRACTION / 20; // 5%
+const MAX_REFERRERS: usize = 4;
+
+/// Referrers and the fee each charges, in fractions of [`FULL_FEE_FRACTION`]. With
+/// [`AGGREGATOR_FEE_RECEIVER_ID`] and its share, at most [`MAX_REFERRERS`], adding up to at most
+/// [`MAX_REFERRAL_FEE_FRACTION`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuoteFees(pub Vec<(AccountId, FeeFraction)>);
 
-impl From<&QuoteFees> for xyk_dex_types::ReferralFees {
+impl From<&QuoteFees> for intear_dex_types::ReferralFees {
     fn from(fees: &QuoteFees) -> Self {
         Self(fees.0.clone())
     }
@@ -155,10 +162,22 @@ impl FromStr for QuoteFees {
                 Ok((referrer_id, fee_fraction))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if fees.len() > MAX_REFERRERS {
+            return Err(format!("At most {MAX_REFERRERS} accounts can be paid"));
+        }
         let referral_fees = QuoteFees(fees);
-        xyk_dex_types::ReferralFees::from(&referral_fees)
-            .validate()
-            .map_err(|error| error.to_string())?;
+        let total_fee_fraction: FeeFraction = referral_fees
+            .0
+            .iter()
+            .map(|(_, fee_fraction)| fee_fraction)
+            .sum();
+        if total_fee_fraction > MAX_REFERRAL_FEE_FRACTION {
+            return Err(format!(
+                "Referral fees must add up to at most {}",
+                (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION) / BigDecimal::from(FULL_FEE_FRACTION))
+                    .normalized()
+            ));
+        }
         Ok(referral_fees)
     }
 }

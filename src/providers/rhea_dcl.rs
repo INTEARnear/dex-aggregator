@@ -1,19 +1,19 @@
 use std::{future::Future, pin::Pin};
 
+use intear_dex_types::FULL_FEE_FRACTION;
 use near_min_api::types::{AccountId, Action, FunctionCallAction, NearGas, NearToken};
 use pathfinder::{
     dcl::{self, RouteApiResponse},
     MaxHops, QuoteAmount,
 };
 use tracing::info;
-use xyk_dex_types::FULL_FEE_FRACTION;
 
 use crate::{
     shared_utils::{
         convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
-        deposit_storage_on_contract_if_needed, get_slippage, needs_storage_deposit_for_contract,
-        payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
-        swap_call_gas, total_fee_amount, Mainnet, NetworkView, ReferrerFee, DEFAULT_REFERRER_ID,
+        deposit_storage_on_contract_if_needed, get_slippage, payable_referral_fees, price_raw,
+        referrer_fees_of_total, register_input_in_wallet, swap_call_gas, total_fee_amount, Mainnet,
+        NetworkView, ReferrerFee, DEFAULT_REFERRER_ID,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -73,11 +73,7 @@ async fn route(
 
     // The fees come out of the input. Exact-in quotes the rest of it, exact-out adds the fees on
     // top of the estimated input once it's quoted.
-    let nep141_in = &token_in;
-    let referral_fees = payable_referral_fees(&request.fees, |referrer_id| async move {
-        !needs_storage_deposit_for_contract(network, &referrer_id, nep141_in).await
-    })
-    .await;
+    let referral_fees = payable_referral_fees(&request.fees);
     let exact_in_fees = match request.amount {
         Amount::AmountIn(amount_in) => referrer_fees_of_total(&referral_fees, amount_in),
         Amount::AmountOut(_) => Vec::new(),
@@ -198,6 +194,7 @@ async fn route(
     }];
 
     let (input_to_nep141, send_fees, input_nep141) = convert_to_nep141_with_fees(
+        network,
         &request.token_in,
         request.trader_account_id.clone(),
         amount_in + total_fee_amount(&fees),
@@ -250,10 +247,9 @@ mod tests {
     use super::*;
     use crate::shared_utils::{
         create_fee_ft_transfer_action, create_storage_deposit_action_for_contract,
-        create_wrap_action, TestNetworkView, WRAP_NEAR,
+        create_wrap_action, TestNetworkView, AGGREGATOR_FEE_RECEIVER_ID, WRAP_NEAR,
     };
     use crate::types::Slippage;
-    use xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestRheaDclQuotes {
@@ -702,7 +698,7 @@ mod tests {
                 )
                 .with_storage(
                     WRAP_NEAR,
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -751,7 +747,7 @@ mod tests {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
                         create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 4),
-                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 1),
                     ],
                     is_fee_transaction: true,
                 },
@@ -785,7 +781,7 @@ mod tests {
                 )
                 .with_storage(
                     WRAP_NEAR,
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -810,7 +806,7 @@ mod tests {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
                         create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
                     ],
                     is_fee_transaction: true,
                 },
@@ -850,7 +846,7 @@ mod tests {
                 )
                 .with_storage(
                     WRAP_NEAR,
-                    PROTOCOL_FEE_RECEIVER_ID.as_str(),
+                    AGGREGATOR_FEE_RECEIVER_ID.as_str(),
                     "0.00125 NEAR".parse().unwrap(),
                     NearToken::from_yoctonear(0),
                 ),
@@ -878,7 +874,7 @@ mod tests {
                 actions: vec![
                     create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 1),
                     create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 2),
-                    create_fee_ft_transfer_action(&PROTOCOL_FEE_RECEIVER_ID.to_owned(), 1),
+                    create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 1),
                 ],
                 is_fee_transaction: true,
             },]

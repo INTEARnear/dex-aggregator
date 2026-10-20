@@ -327,13 +327,6 @@ pub struct Hop {
     position_out: usize,
 }
 
-impl Hop {
-    /// Position of the input token in the pool's tokens
-    pub fn position_in(&self) -> usize {
-        self.position_in
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Route {
     pub hops: SmallVec<[Hop; 4]>,

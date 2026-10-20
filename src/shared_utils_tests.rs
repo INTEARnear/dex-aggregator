@@ -371,9 +371,14 @@ async fn intear_registration_pays_what_the_contract_charges() {
         let account_id = account(account_id);
         async move {
             registration_deposit(
-                &intear_registration(&network, &account_id, &asset_ids.iter().collect::<Vec<_>>())
-                    .await
-                    .unwrap(),
+                &intear_registration(
+                    &network,
+                    &account_id,
+                    &asset_ids.iter().collect::<Vec<_>>(),
+                    &[],
+                )
+                .await
+                .unwrap(),
             )
         }
     };
@@ -2080,53 +2085,36 @@ fn estimated_gas_usage_excludes_swap_margin() {
     );
 }
 
-#[tokio::test]
-async fn protocol_gets_its_share_of_each_payable_referral_fee() {
-    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"ref2.near":0.02,"cant.near":0.01}"#
+#[test]
+fn aggregator_gets_its_share_of_each_referral_fee() {
+    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"ref2.near":0.02,"zero.near":0}"#
         .parse()
         .unwrap();
-    let payable = payable_referral_fees(&referral_fees, |account_id| async move {
-        account_id.as_str() != "cant.near"
-    })
-    .await;
-    // 80% of each paid fee to its referrer, 20% of both together to the protocol, and nothing
-    // of the fee that isn't paid
+    // 80% of each fee to its referrer, 20% of all of them together to the aggregator, and nothing
+    // for the fee of 0
     assert_eq!(
-        payable.0,
+        payable_referral_fees(&referral_fees).0,
         vec![
             ("ref.near".parse().unwrap(), 8_000),
             ("ref2.near".parse().unwrap(), 16_000),
-            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 6_000),
+            (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 6_000),
         ]
     );
 }
 
-#[tokio::test]
-async fn protocol_share_adds_to_the_protocol_as_a_referrer() {
+#[test]
+fn aggregator_share_adds_to_the_aggregator_as_a_referrer() {
     let referral_fees: QuoteFees = r#"{"ref.near":0.01,"dex-aggregator.intear.near":0.01}"#
         .parse()
         .unwrap();
-    let payable = payable_referral_fees(&referral_fees, |_| async { true }).await;
     assert_eq!(
-        payable.0,
-        // Referrers come sorted by account ID
+        payable_referral_fees(&referral_fees).0,
+        // Referrers come sorted by account ID. The aggregator's 80% and the 20% of both fees
         vec![
-            ("dex-aggregator.intear.near".parse().unwrap(), 8_000),
+            (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 12_000),
             ("ref.near".parse().unwrap(), 8_000),
-            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 4_000),
         ]
     );
-}
-
-#[tokio::test]
-async fn protocol_share_is_not_charged_when_the_protocol_cant_receive() {
-    let referral_fees: QuoteFees = r#"{"ref.near":0.01}"#.parse().unwrap();
-    let payable = payable_referral_fees(&referral_fees, |account_id| async move {
-        account_id != xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID
-    })
-    .await;
-    // The referrer still only gets its 80%
-    assert_eq!(payable.0, vec![("ref.near".parse().unwrap(), 8_000)]);
 }
 
 #[test]
