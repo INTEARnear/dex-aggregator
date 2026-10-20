@@ -2033,7 +2033,7 @@ fn fee_transactions_amount_adds_up_fee_transfers_only() {
             receiver_id: account("ft"),
             actions: vec![
                 create_fee_ft_transfer_action(&account("ref.near"), 8),
-                create_fee_ft_transfer_action(&account("plach.intear.near"), 2),
+                create_fee_ft_transfer_action(&account("dex-aggregator.intear.near"), 2),
             ],
             is_fee_transaction: true,
         },
@@ -2103,14 +2103,17 @@ async fn protocol_gets_its_share_of_each_payable_referral_fee() {
 
 #[tokio::test]
 async fn protocol_share_adds_to_the_protocol_as_a_referrer() {
-    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"plach.intear.near":0.01}"#.parse().unwrap();
+    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"dex-aggregator.intear.near":0.01}"#
+        .parse()
+        .unwrap();
     let payable = payable_referral_fees(&referral_fees, |_| async { true }).await;
     assert_eq!(
         payable.0,
         // Referrers come sorted by account ID
         vec![
-            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 12_000),
+            ("dex-aggregator.intear.near".parse().unwrap(), 8_000),
             ("ref.near".parse().unwrap(), 8_000),
+            (xyk_dex_types::PROTOCOL_FEE_RECEIVER_ID.to_owned(), 4_000),
         ]
     );
 }
