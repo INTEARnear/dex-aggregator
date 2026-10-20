@@ -120,13 +120,18 @@ pub fn create_rhea_withdraw_action(
     }))
 }
 
-pub fn create_fee_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -> Action {
+/// The memo names the swap's referrer, for DEX backend to attribute the fee to
+pub fn create_fee_ft_transfer_action(
+    receiver_id: &AccountId,
+    amount: Balance,
+    swap_referrer_id: &str,
+) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "ft_transfer".to_string(),
         args: serde_json::to_vec(&serde_json::json!({
             "receiver_id": receiver_id,
             "amount": amount.to_string(),
-            "memo": "Trading fee",
+            "memo": format!("Trading fee ({swap_referrer_id})"),
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(10)),
@@ -134,10 +139,12 @@ pub fn create_fee_ft_transfer_action(receiver_id: &AccountId, amount: Balance) -
     }))
 }
 
+/// The memo names the swap's referrer, for DEX backend to attribute the fee to
 pub fn create_rhea_fee_mft_transfer_action(
     token_id: &AccountId,
     receiver_id: &AccountId,
     amount: Balance,
+    swap_referrer_id: &str,
 ) -> Action {
     Action::FunctionCall(Box::new(FunctionCallAction {
         method_name: "mft_transfer".to_string(),
@@ -145,7 +152,7 @@ pub fn create_rhea_fee_mft_transfer_action(
             "token_id": token_id,
             "receiver_id": receiver_id,
             "amount": amount.to_string(),
-            "memo": "Trading fee",
+            "memo": format!("Trading fee ({swap_referrer_id})"),
         }))
         .unwrap(),
         gas: Gas(NearGas::from_tgas(10)),
@@ -338,6 +345,7 @@ pub async fn convert_to_nep141_with_fees(
     trader_account_id: Option<AccountId>,
     total: Balance,
     fees: &[ReferrerFee],
+    swap_referrer_id: &str,
 ) -> Option<(
     Vec<ExecutionInstruction>,
     Vec<ExecutionInstruction>,
@@ -356,10 +364,9 @@ pub async fn convert_to_nep141_with_fees(
                 );
             }
         }
-        actions.extend(
-            fees.iter()
-                .map(|fee| create_fee_ft_transfer_action(&fee.referrer_id, fee.amount)),
-        );
+        actions.extend(fees.iter().map(|fee| {
+            create_fee_ft_transfer_action(&fee.referrer_id, fee.amount, swap_referrer_id)
+        }));
         vec![ExecutionInstruction::NearTransaction {
             receiver_id: nep141.clone(),
             actions,

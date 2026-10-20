@@ -78,6 +78,11 @@ async fn route(
         Amount::AmountIn(amount_in) => referrer_fees_of_total(&referral_fees, amount_in),
         Amount::AmountOut(_) => Vec::new(),
     };
+    let swap_referrer_id = request
+        .referrer_id
+        .as_ref()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string());
 
     let response = quotes
         .find_path(dcl::Request {
@@ -116,7 +121,7 @@ async fn route(
                     "output_token": token_out,
                     "min_output_amount": route.min_amount_out.0.to_string(),
                     "skip_unwrap_near": !unwrapping_near,
-                    "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                    "referral_id": swap_referrer_id,
                 }
             });
             (
@@ -142,7 +147,7 @@ async fn route(
                     "output_token": token_out,
                     "output_amount": route.amount_out.0.to_string(),
                     "skip_unwrap_near": !unwrapping_near,
-                    "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                    "referral_id": swap_referrer_id,
                 }
             });
             // Each referrer's share of the estimated input with all fees, not the worst case, so
@@ -199,6 +204,7 @@ async fn route(
         request.trader_account_id.clone(),
         amount_in + total_fee_amount(&fees),
         &fees,
+        &swap_referrer_id,
     )
     .await?;
     let token_output = if unwrapping_near {
@@ -746,8 +752,16 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 4),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 1),
+                        create_fee_ft_transfer_action(
+                            &"ref.near".parse().unwrap(),
+                            4,
+                            DEFAULT_REFERRER_ID
+                        ),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            1,
+                            DEFAULT_REFERRER_ID
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -805,8 +819,16 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(
+                            &"ref.near".parse().unwrap(),
+                            8,
+                            DEFAULT_REFERRER_ID
+                        ),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            2,
+                            DEFAULT_REFERRER_ID
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -872,9 +894,21 @@ mod tests {
             [ExecutionInstruction::NearTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
                 actions: vec![
-                    create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 1),
-                    create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 2),
-                    create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 1),
+                    create_fee_ft_transfer_action(
+                        &"ref.near".parse().unwrap(),
+                        1,
+                        DEFAULT_REFERRER_ID
+                    ),
+                    create_fee_ft_transfer_action(
+                        &"ref2.near".parse().unwrap(),
+                        2,
+                        DEFAULT_REFERRER_ID
+                    ),
+                    create_fee_ft_transfer_action(
+                        &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                        1,
+                        DEFAULT_REFERRER_ID
+                    ),
                 ],
                 is_fee_transaction: true,
             },]

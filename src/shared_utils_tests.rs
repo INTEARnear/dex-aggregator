@@ -2031,14 +2031,22 @@ fn fee_transactions_amount_adds_up_fee_transfers_only() {
     let execution_instructions = vec![
         ExecutionInstruction::NearTransaction {
             receiver_id: account("ft"),
-            actions: vec![create_fee_ft_transfer_action(&account("trader.near"), 1000)],
+            actions: vec![create_fee_ft_transfer_action(
+                &account("trader.near"),
+                1000,
+                "app.near",
+            )],
             is_fee_transaction: false,
         },
         ExecutionInstruction::NearTransaction {
             receiver_id: account("ft"),
             actions: vec![
-                create_fee_ft_transfer_action(&account("ref.near"), 8),
-                create_fee_ft_transfer_action(&account("dex-aggregator.intear.near"), 2),
+                create_fee_ft_transfer_action(&account("ref.near"), 8, "app.near"),
+                create_fee_ft_transfer_action(
+                    &account("dex-aggregator.intear.near"),
+                    2,
+                    "app.near",
+                ),
             ],
             is_fee_transaction: true,
         },
@@ -2118,7 +2126,7 @@ fn aggregator_share_adds_to_the_aggregator_as_a_referrer() {
 }
 
 #[test]
-fn fee_transfers_have_a_trading_fee_memo() {
+fn fee_transfers_have_a_trading_fee_memo_naming_the_swap_referrer() {
     let args = |action: Action| match action {
         Action::FunctionCall(call) => {
             serde_json::from_slice::<serde_json::Value>(&call.args).unwrap()
@@ -2126,20 +2134,29 @@ fn fee_transfers_have_a_trading_fee_memo() {
         _ => panic!("Not a function call"),
     };
     assert_eq!(
-        args(create_fee_ft_transfer_action(&account("ref.near"), 8)),
-        serde_json::json!({"receiver_id": "ref.near", "amount": "8", "memo": "Trading fee"})
+        args(create_fee_ft_transfer_action(
+            &account("ref.near"),
+            8,
+            "app.near"
+        )),
+        serde_json::json!({
+            "receiver_id": "ref.near",
+            "amount": "8",
+            "memo": "Trading fee (app.near)",
+        })
     );
     assert_eq!(
         args(create_rhea_fee_mft_transfer_action(
             &account("ft"),
             &account("ref.near"),
-            8
+            8,
+            "app.near",
         )),
         serde_json::json!({
             "token_id": "ft",
             "receiver_id": "ref.near",
             "amount": "8",
-            "memo": "Trading fee",
+            "memo": "Trading fee (app.near)",
         })
     );
 }

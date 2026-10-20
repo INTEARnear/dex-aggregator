@@ -80,6 +80,12 @@ async fn route(
     let fast_path = matches!(request.token_in, TokenId::Nep141OnRhea(_))
         && matches!(request.token_out, TokenId::Nep141OnRhea(_));
 
+    let swap_referrer_id = request
+        .referrer_id
+        .as_ref()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string());
+
     let referrer_fees =
         referrer_fees_of_total(&payable_referral_fees(&request.fees), exact_amount_in);
     // The fees come out of the input, so the rest is what's quoted and swapped
@@ -151,7 +157,7 @@ async fn route(
             method_name: "swap".to_string(),
             args: serde_json::to_vec(&serde_json::json!({
                 "actions": actions,
-                "referral_id": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                "referral_id": swap_referrer_id,
                 "skip_degen_price_sync": true,
             }))
             .unwrap(),
@@ -163,7 +169,14 @@ async fn route(
             rhea_fee_receivers_registration(network, &token_in, &referrer_fees).await?;
         let fee_actions = referrer_fees
             .iter()
-            .map(|fee| create_rhea_fee_mft_transfer_action(&token_in, &fee.referrer_id, fee.amount))
+            .map(|fee| {
+                create_rhea_fee_mft_transfer_action(
+                    &token_in,
+                    &fee.referrer_id,
+                    fee.amount,
+                    &swap_referrer_id,
+                )
+            })
             .collect();
         let transactions = [
             registration_transactions,
@@ -197,7 +210,7 @@ async fn route(
                 "actions": actions,
                 "skip_degen_price_sync": true,
                 "skip_unwrap_near": !unwrapping_near,
-                "referral_id": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                "referral_id": swap_referrer_id,
             })).unwrap(),
         }))
         .unwrap(),
@@ -216,6 +229,7 @@ async fn route(
         request.trader_account_id.clone(),
         exact_amount_in,
         &referrer_fees,
+        &swap_referrer_id,
     )
     .await?;
 
@@ -1320,8 +1334,12 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
                     actions: vec![
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8, "ref.near"),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            2,
+                            "ref.near"
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1368,8 +1386,12 @@ mod tests {
                 ExecutionInstruction::NearTransaction {
                     receiver_id: "ft".parse().unwrap(),
                     actions: vec![
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8, "ref.near"),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            2,
+                            "ref.near"
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1413,8 +1435,12 @@ mod tests {
                             &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                             true,
                         ),
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 2),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8, "ref.near"),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            2,
+                            "ref.near"
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1469,11 +1495,13 @@ mod tests {
                         &"ft".parse().unwrap(),
                         &"ref.near".parse().unwrap(),
                         8,
+                        "ref.near",
                     ),
                     create_rhea_fee_mft_transfer_action(
                         &"ft".parse().unwrap(),
                         &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                         2,
+                        "ref.near",
                     ),
                 ],
                 is_fee_transaction: false,
@@ -1520,11 +1548,13 @@ mod tests {
                     &"ft".parse().unwrap(),
                     &"ref.near".parse().unwrap(),
                     8,
+                    "ref.near",
                 ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                     2,
+                    "ref.near",
                 ),
             ]
         );
@@ -1586,10 +1616,22 @@ mod tests {
                             &"nostorage.near".parse().unwrap(),
                             true,
                         ),
-                        create_fee_ft_transfer_action(&"nostorage.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                        create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                        create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 8),
+                        create_fee_ft_transfer_action(
+                            &"nostorage.near".parse().unwrap(),
+                            8,
+                            "ref.near"
+                        ),
+                        create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8, "ref.near"),
+                        create_fee_ft_transfer_action(
+                            &"ref2.near".parse().unwrap(),
+                            16,
+                            "ref.near"
+                        ),
+                        create_fee_ft_transfer_action(
+                            &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                            8,
+                            "ref.near"
+                        ),
                     ],
                     is_fee_transaction: true,
                 },
@@ -1642,9 +1684,13 @@ mod tests {
             &ExecutionInstruction::NearTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
                 actions: vec![
-                    create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8),
-                    create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16),
-                    create_fee_ft_transfer_action(&AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 6),
+                    create_fee_ft_transfer_action(&"ref.near".parse().unwrap(), 8, "ref.near"),
+                    create_fee_ft_transfer_action(&"ref2.near".parse().unwrap(), 16, "ref.near"),
+                    create_fee_ft_transfer_action(
+                        &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
+                        6,
+                        "ref.near"
+                    ),
                 ],
                 is_fee_transaction: true,
             }
@@ -1689,21 +1735,25 @@ mod tests {
                     &"ft".parse().unwrap(),
                     &"ref.near".parse().unwrap(),
                     8,
+                    "ref.near",
                 ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &"ref2.near".parse().unwrap(),
                     16,
+                    "ref.near",
                 ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &"unregistered.near".parse().unwrap(),
                     8,
+                    "ref.near",
                 ),
                 create_rhea_fee_mft_transfer_action(
                     &"ft".parse().unwrap(),
                     &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                     8,
+                    "ref.near",
                 ),
             ]
         );
