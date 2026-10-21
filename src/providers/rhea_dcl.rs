@@ -424,7 +424,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(33_468_814_297_143),
+                estimated_gas_paid: NearGas::from_gas(29_328_674_297_143),
             })
         );
     }
@@ -491,7 +491,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Near,
-                estimated_gas_paid: NearGas::from_gas(30_531_484_930_531),
+                estimated_gas_paid: NearGas::from_gas(26_391_344_930_531),
             })
         );
     }
@@ -579,7 +579,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(33_469_013_975_739),
+                estimated_gas_paid: NearGas::from_gas(29_328_873_975_739),
             })
         );
     }
@@ -693,7 +693,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(29_950_495_858_912),
+                estimated_gas_paid: NearGas::from_gas(25_950_495_858_912),
             })
         );
     }
