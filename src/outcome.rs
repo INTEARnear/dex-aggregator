@@ -590,6 +590,8 @@ struct IntearDexSwap {
     amount_in: U128,
     amount_out: U128,
     trader: AccountId,
+    #[serde(default)]
+    referral_fees_paid: Vec<(AccountId, U128)>,
 }
 
 #[derive(Deserialize)]
@@ -624,7 +626,12 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
                 Some(LoggedSwap {
                     token_in: TokenId::TokenOnIntearDex(swap.request.asset_in.parse().ok()?),
                     token_out: TokenId::TokenOnIntearDex(swap.request.asset_out.parse().ok()?),
-                    amount_in: swap.amount_in.0,
+                    amount_in: swap
+                        .referral_fees_paid
+                        .iter()
+                        .fold(swap.amount_in.0, |amount_in, (_, fee)| {
+                            amount_in.saturating_add(fee.0)
+                        }),
                     amount_out: swap.amount_out.0,
                 })
             })
