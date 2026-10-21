@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
-    types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash, NearToken},
+    types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash, NearGas, NearToken},
     utils::dec_format,
 };
 use num_traits::{ToPrimitive, Zero};
@@ -279,6 +279,9 @@ pub struct Route {
     /// provided `Amount::AmountOut`. The estimated amounts already include it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discount: Option<Amount>,
+    /// Gas the execution instructions are expected to cost.
+    #[serde(skip)]
+    pub estimated_gas_paid: NearGas,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]

@@ -2055,7 +2055,7 @@ fn fee_transactions_amount_adds_up_fee_transfers_only() {
 }
 
 #[test]
-fn estimated_gas_usage_excludes_swap_margin() {
+fn estimated_gas_paid_excludes_swap_margin() {
     let call = |gas: NearGas| {
         Action::FunctionCall(Box::new(FunctionCallAction {
             method_name: "swap".to_string(),
@@ -2079,8 +2079,8 @@ fn estimated_gas_usage_excludes_swap_margin() {
     // 5.5 TGas predicted for a swap, attached as swap_call_gas does with 10 TGas reserved
     let attached = swap_call_gas(NearGas::from_ggas(5_500), NearGas::from_tgas(10), false).0;
     assert_eq!(
-        estimated_gas_usage(&transaction(attached)),
-        cost(fees + attached.as_gas() - NearGas::from_tgas(18).as_gas())
+        estimated_gas_paid(&transaction(attached), None),
+        NearGas::from_gas(fees + attached.as_gas() - NearGas::from_tgas(18).as_gas())
     );
     assert_eq!(
         max_gas_cost(&transaction(attached)),
@@ -2088,8 +2088,68 @@ fn estimated_gas_usage_excludes_swap_margin() {
     );
     // Less gas than the margin burns only fees
     assert_eq!(
-        estimated_gas_usage(&transaction(NearGas::from_tgas(10))),
-        cost(fees)
+        estimated_gas_paid(&transaction(NearGas::from_tgas(10)), None),
+        NearGas::from_gas(fees)
+    );
+}
+
+#[test]
+fn estimated_gas_paid_of_swap_call() {
+    let swap_call = Action::FunctionCall(Box::new(FunctionCallAction {
+        method_name: "ft_transfer_call".to_string(),
+        args: vec![],
+        gas: swap_call_gas(NearGas::from_tgas(10), NearGas::from_tgas(60), true),
+        deposit: NearToken::from_yoctonear(1),
+    }));
+    let instructions = [
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("wrap.near"),
+            actions: vec![create_wrap_action(NearToken::from_near(1))],
+            is_fee_transaction: false,
+        },
+        ExecutionInstruction::NearTransaction {
+            receiver_id: account("wrap.near"),
+            actions: vec![swap_call.clone()],
+            is_fee_transaction: false,
+        },
+    ];
+    let wrap_fees = FUNCTION_CALL_FEE_GAS.as_gas()
+        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * ("near_deposit".len() + "{}".len()) as u64;
+    let swap_call_fees = FUNCTION_CALL_FEE_GAS.as_gas()
+        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * "ft_transfer_call".len() as u64;
+    let gas_paid = |trader_account_id: &str, near_transfer_gas: NearGas| {
+        let trader_account_id = account(trader_account_id);
+        let swap_call_gas_paid = swap_call_gas_paid(
+            NearGas::from_tgas(10),
+            NearGas::from_tgas(5),
+            1,
+            Some(&trader_account_id),
+        );
+        assert_eq!(
+            swap_call_gas_paid,
+            NearGas::from_gas(NearGas::from_tgas(15).as_gas() + near_transfer_gas.as_gas())
+        );
+        // Wrapping goes in the swap's transaction
+        assert_eq!(
+            estimated_gas_paid(&instructions, Some((&swap_call, swap_call_gas_paid))),
+            NearGas::from_gas(
+                TRANSACTION_FEE_GAS.as_gas()
+                    + wrap_fees
+                    + swap_call_fees
+                    + swap_call_gas_paid.as_gas()
+            )
+        );
+    };
+    // Named and NEAR implicit accounts as measured on mainnet
+    gas_paid("trader.near", NearGas::from_gas(223_182_562_500));
+    gas_paid(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        NearGas::from_gas(7_524_947_687_500),
+    );
+    // An ETH implicit account is charged for creating the account, but not for its key
+    gas_paid(
+        "0x0000000000000000000000000000000000000000",
+        NearGas::from_gas(7_423_182_562_500),
     );
 }
 

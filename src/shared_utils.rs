@@ -15,8 +15,8 @@ use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
-        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, CryptoHash,
-        Finality, FunctionCallAction, Gas, NearGas, NearToken,
+        near_account_id::AccountType, AccountId, AccountIdRef, Action, Balance, BlockHeight,
+        BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -77,6 +77,52 @@ pub fn swap_call_gas(swap_gas: NearGas, reserved: NearGas, ft_transfer_call: boo
         return Gas(MAX_SWAP_GAS);
     }
     Gas(gas)
+}
+
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L43-L47
+const ACTION_RECEIPT_EXECUTION_GAS: NearGas = NearGas::from_gas(108_059_500_000);
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L88-L92
+const TRANSFER_EXECUTION_GAS: NearGas = NearGas::from_gas(115_123_062_500);
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/85.yaml#L16-L27
+const CREATE_ACCOUNT_EXECUTION_GAS: NearGas = NearGas::from_gas(7_200_000_000_000);
+/// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L98-L102
+const ADD_FULL_ACCESS_KEY_EXECUTION_GAS: NearGas = NearGas::from_gas(101_765_125_000);
+
+/// Share of the swap gas the pathfinder predicts for dexes to burn compared to what is needed to be attached.
+pub const SWAP_GAS_BURNT_PERCENT: u64 = 80;
+
+fn near_transfer_gas(trader_account_id: Option<&AccountId>) -> NearGas {
+    let account_creation_gas =
+        match trader_account_id.map(|account_id| account_id.get_account_type()) {
+            Some(AccountType::NearImplicitAccount) => {
+                CREATE_ACCOUNT_EXECUTION_GAS.as_gas() + ADD_FULL_ACCESS_KEY_EXECUTION_GAS.as_gas()
+            }
+            Some(AccountType::EthImplicitAccount | AccountType::NearDeterministicAccount) => {
+                CREATE_ACCOUNT_EXECUTION_GAS.as_gas()
+            }
+            Some(AccountType::NamedAccount) | None => 0,
+        };
+    NearGas::from_gas(
+        ACTION_RECEIPT_EXECUTION_GAS.as_gas()
+            + TRANSFER_EXECUTION_GAS.as_gas()
+            + account_creation_gas,
+    )
+}
+
+/// Gas a swap call is expected to cost with all the receipts it causes: `swap_gas` the DEX is
+/// predicted to burn for the swaps, `overhead` for the rest of the DEX's and the tokens' work, and
+/// `near_transfers` of NEAR to the trader. Its refunds burn gas too, but nobody pays for it.
+pub fn swap_call_gas_paid(
+    swap_gas: NearGas,
+    overhead: NearGas,
+    near_transfers: u64,
+    trader_account_id: Option<&AccountId>,
+) -> NearGas {
+    NearGas::from_gas(
+        swap_gas.as_gas()
+            + overhead.as_gas()
+            + near_transfers * near_transfer_gas(trader_account_id).as_gas(),
+    )
 }
 
 pub fn create_wrap_action(amount: NearToken) -> Action {
@@ -1869,12 +1915,19 @@ pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToke
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
 }
 
-/// What the execution instructions are expected to cost in gas, with unused margin refunded
-pub fn estimated_gas_usage(execution_instructions: &[ExecutionInstruction]) -> NearToken {
-    let gas = total_gas(execution_instructions, |call| {
-        call.gas.as_gas().saturating_sub(SWAP_GAS_MARGIN.as_gas())
-    });
-    pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
+/// Gas the execution instructions are expected to cost: the fees of their transactions and function
+/// calls, and what each function call burns. `swap_call` costs the gas paired with it, other calls
+/// burn what's attached to them but the swap margin. Refunds of unused gas burn gas too, but nobody
+/// pays for it.
+pub fn estimated_gas_paid(
+    execution_instructions: &[ExecutionInstruction],
+    swap_call: Option<(&Action, NearGas)>,
+) -> NearGas {
+    let transactions = optimize_execution_instructions(execution_instructions.to_vec());
+    NearGas::from_gas(total_gas(&transactions, |call| match swap_call {
+        Some((Action::FunctionCall(swap), gas_paid)) if **swap == *call => gas_paid.as_gas(),
+        _ => call.gas.as_gas().saturating_sub(SWAP_GAS_MARGIN.as_gas()),
+    }))
 }
 
 /// What the fee transactions of a route transfer, all in the NEP-141 of its input token

@@ -1,5 +1,7 @@
 use std::{future::Future, pin::Pin};
 
+use near_min_api::types::NearGas;
+
 use crate::{shared_utils::convert_to_nep141, Amount, DexId, Provider, Route, SwapRequest};
 
 pub struct WrapProvider;
@@ -30,6 +32,8 @@ impl Provider for WrapProvider {
                     deprecated_needs_unwrap_always_false: false,
                     discount: None,
                     token_output: request.token_in,
+                    // main.rs adds what the conversion burns
+                    estimated_gas_paid: NearGas::from_gas(0),
                 });
             }
 

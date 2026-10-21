@@ -11,9 +11,10 @@ use tracing::info;
 use crate::{
     shared_utils::{
         convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
-        deposit_storage_on_contract_if_needed, get_slippage, payable_referral_fees, price_raw,
-        referrer_fees_of_total, register_input_in_wallet, swap_call_gas, total_fee_amount, Mainnet,
-        NetworkView, ReferrerFee, DEFAULT_REFERRER_ID,
+        deposit_storage_on_contract_if_needed, estimated_gas_paid, get_slippage,
+        payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
+        swap_call_gas, swap_call_gas_paid, total_fee_amount, Mainnet, NetworkView, ReferrerFee,
+        DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -23,6 +24,7 @@ pub struct RheaDclProvider;
 
 pub const RHEA_DCL_CONTRACT_ID: &str = "dclv2.ref-labs.near";
 const RESERVED_GAS: NearGas = NearGas::from_tgas(62);
+const SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(7_760);
 
 trait RheaDclQuotes: Send + Sync {
     fn find_path(
@@ -194,7 +196,7 @@ async fn route(
     }));
     let swap_transactions = vec![ExecutionInstruction::NearTransaction {
         receiver_id: token_in,
-        actions: vec![swap_action],
+        actions: vec![swap_action.clone()],
         is_fee_transaction: false,
     }];
 
@@ -234,6 +236,19 @@ async fn route(
         send_fees,
     ]
     .concat();
+    // Unwrapped output is sent to the trader as NEAR
+    let estimated_gas_paid = estimated_gas_paid(
+        &transactions,
+        Some((
+            &swap_action,
+            swap_call_gas_paid(
+                NearGas::from_gas(swap_gas.as_gas() * SWAP_GAS_BURNT_PERCENT / 100),
+                SWAP_OVERHEAD_GAS,
+                u64::from(unwrapping_near),
+                request.trader_account_id.as_ref(),
+            ),
+        )),
+    );
     Some(Route {
         dex_id: DexId::RheaDcl,
         estimated_amount,
@@ -243,6 +258,7 @@ async fn route(
         deprecated_needs_unwrap_always_false: false,
         discount: None,
         token_output,
+        estimated_gas_paid,
     })
 }
 
@@ -408,6 +424,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
+                estimated_gas_paid: NearGas::from_gas(33_468_814_297_143),
             })
         );
     }
@@ -474,6 +491,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Near,
+                estimated_gas_paid: NearGas::from_gas(30_531_484_930_531),
             })
         );
     }
@@ -561,6 +579,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
+                estimated_gas_paid: NearGas::from_gas(33_469_013_975_739),
             })
         );
     }
@@ -674,6 +693,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
+                estimated_gas_paid: NearGas::from_gas(29_950_495_858_912),
             })
         );
     }

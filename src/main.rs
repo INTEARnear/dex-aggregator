@@ -10,7 +10,10 @@ use axum::{
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
-use near_min_api::{types::Finality, QueryFinality, RpcClient};
+use near_min_api::{
+    types::{Finality, NearGas},
+    QueryFinality, RpcClient,
+};
 use std::{
     env,
     future::Future,
@@ -28,7 +31,7 @@ use tracing_subscriber::FmtSubscriber;
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
-        convert_to, estimated_gas_usage, fee_transactions_amount, final_block_hash, max_gas_cost,
+        convert_to, estimated_gas_paid, fee_transactions_amount, final_block_hash, max_gas_cost,
         optimize_execution_instructions, price_raw, storage_deposits, Mainnet, RPC_CLIENT,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
@@ -277,6 +280,10 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
                     stats.estimated_amount = None;
                     continue;
                 };
+                route.estimated_gas_paid = NearGas::from_gas(
+                    route.estimated_gas_paid.as_gas()
+                        + estimated_gas_paid(&conversion, None).as_gas(),
+                );
                 route.execution_instructions.extend(conversion);
                 route.token_output = request.token_out.clone();
             }
@@ -304,7 +311,8 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         .into_iter()
         .map(|route| Quote {
             estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
-            estimated_gas_usage: estimated_gas_usage(&route.execution_instructions),
+            estimated_gas_usage: pathfinder::MIN_GAS_PRICE
+                .saturating_mul(route.estimated_gas_paid.as_gas().into()),
             storage_deposits: storage_deposits(&route.execution_instructions),
             fee_amount: fee_transactions_amount(&route.execution_instructions),
             signing: signing.clone(),
