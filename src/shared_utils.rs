@@ -14,12 +14,9 @@ use intear_dex_types::DirectWithdrawAmount;
 use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
-    types::{
-        near_account_id::AccountType, AccountId, AccountIdRef, Action, Balance, BlockHeight,
-        BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken,
-    },
-    utils::dec_format,
-    QueryFinality, RpcClient,
+    QueryFinality, RpcClient, types::{
+        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128, near_account_id::AccountType,
+    }, utils::dec_format,
 };
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
@@ -323,6 +320,12 @@ pub trait NetworkView: Send + Sync {
         account_id: &AccountId,
     ) -> impl Future<Output = Result<Balance, String>> + Send;
 
+    fn ft_lockup_balance(
+        &self,
+        lockup_id: AccountId,
+        account_id: &AccountId,
+    ) -> impl Future<Output = Result<Balance, String>> + Send;
+
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
@@ -555,6 +558,30 @@ impl NetworkView for Mainnet {
             .map_err(|err| format!("{err:?}"))
     }
 
+    async fn ft_lockup_balance(
+        &self,
+        lockup_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<Balance, String> {
+        #[derive(Debug, Clone, Deserialize)]
+        struct FtLockupAccount {
+            locked: U128,
+        }
+        
+        RPC_CLIENT
+            .call::<Option<FtLockupAccount>>(
+                lockup_id,
+                "get_account",
+                serde_json::json!({
+                    "account_id": account_id,
+                }),
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map(|account| account.map_or(0, |account| account.locked.0))
+            .map_err(|err| format!("{err:?}"))
+    }
+
     fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
         TOKEN_INFOS.read().unwrap().clone()
     }
@@ -575,6 +602,7 @@ pub(crate) struct TestNetworkView {
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
     ft_balances: HashMap<(AccountId, AccountId), Balance>,
+    ft_lockup_balances: HashMap<(AccountId, AccountId), Balance>,
     storage_balance_bounds_errors: HashSet<AccountId>,
     intear_balances: HashSet<AccountId>,
     intear_untracked_assets: HashSet<AssetId>,
@@ -593,6 +621,7 @@ impl Default for TestNetworkView {
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
             ft_balances: HashMap::new(),
+            ft_lockup_balances: HashMap::new(),
             storage_balance_bounds_errors: Default::default(),
             intear_balances: Default::default(),
             intear_untracked_assets: Default::default(),
@@ -736,6 +765,19 @@ impl TestNetworkView {
         self
     }
 
+    pub(crate) fn with_ft_lockup_balance(
+        mut self,
+        lockup_id: &str,
+        account_id: &str,
+        amount: Balance,
+    ) -> Self {
+        self.ft_lockup_balances.insert(
+            (lockup_id.parse().unwrap(), account_id.parse().unwrap()),
+            amount,
+        );
+        self
+    }
+
     #[allow(dead_code)]
     pub(crate) fn with_native_balance(mut self, account_id: &str, amount: NearToken) -> Self {
         self.native_balances
@@ -824,6 +866,18 @@ impl NetworkView for TestNetworkView {
         Ok(self
             .ft_balances
             .get(&(token_id, account_id.clone()))
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn ft_lockup_balance(
+        &self,
+        lockup_id: AccountId,
+        account_id: &AccountId,
+    ) -> Result<Balance, String> {
+        Ok(self
+            .ft_lockup_balances
+            .get(&(lockup_id, account_id.clone()))
             .copied()
             .unwrap_or(0))
     }

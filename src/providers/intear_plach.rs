@@ -96,6 +96,7 @@ fn swap_call_gas_paid_with_operations(
 pub use intear_dex_types::AssetId;
 
 const TEAR_TOKEN_ID: &str = "token.intear.near";
+const TEAR_STAKING_CONTRACT_ID: &str = "stakeyourtears.intear.near";
 const ONE_TEAR: Balance = 10u128.pow(24);
 
 const TEAR_FEE_DISCOUNTS: [(Balance, FeeFractionFraction); 3] = [
@@ -241,12 +242,17 @@ async fn route(
 
     let fee_discount = match (fee_discounter, &request.trader_account_id) {
         (Some(fee_discounter), Some(trader_account_id)) => {
-            let tear_balance = network
-                .ft_balance(TEAR_TOKEN_ID.parse().unwrap(), trader_account_id)
-                .await
-                .inspect_err(|e| info!("No TEAR balance to discount fees by: {e}"))
-                .ok()?;
-            tear_fee_discount(tear_balance).map(|fee_discount| (fee_discounter, fee_discount))
+            let (tear_balance, staked_tear) = tokio::try_join!(
+                network.ft_balance(TEAR_TOKEN_ID.parse().unwrap(), trader_account_id),
+                network.ft_lockup_balance(
+                    TEAR_STAKING_CONTRACT_ID.parse().unwrap(),
+                    trader_account_id
+                ),
+            )
+            .inspect_err(|e| info!("No TEAR holdings to discount fees by: {e}"))
+            .ok()?;
+            tear_fee_discount(tear_balance + staked_tear)
+                .map(|fee_discount| (fee_discounter, fee_discount))
         }
         _ => None,
     };
@@ -889,6 +895,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(route.discount, None);
+    }
+
+    #[tokio::test]
+    async fn fee_discount_counts_staked_tear() {
+        use near_min_api::types::near_crypto::KeyType;
+
+        let fee_discounter = FeeDiscounter {
+            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
+        };
+        let route = route(
+            SwapRequest {
+                token_in: TokenId::Near,
+                token_out: TokenId::Nep141("ft".parse().unwrap()),
+                amount: Amount::AmountIn(100),
+                slippage: Slippage::Fixed {
+                    slippage: "0.01".parse().unwrap(),
+                },
+                dexes: None,
+                trader_account_id: Some("trader.near".parse().unwrap()),
+                signing_public_key: None,
+                referrer_id: None,
+                fees: Default::default(),
+            },
+            &TestNetworkView::default()
+                .with_test_prices()
+                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 400 * ONE_TEAR)
+                .with_ft_lockup_balance(TEAR_STAKING_CONTRACT_ID, "trader.near", 600 * ONE_TEAR),
+            &TestPlachQuotes::default(),
+            Some(&fee_discounter),
+        )
+        .await
+        .unwrap();
+        // The 25% discount of 1,000 TEAR, as `signs_fee_discount` gets from the wallet alone
+        assert_eq!(
+            serde_json::to_value(&route).unwrap()["discount"],
+            serde_json::json!({ "amount_out": "5" })
+        );
     }
 
     #[tokio::test]
