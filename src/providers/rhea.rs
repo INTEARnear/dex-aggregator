@@ -9,11 +9,12 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, convert_to_nep141_with_fees, create_rhea_fee_mft_transfer_action,
-        deposit_storage_if_needed, estimated_gas_paid, get_slippage, payable_referral_fees,
-        price_raw, referrer_fees_of_total, register_input_in_wallet,
-        rhea_fee_receivers_registration, rhea_registration, swap_call_gas, swap_call_gas_paid,
-        total_fee_amount, Mainnet, NetworkView, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
+        base_token, convert_to_nep141, convert_to_nep141_with_fees,
+        create_rhea_fee_mft_transfer_action, deposit_storage_if_needed, estimated_gas_paid,
+        get_slippage, payable_referral_fees, price_raw, referrer_fees_of_total,
+        register_input_in_wallet, rhea_fee_receivers_registration, rhea_registration,
+        swap_call_gas, swap_call_gas_paid, total_fee_amount, BaseTokenId, Mainnet, NetworkView,
+        DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -67,8 +68,8 @@ async fn route(
     let slippage = get_slippage(
         network,
         request.slippage,
-        &request.token_in,
-        &request.token_out,
+        &base_token(&request.token_in).unwrap(),
+        &base_token(&request.token_out).unwrap(),
     );
 
     let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
@@ -100,8 +101,8 @@ async fn route(
             amount_in: swap_amount_in,
             max_hops: MaxHops::Four,
             slippage,
-            near_price_raw: price_raw(network, &TokenId::Near)?,
-            token_out_price_raw: price_raw(network, &request.token_out)?,
+            near_price_raw: price_raw(network, &BaseTokenId::Near)?,
+            token_out_price_raw: price_raw(network, &base_token(&request.token_out).unwrap())?,
         })
         .await?;
 

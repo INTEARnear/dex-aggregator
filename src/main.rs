@@ -31,13 +31,14 @@ use tracing_subscriber::FmtSubscriber;
 use crate::{
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
-        convert_to, estimated_gas_paid, fee_transactions_amount, final_block_hash, max_gas_cost,
-        optimize_execution_instructions, price_raw, storage_deposits, Mainnet, RPC_CLIENT,
+        base_token, convert_to, estimated_gas_paid, fee_transactions_amount, final_block_hash,
+        max_gas_cost, optimize_execution_instructions, price_raw, storage_deposits, BaseTokenId,
+        Mainnet, RPC_CLIENT,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
         Amount, DexId, ExecutionInstruction, OutcomeRequest, Quote, Route, SigningContext,
-        Slippage, SwapOutcome, SwapRequest, TokenId,
+        Slippage, SwapOutcome, SwapRequest,
     },
 };
 
@@ -324,7 +325,8 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         Amount::AmountIn(_) => &request.token_out,
         Amount::AmountOut(_) => &request.token_in,
     };
-    let prices_raw = price_raw(&Mainnet, &TokenId::Near).zip(price_raw(&Mainnet, quoted_token));
+    let prices_raw = price_raw(&Mainnet, &BaseTokenId::Near)
+        .zip(price_raw(&Mainnet, &base_token(quoted_token).unwrap()));
     if prices_raw.is_none() {
         info!(
             "No price to weigh the costs of routes against their amounts, comparing amounts only"

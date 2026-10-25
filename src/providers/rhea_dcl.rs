@@ -10,11 +10,11 @@ use tracing::info;
 
 use crate::{
     shared_utils::{
-        convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
+        base_token, convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
         deposit_storage_on_contract_if_needed, estimated_gas_paid, get_slippage,
         payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
-        swap_call_gas, swap_call_gas_paid, total_fee_amount, Mainnet, NetworkView, ReferrerFee,
-        DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
+        swap_call_gas, swap_call_gas_paid, total_fee_amount, BaseTokenId, Mainnet, NetworkView,
+        ReferrerFee, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -62,8 +62,8 @@ async fn route(
     let slippage = get_slippage(
         network,
         request.slippage,
-        &request.token_in,
-        &request.token_out,
+        &base_token(&request.token_in).unwrap(),
+        &base_token(&request.token_out).unwrap(),
     );
 
     let (_, token_in) = convert_to_nep141(&request.token_in, None, 0).await?;
@@ -98,12 +98,12 @@ async fn route(
             },
             max_hops: MaxHops::Four,
             slippage,
-            near_price_raw: price_raw(network, &TokenId::Near)?,
+            near_price_raw: price_raw(network, &BaseTokenId::Near)?,
             quoted_token_price_raw: price_raw(
                 network,
-                match request.amount {
-                    Amount::AmountIn(_) => &request.token_out,
-                    Amount::AmountOut(_) => &request.token_in,
+                &match request.amount {
+                    Amount::AmountIn(_) => base_token(&request.token_out).unwrap(),
+                    Amount::AmountOut(_) => base_token(&request.token_in).unwrap(),
                 },
             )?,
         })

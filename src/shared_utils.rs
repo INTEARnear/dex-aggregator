@@ -14,9 +14,12 @@ use intear_dex_types::DirectWithdrawAmount;
 use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
-    QueryFinality, RpcClient, types::{
-        AccountId, AccountIdRef, Action, Balance, BlockHeight, BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128, near_account_id::AccountType,
-    }, utils::dec_format,
+    types::{
+        near_account_id::AccountType, AccountId, AccountIdRef, Action, Balance, BlockHeight,
+        BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128,
+    },
+    utils::dec_format,
+    QueryFinality, RpcClient,
 };
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
@@ -326,7 +329,7 @@ pub trait NetworkView: Send + Sync {
         account_id: &AccountId,
     ) -> impl Future<Output = Result<Balance, String>> + Send;
 
-    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>;
+    fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
 }
@@ -567,7 +570,7 @@ impl NetworkView for Mainnet {
         struct FtLockupAccount {
             locked: U128,
         }
-        
+
         RPC_CLIENT
             .call::<Option<FtLockupAccount>>(
                 lockup_id,
@@ -582,7 +585,7 @@ impl NetworkView for Mainnet {
             .map_err(|err| format!("{err:?}"))
     }
 
-    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
+    fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
         TOKEN_INFOS.read().unwrap().clone()
     }
 
@@ -598,7 +601,7 @@ pub(crate) struct TestNetworkView {
     storage_balance_bounds: HashMap<AccountId, StorageBalanceBounds>,
     rhea_token_registers: HashMap<(AccountId, AccountId), bool>,
     intear_asset_registers: HashMap<(AccountId, AssetId), bool>,
-    tokens: Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
+    tokens: Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
     ft_balances: HashMap<(AccountId, AccountId), Balance>,
@@ -706,7 +709,7 @@ impl TestNetworkView {
         self
     }
 
-    pub(crate) fn with_tokens(mut self, tokens: HashMap<TokenId, TokenInfo>) -> Self {
+    pub(crate) fn with_tokens(mut self, tokens: HashMap<BaseTokenId, TokenInfo>) -> Self {
         self.tokens = Ok(Arc::new(tokens));
         self
     }
@@ -714,15 +717,18 @@ impl TestNetworkView {
     /// Prices NEAR, wNEAR and the `ft` and `other` tokens the provider tests swap, which DEXes
     /// with routes need to weigh gas against amounts
     pub(crate) fn with_test_prices(self) -> Self {
-        [TokenId::Near, TokenId::Nep141(WRAP_NEAR.parse().unwrap())]
-            .into_iter()
-            .chain(["ft", "other"].map(|token| TokenId::Nep141(token.parse().unwrap())))
-            .fold(self, |network, token_id| {
-                network.with_price(token_id, BigDecimal::from_str("1e-20").unwrap())
-            })
+        [
+            BaseTokenId::Near,
+            BaseTokenId::Nep141(WRAP_NEAR.parse().unwrap()),
+        ]
+        .into_iter()
+        .chain(["ft", "other"].map(|token| BaseTokenId::Nep141(token.parse().unwrap())))
+        .fold(self, |network, token_id| {
+            network.with_price(token_id, BigDecimal::from_str("1e-20").unwrap())
+        })
     }
 
-    pub(crate) fn with_price(mut self, token_id: TokenId, price_usd_raw: BigDecimal) -> Self {
+    pub(crate) fn with_price(mut self, token_id: BaseTokenId, price_usd_raw: BigDecimal) -> Self {
         Arc::make_mut(self.tokens.as_mut().unwrap()).insert(
             token_id,
             TokenInfo {
@@ -882,7 +888,7 @@ impl NetworkView for TestNetworkView {
             .unwrap_or(0))
     }
 
-    fn token_infos(&self) -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
+    fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
         self.tokens.clone()
     }
 
@@ -1257,7 +1263,7 @@ lazy_static! {
         .collect();
     pub static ref RPC_CLIENT: RpcClient = RpcClient::new(RPC_URLS.iter());
 
-    static ref TOKEN_INFOS: RwLock<Result<Arc<HashMap<TokenId, TokenInfo>>, String>> =
+    static ref TOKEN_INFOS: RwLock<Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>> =
         RwLock::new(Err("Token infos are not loaded yet".to_string()));
     static ref BLOCK_HEIGHT: RwLock<Result<BlockHeight, String>> =
         RwLock::new(Err("Block height is not loaded yet".to_string()));
@@ -1326,8 +1332,8 @@ where
 pub fn get_slippage(
     network: &impl NetworkView,
     slippage: Slippage,
-    token_in: &TokenId,
-    token_out: &TokenId,
+    token_in: &BaseTokenId,
+    token_out: &BaseTokenId,
 ) -> BigDecimal {
     match slippage {
         Slippage::Auto {
@@ -1410,8 +1416,8 @@ fn token_volatility_scale(token_info: &TokenInfo, current_block_height: u64) -> 
 
 fn slippage_scale_for_token(
     network: &impl NetworkView,
-    tokens_result: &Result<Arc<HashMap<TokenId, TokenInfo>>, String>,
-    token_id: &TokenId,
+    tokens_result: &Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>,
+    token_id: &BaseTokenId,
 ) -> BigDecimal {
     match tokens_result {
         Ok(tokens) => {
@@ -1457,7 +1463,7 @@ where
     }
 }
 
-async fn fetch_token_infos() -> Result<Arc<HashMap<TokenId, TokenInfo>>, String> {
+async fn fetch_token_infos() -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
     let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
         .unwrap_or_else(|_| "https://prices.intear.tech".to_string());
     let url = format!("{endpoint}/tokens");
@@ -1467,11 +1473,11 @@ async fn fetch_token_infos() -> Result<Arc<HashMap<TokenId, TokenInfo>>, String>
         .await
         .and_then(|response| response.error_for_status())
         .map_err(|err| format!("Failed to get all tokens: {err}"))?
-        .json::<HashMap<TokenId, TokenInfo>>()
+        .json::<HashMap<BaseTokenId, TokenInfo>>()
         .await
         .map_err(|err| format!("Failed to parse all tokens: {err}"))?;
-    if let Some(wnear_info) = tokens.get(&TokenId::Nep141(WRAP_NEAR.parse().unwrap())) {
-        tokens.insert(TokenId::Near, wnear_info.clone());
+    if let Some(wnear_info) = tokens.get(&BaseTokenId::Nep141(WRAP_NEAR.parse().unwrap())) {
+        tokens.insert(BaseTokenId::Near, wnear_info.clone());
     }
     Ok(Arc::new(tokens))
 }
@@ -1757,10 +1763,20 @@ pub fn is_near(token_id: &TokenId) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BaseTokenId {
     Near,
     Nep141(AccountId),
+}
+
+impl<'de> Deserialize<'de> for BaseTokenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let token_id: TokenId = serde::Deserialize::deserialize(deserializer)?;
+        base_token(&token_id).ok_or_else(|| serde::de::Error::custom("invalid token id"))
+    }
 }
 
 pub fn base_token(token_id: &TokenId) -> Option<BaseTokenId> {
@@ -2028,20 +2044,15 @@ pub fn storage_deposits(execution_instructions: &[ExecutionInstruction]) -> Near
         .fold(NearToken::from_yoctonear(0), NearToken::saturating_add)
 }
 
-/// Current USD price of a raw unit of `token_id` (a yoctoNEAR for NEAR), `None` if it has no price
-pub fn price_raw(network: &impl NetworkView, token_id: &TokenId) -> Option<BigDecimal> {
-    let token_id = match base_token(token_id)? {
-        BaseTokenId::Near => TokenId::Near,
-        BaseTokenId::Nep141(account_id) => TokenId::Nep141(account_id),
-    };
+pub fn price_raw(network: &impl NetworkView, token_id: &BaseTokenId) -> Option<BigDecimal> {
     network
         .token_infos()
         .ok()?
-        .get(&token_id)
+        .get(token_id)
         .map(|info| info.price_usd_raw.clone())
         .filter(|price| !price.is_zero())
         .or_else(|| {
-            info!("No price of {token_id}");
+            info!("No price of {token_id:?}");
             None
         })
 }

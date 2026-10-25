@@ -22,10 +22,10 @@ use xyk_dex_types::{
 
 use crate::{
     shared_utils::{
-        convert_to_native, convert_to_nep141, deposit_storage_if_needed, estimated_gas_paid,
-        get_slippage, intear_registration, is_near, payable_referral_fees, price_raw,
-        register_input_in_wallet, swap_call_gas, swap_call_gas_paid, Mainnet, NetworkView,
-        DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
+        base_token, convert_to_native, convert_to_nep141, deposit_storage_if_needed,
+        estimated_gas_paid, get_slippage, intear_registration, is_near, payable_referral_fees,
+        price_raw, register_input_in_wallet, swap_call_gas, swap_call_gas_paid, BaseTokenId,
+        Mainnet, NetworkView, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -206,8 +206,8 @@ async fn route(
     let slippage = get_slippage(
         network,
         request.slippage,
-        &request.token_in,
-        &request.token_out,
+        &base_token(&request.token_in).unwrap(),
+        &base_token(&request.token_out).unwrap(),
     );
 
     let (_, token_in) = match &request.token_in {
@@ -269,12 +269,12 @@ async fn route(
             },
             max_hops: MaxHops::Four,
             slippage,
-            near_price_raw: price_raw(network, &TokenId::Near)?,
+            near_price_raw: price_raw(network, &BaseTokenId::Near)?,
             quoted_token_price_raw: price_raw(
                 network,
-                match request.amount {
-                    Amount::AmountIn(_) => &request.token_out,
-                    Amount::AmountOut(_) => &request.token_in,
+                &match request.amount {
+                    Amount::AmountIn(_) => base_token(&request.token_out).unwrap(),
+                    Amount::AmountOut(_) => base_token(&request.token_in).unwrap(),
                 },
             )?,
             fee_discount: fee_discount.map_or(0, |(_, fee_discount)| fee_discount),

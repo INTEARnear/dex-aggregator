@@ -1574,24 +1574,24 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         Slippage::Fixed {
             slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &wnear(),
+        &BaseTokenId::Near,
+        &base_token(&wnear()).unwrap(),
     );
     assert_eq!(passthrough, bd("0.01"));
 
     let too_small = get_slippage(
         &network,
         Slippage::Fixed { slippage: bd("0") },
-        &TokenId::Near,
-        &wnear(),
+        &BaseTokenId::Near,
+        &base_token(&wnear()).unwrap(),
     );
     assert_eq!(too_small, BigDecimal::from_f64(0.0001).unwrap());
 
     let too_large = get_slippage(
         &network,
         Slippage::Fixed { slippage: bd("2") },
-        &TokenId::Near,
-        &wnear(),
+        &BaseTokenId::Near,
+        &base_token(&wnear()).unwrap(),
     );
     assert_eq!(too_large, BigDecimal::from_f64(0.9999).unwrap());
 }
@@ -1605,8 +1605,8 @@ async fn get_slippage_auto_missing_token_uses_scale_0_8() {
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(
         slippage,
@@ -1623,8 +1623,8 @@ async fn get_slippage_auto_token_fetch_error_uses_scale_0_005() {
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(
         slippage,
@@ -1636,7 +1636,7 @@ async fn get_slippage_auto_token_fetch_error_uses_scale_0_005() {
 async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token() {
     let mut tokens = HashMap::new();
     tokens.insert(
-        TokenId::Near,
+        BaseTokenId::Near,
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1647,7 +1647,7 @@ async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token()
         },
     );
     tokens.insert(
-        ft(),
+        BaseTokenId::Nep141(account("ft")),
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1666,8 +1666,8 @@ async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token()
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(
         slippage,
@@ -1679,7 +1679,7 @@ async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token()
 async fn get_slippage_auto_new_token_uses_max_slippage() {
     let mut tokens = HashMap::new();
     tokens.insert(
-        TokenId::Near,
+        BaseTokenId::Near,
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1690,7 +1690,7 @@ async fn get_slippage_auto_new_token_uses_max_slippage() {
         },
     );
     tokens.insert(
-        ft(),
+        BaseTokenId::Nep141(account("ft")),
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1709,8 +1709,8 @@ async fn get_slippage_auto_new_token_uses_max_slippage() {
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(slippage, bd("0.51"));
 }
@@ -1719,7 +1719,7 @@ async fn get_slippage_auto_new_token_uses_max_slippage() {
 async fn get_slippage_auto_somewhat_new_token_uses_scale_0_6() {
     let mut tokens = HashMap::new();
     tokens.insert(
-        TokenId::Near,
+        BaseTokenId::Near,
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1730,7 +1730,7 @@ async fn get_slippage_auto_somewhat_new_token_uses_scale_0_6() {
         },
     );
     tokens.insert(
-        ft(),
+        BaseTokenId::Nep141(account("ft")),
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1749,8 +1749,8 @@ async fn get_slippage_auto_somewhat_new_token_uses_scale_0_6() {
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(
         slippage,
@@ -1963,7 +1963,7 @@ fn token_volatility_scale_all_addends_stay_at_or_below_one() {
 async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
     let mut tokens = HashMap::new();
     tokens.insert(
-        TokenId::Near,
+        BaseTokenId::Near,
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1"),
@@ -1974,7 +1974,7 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
         },
     );
     tokens.insert(
-        ft(),
+        base_token(&ft()).unwrap(),
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1.3"),
@@ -1991,8 +1991,8 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
             max_slippage: bd("0.51"),
             min_slippage: bd("0.01"),
         },
-        &TokenId::Near,
-        &ft(),
+        &BaseTokenId::Near,
+        &base_token(&ft()).unwrap(),
     );
     assert_eq!(
         slippage,
