@@ -20,7 +20,7 @@ use swap_router_types::hook::{
 use tokio::sync::Semaphore;
 use tracing::info;
 
-use crate::{stats::RouteOutcome, types::Quote, DexId, Route, SwapRequest};
+use crate::{shared_utils::Mainnet, stats::RouteOutcome, types::Quote, DexId, Route, SwapRequest};
 
 const HOOK_DIRECTORY: &str = "hooks";
 const ROUTE_TIMEOUT: Duration = Duration::from_millis(60_000);
@@ -200,7 +200,7 @@ impl Hook {
         for hook_quote in hook_quotes {
             let route = match hook_quote {
                 HookQuote::IntearOtcIntent { maker_intent } => {
-                    inteardex_otc::route(self.dex_id(), request, maker_intent).await
+                    inteardex_otc::route(&Mainnet, self.dex_id(), request, maker_intent).await
                 }
             };
             routes.extend(route);

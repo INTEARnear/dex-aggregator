@@ -5,23 +5,24 @@ use otc_dex_types::AuthorizedTradeIntent;
 use swap_router_types::otc::OtcTrade;
 
 use crate::{
-    providers::intear_plach::{AssetId, INTEAR_DEX_CONTRACT_ID},
+    providers::intear_plach::{
+        reserved_gas, swap_call_gas_paid_with_operations, AssetId, FT_TRANSFER_CALL_RESERVED_GAS,
+        FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS, INTEAR_DEX_CONTRACT_ID, SWAP_OVERHEAD_GAS,
+    },
     shared_utils::{
         deposit_storage_if_needed, estimated_gas_paid, register_assets_on_intear, swap_call_gas,
-        Mainnet, DEFAULT_REFERRER_ID,
+        NetworkView, DEFAULT_REFERRER_ID,
     },
     types::ExecutionInstruction,
     Amount, DexId, Route, SwapRequest,
 };
 
-const OTC_SWAP_GAS: NearGas = NearGas::from_tgas(15);
-const REFERRAL_FEE_GAS: NearGas = NearGas::from_tgas(1);
-const OUTPUT_WITHDRAWAL_GAS: NearGas = NearGas::from_tgas(15);
-const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
+const OTC_SWAP_GAS: NearGas = NearGas::from_ggas(27_500);
 
 /// The route that fills `maker_intent`, quoted by the hook `dex_id`. An intent that doesn't take
 /// the other side of the request's [`OtcTrade`] panics.
 pub async fn route(
+    network: &impl NetworkView,
     dex_id: DexId,
     request: &SwapRequest,
     maker_intent: Base64VecU8,
@@ -87,18 +88,30 @@ pub async fn route(
         "referral_fees": otc_trade.referral_fees,
     });
 
-    let swap_gas =
-        NearGas::from_gas(OTC_SWAP_GAS.as_gas() + REFERRAL_FEE_GAS.as_gas() * fees.len() as u64);
-    let (receiver_id, swap_action) = match asset_in {
+    let reserved_gas = reserved_gas(&operations);
+    // The output withdrawn as NEAR is sent to the trader
+    let near_transfers = if *asset_out == AssetId::Near { 1 } else { 0 };
+    let swap_call_gas_paid = |entry_overhead| {
+        swap_call_gas_paid_with_operations(
+            OTC_SWAP_GAS,
+            &operations,
+            &otc_trade.referral_fees,
+            entry_overhead,
+            near_transfers,
+            Some(&otc_trade.trader_account_id),
+        )
+    };
+    let (receiver_id, swap_action, swap_gas_paid) = match asset_in {
         AssetId::Near => (
             INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
             Action::FunctionCall(Box::new(FunctionCallAction {
                 method_name: "deposit_near".to_string(),
                 args: serde_json::to_vec(&serde_json::json!({ "operations": operations_args }))
                     .unwrap(),
-                gas: swap_call_gas(swap_gas, OUTPUT_WITHDRAWAL_GAS, false),
+                gas: swap_call_gas(OTC_SWAP_GAS, reserved_gas, false),
                 deposit: NearToken::from_yoctonear(deposit_amount),
             })),
+            swap_call_gas_paid(SWAP_OVERHEAD_GAS),
         ),
         AssetId::Nep141(token_in_id) => (
             token_in_id.clone(),
@@ -111,14 +124,15 @@ pub async fn route(
                 }))
                 .unwrap(),
                 gas: swap_call_gas(
-                    swap_gas,
+                    OTC_SWAP_GAS,
                     NearGas::from_gas(
-                        OUTPUT_WITHDRAWAL_GAS.as_gas() + FT_TRANSFER_CALL_RESERVED_GAS.as_gas(),
+                        reserved_gas.as_gas() + FT_TRANSFER_CALL_RESERVED_GAS.as_gas(),
                     ),
                     true,
                 ),
                 deposit: NearToken::from_yoctonear(1),
             })),
+            swap_call_gas_paid(FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS),
         ),
         AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => unreachable!(),
     };
@@ -131,21 +145,21 @@ pub async fn route(
         .collect::<Vec<_>>();
     let execution_instructions = [
         register_assets_on_intear(
-            &Mainnet,
+            network,
             &otc_trade.trader_account_id,
             &[asset_out],
             &fee_receivers,
         )
         .await?,
         deposit_storage_if_needed(
-            &Mainnet,
+            network,
             &request.token_out,
             otc_trade.trader_account_id.clone(),
         )
         .await?,
         vec![ExecutionInstruction::NearTransaction {
             receiver_id,
-            actions: vec![swap_action],
+            actions: vec![swap_action.clone()],
             is_fee_transaction: false,
         }],
     ]
@@ -155,7 +169,10 @@ pub async fn route(
         estimated_amount,
         // fills exactly or not at all
         worst_case_amount: estimated_amount,
-        estimated_gas_paid: estimated_gas_paid(&execution_instructions, None),
+        estimated_gas_paid: estimated_gas_paid(
+            &execution_instructions,
+            Some((&swap_action, swap_gas_paid)),
+        ),
         execution_instructions,
         deprecated_needs_unwrap_always_false: false,
         discount: None,

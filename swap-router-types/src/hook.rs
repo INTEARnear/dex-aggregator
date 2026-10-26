@@ -214,8 +214,7 @@ mod export_tests {
             if input.quotes.is_empty() {
                 panic!("No quotes to beat");
             }
-            Ok(vec![HookQuote::OtcIntent {
-                otc_dex_id: "owner.near/otc".parse().unwrap(),
+            Ok(vec![HookQuote::IntearOtcIntent {
                 maker_intent: Base64VecU8(input.swap_request.token_in.to_string().into_bytes()),
             }])
         }

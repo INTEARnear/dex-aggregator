@@ -35,12 +35,12 @@ pub struct IntearPlachProvider;
 
 pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
+pub const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
 const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);
 const WITHDRAWAL_CALLBACK_GAS: NearGas = NearGas::from_tgas(5);
 const SPARE_RESERVED_GAS: NearGas = NearGas::from_tgas(2);
 
-fn reserved_gas(operations: &[Operation]) -> NearGas {
+pub fn reserved_gas(operations: &[Operation]) -> NearGas {
     let withdrawals_gas = operations
         .iter()
         .map(|operation| match operation {
@@ -57,15 +57,15 @@ fn reserved_gas(operations: &[Operation]) -> NearGas {
     NearGas::from_gas(SPARE_RESERVED_GAS.as_gas() + withdrawals_gas)
 }
 
-const SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(3_260);
-const FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(8_530);
+pub const SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(3_260);
+pub const FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(8_530);
 const WITHDRAWAL_OVERHEAD_GAS: NearGas = NearGas::from_ggas(4_540);
 const NEAR_WITHDRAWAL_OVERHEAD_GAS: NearGas = NearGas::from_ggas(2_100);
 const REFERRAL_FEE_OVERHEAD_GAS: NearGas = NearGas::from_ggas(600);
 
 /// Gas a swap call with the operations and referral fees costs, with `entry_overhead` for how the
 /// call gets the input to the DEX and `near_transfers` of NEAR to the trader
-fn swap_call_gas_paid_with_operations(
+pub fn swap_call_gas_paid_with_operations(
     swap_gas: NearGas,
     operations: &[Operation],
     referral_fees: &ReferralFees,
