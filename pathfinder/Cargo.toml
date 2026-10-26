@@ -18,7 +18,7 @@ bigdecimal = "0.4.10"
 rustc-hash = "2.1.3"
 smallvec = "1.15.1"
 ruint = "1.20.1"
-intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "62fe007e64a5cfcc2960f7ee14d3272750cd0208", features = ["json"] }
-xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "62fe007e64a5cfcc2960f7ee14d3272750cd0208" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }

@@ -174,16 +174,6 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
         ));
     }
 
-    if let Some(unloaded_hook) = request.dexes.iter().flatten().find(|dex_id| {
-        matches!(dex_id, DexId::Hook(_))
-            && !hooks::loaded().iter().any(|hook| hook.dex_id() == **dex_id)
-    }) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("No hook is loaded as {unloaded_hook}"),
-        ));
-    }
-
     Ok(())
 }
 

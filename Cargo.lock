@@ -2223,7 +2223,7 @@ dependencies = [
 [[package]]
 name = "intear-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=62fe007e64a5cfcc2960f7ee14d3272750cd0208#62fe007e64a5cfcc2960f7ee14d3272750cd0208"
+source = "git+https://github.com/INTEARnear/dex?rev=ad794a28fb51c4cbac6ef28ea81e6f038f885666#ad794a28fb51c4cbac6ef28ea81e6f038f885666"
 dependencies = [
  "near-sdk",
 ]
@@ -3073,7 +3073,7 @@ dependencies = [
 [[package]]
 name = "otc-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=62fe007e64a5cfcc2960f7ee14d3272750cd0208#62fe007e64a5cfcc2960f7ee14d3272750cd0208"
+source = "git+https://github.com/INTEARnear/dex?rev=ad794a28fb51c4cbac6ef28ea81e6f038f885666#ad794a28fb51c4cbac6ef28ea81e6f038f885666"
 dependencies = [
  "intear-dex-types",
  "near-sdk",
@@ -5498,7 +5498,7 @@ dependencies = [
 [[package]]
 name = "xyk-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex?rev=62fe007e64a5cfcc2960f7ee14d3272750cd0208#62fe007e64a5cfcc2960f7ee14d3272750cd0208"
+source = "git+https://github.com/INTEARnear/dex?rev=ad794a28fb51c4cbac6ef28ea81e6f038f885666#ad794a28fb51c4cbac6ef28ea81e6f038f885666"
 dependencies = [
  "ethnum",
  "intear-dex-types",

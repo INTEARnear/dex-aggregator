@@ -25,16 +25,12 @@ pub async fn route(
     network: &impl NetworkView,
     dex_id: DexId,
     request: &SwapRequest,
-    maker_intent: Base64VecU8,
+    maker_intent: AuthorizedTradeIntent,
 ) -> Option<Route> {
     let otc_trade = OtcTrade::of_request(request)
         .unwrap_or_else(|| panic!("{dex_id} quoted a swap that can't go through the OTC DEX"));
-    let maker_trade = near_sdk::borsh::from_slice::<AuthorizedTradeIntent>(&maker_intent.0)
-        .unwrap_or_else(|err| {
-            panic!("{dex_id} quoted an intent that isn't an AuthorizedTradeIntent: {err}")
-        })
-        .trade_intent;
-    if let Err(err) = otc_trade.check_maker_trade(&maker_trade) {
+    let maker_trade = &maker_intent.trade_intent;
+    if let Err(err) = otc_trade.check_maker_trade(maker_trade) {
         panic!("{dex_id} quoted: {err}");
     }
 
@@ -67,7 +63,7 @@ pub async fn route(
     let operations = vec![
         Operation::SwapSimple {
             dex_id: "slimedragon.near/otc".parse().unwrap(),
-            message: maker_intent,
+            message: Base64VecU8(near_sdk::borsh::to_vec(&maker_intent).unwrap()),
             asset_in: asset_in.clone(),
             asset_out: asset_out.clone(),
             amount: SwapOperationAmount::Amount(swap_amount),

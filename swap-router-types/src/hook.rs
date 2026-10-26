@@ -1,12 +1,11 @@
 use std::{borrow::Cow, net::IpAddr, time::Duration};
 
-use near_sdk::json_types::Base64VecU8;
 use otc_dex_types::AuthorizedTradeIntent;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 3;
+pub const HOOK_ABI_VERSION: u32 = 4;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -29,18 +28,7 @@ pub struct HookInput<'a> {
 /// A quote a hook adds. The aggregator builds its route, so a hook only says what it trades.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HookQuote {
-    IntearOtcIntent {
-        /// The `AuthorizedTradeIntent`, Borsh in base64
-        maker_intent: Base64VecU8,
-    },
-}
-
-impl HookQuote {
-    pub fn otc_intent(maker_intent: &AuthorizedTradeIntent) -> Self {
-        Self::IntearOtcIntent {
-            maker_intent: Base64VecU8(near_sdk::borsh::to_vec(maker_intent).unwrap()),
-        }
-    }
+    IntearOtcIntent { maker_intent: AuthorizedTradeIntent },
 }
 
 /// A hook, for [`export_hook!`](crate::export_hook) to make the ABI of
@@ -201,6 +189,10 @@ mod tests {
 mod export_tests {
     use std::ffi::{CStr, CString};
 
+    use intear_dex_types::AssetId;
+    use near_sdk::json_types::U128;
+    use otc_dex_types::{AuthorizationMethod, TradeIntent, Validity};
+
     use super::*;
 
     struct TestHook;
@@ -214,8 +206,19 @@ mod export_tests {
             if input.quotes.is_empty() {
                 panic!("No quotes to beat");
             }
+            let trade_intent = TradeIntent {
+                user_id: input.swap_request.trader_account_id.clone().unwrap(),
+                asset_in: AssetId::Near,
+                asset_out: AssetId::Near,
+                amount_in: U128(1),
+                amount_out: U128(2),
+                validity: Validity::default(),
+            };
             Ok(vec![HookQuote::IntearOtcIntent {
-                maker_intent: Base64VecU8(input.swap_request.token_in.to_string().into_bytes()),
+                maker_intent: AuthorizedTradeIntent {
+                    trade_intent,
+                    authorization_method: AuthorizationMethod::Predecessor,
+                },
             }])
         }
     }
@@ -258,7 +261,7 @@ mod export_tests {
         let [HookQuote::IntearOtcIntent { maker_intent, .. }] = quotes.as_slice() else {
             panic!("Not one OTC intent: {quotes:?}");
         };
-        assert_eq!(maker_intent.0, b"near");
+        assert_eq!(maker_intent.trade_intent.user_id, "trader.near");
 
         let mut without_quotes: serde_json::Value =
             serde_json::from_str(&super::tests::input_json()).unwrap();
