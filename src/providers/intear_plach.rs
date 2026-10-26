@@ -16,8 +16,8 @@ use pathfinder::{
 use sha2::{Digest, Sha256};
 use tracing::info;
 use xyk_dex_types::{
-    FeeDiscount, FeeFractionFraction, SignedFeeDiscount, SwapArgs, SwapRoute,
-    FULL_FEE_FRACTION_FRACTION,
+    FeeDiscount, FeeDiscountSignaturePayload, FeeFractionFraction, SignedFeeDiscount, SwapArgs,
+    SwapRoute, FULL_FEE_FRACTION_FRACTION,
 };
 
 use crate::{
@@ -35,6 +35,7 @@ pub struct IntearPlachProvider;
 
 pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
+const CHAIN_ID: &str = "mainnet";
 const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
 const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);
 const WITHDRAWAL_CALLBACK_GAS: NearGas = NearGas::from_tgas(5);
@@ -143,7 +144,8 @@ impl FeeDiscounter {
 
     /// Signs sha256(borsh(`discount`)), which the DEX verifies
     fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
-        let hash = Sha256::digest(borsh::to_vec(&discount).unwrap());
+        let hash =
+            Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap());
         let signature = match self.secret_key.sign(&hash) {
             Signature::ED25519(signature) => signature.to_bytes().to_vec(),
             // Borsh puts the key type before the 65 bytes of r, s, and the recovery id
@@ -154,6 +156,15 @@ impl FeeDiscounter {
             discount,
             signature,
         }
+    }
+}
+
+fn fee_discount_signature_payload(discount: &FeeDiscount) -> FeeDiscountSignaturePayload {
+    FeeDiscountSignaturePayload {
+        chain_id: CHAIN_ID.to_string(),
+        engine_contract_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+        dex_id: PLACH_DEX_ID.parse().unwrap(),
+        discount: discount.clone(),
     }
 }
 
@@ -1006,7 +1017,7 @@ mod tests {
         assert!(Signature::from_parts(KeyType::ED25519, &signature)
             .unwrap()
             .verify(
-                &Sha256::digest(borsh::to_vec(&discount).unwrap()),
+                &Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap()),
                 &fee_discounter.secret_key.public_key(),
             ));
     }

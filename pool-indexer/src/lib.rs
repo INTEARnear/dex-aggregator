@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use inindexer::MessageStreamer;
-use inindexer::near_indexer_primitives::StreamerMessage;
+use inindexer::StreamerMessage;
 use inindexer::near_indexer_primitives::views::StateChangeValueView;
 use inindexer::teardata::TeardataProvider;
 use near_min_api::types::{AccountId, BlockHeight, BlockId, BlockReference, CryptoHash, Finality};
