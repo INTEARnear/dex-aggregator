@@ -269,9 +269,10 @@ mod tests {
     use super::*;
     use crate::shared_utils::{
         create_fee_ft_transfer_action, create_storage_deposit_action_for_contract,
-        create_wrap_action, TestNetworkView, AGGREGATOR_FEE_RECEIVER_ID, WRAP_NEAR,
+        create_wrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
+    use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestRheaDclQuotes {

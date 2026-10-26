@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Json, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, Uri},
     middleware,
     routing::get,
     Extension, Router,
@@ -28,7 +28,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use swap_router_types::{hook::RequestDetails, types};
+
 use crate::{
+    hooks::Hook,
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
         base_token, convert_to, estimated_gas_paid, fee_transactions_amount, final_block_hash,
@@ -45,13 +48,13 @@ use crate::{
 static ACCESS_KEY_RPC_CLIENT: LazyLock<RpcClient> =
     LazyLock::new(|| RPC_CLIENT.clone().with_max_retries(3));
 
+mod hooks;
 mod outcome;
 mod providers;
 mod rate_limit;
 mod shared_utils;
 mod stats;
 mod subscription;
-mod types;
 
 pub trait Provider: Sync {
     fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>>;
@@ -62,6 +65,8 @@ pub trait Provider: Sync {
 async fn route_handler(
     State(stats): State<Stats>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
+    uri: Uri,
+    headers: HeaderMap,
     Query(request): Query<SwapRequest>,
 ) -> Result<Json<Vec<Quote>>, (StatusCode, String)> {
     let started_at = Instant::now();
@@ -69,7 +74,8 @@ async fn route_handler(
     info!("Received route request: {:?}", request);
 
     validate_request(&request)?;
-    let (quotes, route_stats) = find_routes(&request).await;
+    let (quotes, route_stats) =
+        find_routes(&request, &hooks::request_details(ip, &uri, &headers)).await;
     record_stats(
         &stats,
         ip,
@@ -168,6 +174,16 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
         ));
     }
 
+    if let Some(unloaded_hook) = request.dexes.iter().flatten().find(|dex_id| {
+        matches!(dex_id, DexId::Hook(_))
+            && !hooks::loaded().iter().any(|hook| hook.dex_id() == **dex_id)
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("No hook is loaded as {unloaded_hook}"),
+        ));
+    }
+
     Ok(())
 }
 
@@ -182,7 +198,10 @@ impl Drop for AbortOnDrop {
 }
 
 /// Quotes of every requested DEX, best first
-async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
+async fn find_routes(
+    request: &SwapRequest,
+    request_details: &RequestDetails,
+) -> (Vec<Quote>, Vec<RouteStats>) {
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::wrap::WrapProvider,
@@ -190,12 +209,12 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         &providers::intear_plach::IntearPlachProvider,
     ];
 
-    let dexes = request.dexes.clone().unwrap_or(vec![
-        DexId::Wrap,
-        DexId::Rhea,
-        DexId::RheaDcl,
-        DexId::Plach,
-    ]);
+    let dexes = request.dexes.clone().unwrap_or_else(|| {
+        [DexId::Wrap, DexId::Rhea, DexId::RheaDcl, DexId::Plach]
+            .into_iter()
+            .chain(hooks::loaded().iter().map(Hook::dex_id))
+            .collect()
+    });
 
     let mut routes = Vec::new();
     for provider in providers {
@@ -236,90 +255,135 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
         .unzip();
-    let mut converted_routes = Vec::new();
+    let mut quotes = Vec::new();
     for (stats, route) in route_stats.iter_mut().zip(routes) {
-        let Some(mut route) = route else {
+        let Some(route) = route else {
             continue;
         };
-        if !route.deprecated_needs_unwrap_always_false {
-            let amount_out = match (
-                request.amount,
-                route.estimated_amount,
-                route.worst_case_amount,
-            ) {
-                (Amount::AmountIn(_), Amount::AmountOut(amount), Amount::AmountOut(amount2)) => {
-                    if amount == amount2 {
-                        Some(amount)
-                    } else {
-                        None
-                    }
-                }
-                (Amount::AmountOut(amount), Amount::AmountIn(_), Amount::AmountIn(_)) => {
-                    Some(amount)
-                }
-                _ => unreachable!(),
-            };
-            if let Some(amount_out) = amount_out {
-                info!(
-                    "Converting from {:?} to {:?} with amount {}",
-                    route.token_output, request.token_out, amount_out
-                );
-                let conversion = convert_to(
-                    &Mainnet,
-                    &route.token_output,
-                    &request.token_out,
-                    amount_out,
-                    request.trader_account_id.clone(),
-                )
-                .await;
-                let Some(conversion) = conversion else {
-                    error!(
-                        "No conversion of the {} route from {} to {}, leaving it out",
-                        route.dex_id, route.token_output, request.token_out
-                    );
-                    stats.outcome = RouteOutcome::NotFound;
-                    stats.estimated_amount = None;
-                    continue;
-                };
-                route.estimated_gas_paid = NearGas::from_gas(
-                    route.estimated_gas_paid.as_gas()
-                        + estimated_gas_paid(&conversion, None).as_gas(),
-                );
-                route.execution_instructions.extend(conversion);
-                route.token_output = request.token_out.clone();
+        match finish_route(request, route).await {
+            Some(route) => quotes.push(quote_of_route(route, signing.clone())),
+            None => {
+                stats.outcome = RouteOutcome::NotFound;
+                stats.estimated_amount = None;
             }
         }
-        // Fee transactions go last, after the output conversion too, so the swap doesn't wait
-        // for fees.
-        let (fee_transactions, swap_transactions): (Vec<_>, Vec<_>) = route
-            .execution_instructions
-            .drain(..)
-            .partition(|instruction| {
-                matches!(
-                    instruction,
-                    ExecutionInstruction::NearTransaction {
-                        is_fee_transaction: true,
-                        ..
-                    }
-                )
-            });
-        route.execution_instructions =
-            optimize_execution_instructions([swap_transactions, fee_transactions].concat());
-        converted_routes.push(route);
+    }
+    sort_quotes(request, &mut quotes);
+
+    for hook in hooks::loaded() {
+        if !dexes.contains(&hook.dex_id()) {
+            continue;
+        }
+        let started_at = Instant::now();
+        let (mut outcome, hook_routes) = hook.routes(request, request_details, &quotes).await;
+        let mut hook_quotes = Vec::new();
+        for route in hook_routes {
+            if let Some(route) = finish_route(request, route).await {
+                hook_quotes.push(quote_of_route(route, signing.clone()));
+            }
+        }
+        if matches!(outcome, RouteOutcome::Found) && hook_quotes.is_empty() {
+            outcome = RouteOutcome::NotFound;
+        }
+        sort_quotes(request, &mut hook_quotes);
+        route_stats.push(RouteStats {
+            dex_id: hook.dex_id(),
+            duration: started_at.elapsed(),
+            outcome,
+            estimated_amount: hook_quotes
+                .first()
+                .map(|quote| match quote.route.estimated_amount {
+                    Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
+                }),
+        });
+        quotes.extend(hook_quotes);
+        sort_quotes(request, &mut quotes);
     }
 
-    let mut quotes = converted_routes
-        .into_iter()
-        .map(|route| Quote {
-            estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
-            estimated_gas_usage: pathfinder::MIN_GAS_PRICE
-                .saturating_mul(route.estimated_gas_paid.as_gas().into()),
-            storage_deposits: storage_deposits(&route.execution_instructions),
-            fee_amount: fee_transactions_amount(&route.execution_instructions),
-            signing: signing.clone(),
-            route,
-        })
-        .collect::<Vec<_>>();
+    tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
+
+    (quotes, route_stats)
+}
+
+/// The route with its output converted to the requested token location, and its fee transactions
+/// last. None if there's no conversion for the output.
+async fn finish_route(request: &SwapRequest, mut route: Route) -> Option<Route> {
+    if !route.deprecated_needs_unwrap_always_false {
+        let amount_out = match (
+            request.amount,
+            route.estimated_amount,
+            route.worst_case_amount,
+        ) {
+            (Amount::AmountIn(_), Amount::AmountOut(amount), Amount::AmountOut(amount2)) => {
+                if amount == amount2 {
+                    Some(amount)
+                } else {
+                    None
+                }
+            }
+            (Amount::AmountOut(amount), Amount::AmountIn(_), Amount::AmountIn(_)) => Some(amount),
+            _ => unreachable!(),
+        };
+        if let Some(amount_out) = amount_out {
+            info!(
+                "Converting from {:?} to {:?} with amount {}",
+                route.token_output, request.token_out, amount_out
+            );
+            let conversion = convert_to(
+                &Mainnet,
+                &route.token_output,
+                &request.token_out,
+                amount_out,
+                request.trader_account_id.clone(),
+            )
+            .await;
+            let Some(conversion) = conversion else {
+                error!(
+                    "No conversion of the {} route from {} to {}, leaving it out",
+                    route.dex_id, route.token_output, request.token_out
+                );
+                return None;
+            };
+            route.estimated_gas_paid = NearGas::from_gas(
+                route.estimated_gas_paid.as_gas() + estimated_gas_paid(&conversion, None).as_gas(),
+            );
+            route.execution_instructions.extend(conversion);
+            route.token_output = request.token_out.clone();
+        }
+    }
+    // Fee transactions go last, after the output conversion too, so the swap doesn't wait
+    // for fees.
+    let (fee_transactions, swap_transactions): (Vec<_>, Vec<_>) = route
+        .execution_instructions
+        .drain(..)
+        .partition(|instruction| {
+            matches!(
+                instruction,
+                ExecutionInstruction::NearTransaction {
+                    is_fee_transaction: true,
+                    ..
+                }
+            )
+        });
+    route.execution_instructions =
+        optimize_execution_instructions([swap_transactions, fee_transactions].concat());
+    Some(route)
+}
+
+fn quote_of_route(route: Route, signing: Option<SigningContext>) -> Quote {
+    Quote {
+        estimated_max_gas_cost: max_gas_cost(&route.execution_instructions),
+        estimated_gas_usage: pathfinder::MIN_GAS_PRICE
+            .saturating_mul(route.estimated_gas_paid.as_gas().into()),
+        storage_deposits: storage_deposits(&route.execution_instructions),
+        fee_amount: fee_transactions_amount(&route.execution_instructions),
+        signing,
+        route,
+    }
+}
+
+/// Best first, by what each quote gets net of its costs
+fn sort_quotes(request: &SwapRequest, quotes: &mut [Quote]) {
     // Costs are in NEAR, the amounts in the token whose amount is quoted
     let quoted_token = match request.amount {
         Amount::AmountIn(_) => &request.token_out,
@@ -333,10 +397,6 @@ async fn find_routes(request: &SwapRequest) -> (Vec<Quote>, Vec<RouteStats>) {
         );
     }
     quotes.sort_by_cached_key(|quote| std::cmp::Reverse(net_amount(quote, prices_raw.as_ref())));
-
-    tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
-
-    (quotes, route_stats)
 }
 
 /// The nonce of the trader's signing key and a recent final block's hash, to sign the routes'
@@ -406,6 +466,7 @@ async fn main() {
 
     info!("Starting swap-router HTTP server...");
 
+    hooks::load();
     lazy_static::initialize(&providers::intear_plach::FEE_DISCOUNTER);
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;

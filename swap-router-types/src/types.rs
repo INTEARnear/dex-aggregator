@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Display, str::FromStr};
+use std::{collections::BTreeMap, fmt::Display, str::FromStr, sync::Arc};
 
 use bigdecimal::BigDecimal;
 use near_min_api::{
@@ -9,8 +9,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
-use crate::providers::intear_plach::AssetId;
-use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
+use intear_dex_types::{AssetId, FeeFraction, FULL_FEE_FRACTION};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -81,7 +80,7 @@ impl FromStr for TokenId {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SwapRequest {
     /// The token to swap from. This and token_out must be different.
     pub token_in: TokenId,
@@ -182,6 +181,25 @@ impl FromStr for QuoteFees {
     }
 }
 
+impl Serialize for QuoteFees {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = self
+            .0
+            .iter()
+            .map(|(account_id, fee_fraction)| {
+                (
+                    account_id.clone(),
+                    (BigDecimal::from(*fee_fraction) / BigDecimal::from(FULL_FEE_FRACTION))
+                        .to_f64()
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<AccountId, f64>>();
+        let string = serde_json::to_string(&map).unwrap();
+        string.serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for QuoteFees {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer)?
@@ -193,7 +211,24 @@ impl<'de> Deserialize<'de> for QuoteFees {
 mod comma_separated {
     use std::{fmt::Display, str::FromStr};
 
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T>(values: &Option<Vec<T>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Display,
+    {
+        values
+            .as_ref()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .serialize(serializer)
+    }
 
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
     where
@@ -220,8 +255,9 @@ where
     D: serde::Deserializer<'de>,
     S: std::str::FromStr,
 {
-    let s = <&str as serde::Deserialize>::deserialize(deserializer)?;
-    S::from_str(s).map_err(|_| D::Error::custom("could not parse string"))
+    // Owned, so it also reads values that were buffered or unescaped, like in a hook's JSON input
+    let s = String::deserialize(deserializer)?;
+    S::from_str(&s).map_err(|_| D::Error::custom("could not parse string"))
 }
 
 fn to_str<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
@@ -284,7 +320,7 @@ pub struct Route {
     pub estimated_gas_paid: NearGas,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Quote {
     #[serde(flatten)]
     pub route: Route,
@@ -302,12 +338,12 @@ pub struct Quote {
     pub fee_amount: Balance,
     /// What to sign the transactions with, so they can be sent without asking an RPC first: with
     /// `trader_account_id` and `signing_public_key` in the request, once the key is found
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing: Option<SigningContext>,
 }
 
 /// The nonce and block hash to sign a route's transactions with
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct SigningContext {
     /// The nonce `signing_public_key` is at, as of the latest block: the first transaction takes
     /// the one after. Read when the routes were found, so a transaction the key sent since makes
@@ -414,7 +450,7 @@ mod signed_dec_format {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DexId {
     /// https://app.rhea.finance/
     /// AMM DEX
@@ -445,8 +481,14 @@ pub enum DexId {
     ///
     /// Supports both AmountIn and AmountOut
     Plach,
+    /// A hook loaded at startup from `hooks/<name>.so`, named `hook:<name>`, that adds quotes on
+    /// top of the other DEXes' ones. Any name parses, the aggregator checks that it's loaded.
+    ///
+    /// Supports what the hook supports
+    Hook(Arc<str>),
 }
 
+const HOOK_PREFIX: &str = "hook:";
 const RHEA_STR: &str = "Rhea";
 const AIDOLS_STR: &str = "Aidols";
 const WRAP_STR: &str = "Wrap";
@@ -469,7 +511,27 @@ impl Display for DexId {
             DexId::XRhea => f.write_str(XRHEA_STR),
             DexId::RNear => f.write_str(RNEAR_STR),
             DexId::Plach => f.write_str(PLACH_STR),
+            DexId::Hook(name) => write!(f, "{HOOK_PREFIX}{name}"),
         }
+    }
+}
+
+impl Serialize for DexId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DexId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -477,6 +539,12 @@ impl FromStr for DexId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(name) = s.strip_prefix(HOOK_PREFIX) {
+            if name.is_empty() {
+                return Err(format!("Invalid dex id: {s}"));
+            }
+            return Ok(DexId::Hook(name.into()));
+        }
         Ok(match s {
             RHEA_STR => DexId::Rhea,
             AIDOLS_STR => DexId::Aidols,

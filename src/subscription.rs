@@ -1,10 +1,11 @@
-use std::{net::IpAddr, time::Duration};
+use std::time::Duration;
 
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
+    http::{HeaderMap, Uri},
     response::Response,
     Extension,
 };
@@ -14,8 +15,10 @@ use serde_json::json;
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tracing::info;
 
+use swap_router_types::hook::RequestDetails;
+
 use crate::{
-    find_routes,
+    find_routes, hooks,
     rate_limit::{ClientIp, RequestLimit},
     record_stats,
     stats::Stats,
@@ -42,12 +45,20 @@ pub async fn subscribe_handler(
     State(stats): State<Stats>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Extension(limit): Extension<RequestLimit>,
+    uri: Uri,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    upgrade.on_upgrade(move |socket| subscribe(socket, stats, ip, limit))
+    let request_details = hooks::request_details(ip, &uri, &headers);
+    upgrade.on_upgrade(move |socket| subscribe(socket, stats, request_details, limit))
 }
 
-async fn subscribe(mut socket: WebSocket, stats: Stats, ip: IpAddr, limit: RequestLimit) {
+async fn subscribe(
+    mut socket: WebSocket,
+    stats: Stats,
+    request_details: RequestDetails,
+    limit: RequestLimit,
+) {
     let (updates_sender, mut updates) = mpsc::unbounded_channel::<String>();
     let mut routing: Option<JoinHandle<()>> = None;
     loop {
@@ -74,7 +85,7 @@ async fn subscribe(mut socket: WebSocket, stats: Stats, ip: IpAddr, limit: Reque
                             id,
                             request,
                             stats.clone(),
-                            ip,
+                            request_details.clone(),
                             updates_sender.clone(),
                         )));
                     }
@@ -111,7 +122,7 @@ async fn route_updates(
     id: u64,
     request: SwapRequest,
     stats: Stats,
-    ip: IpAddr,
+    request_details: RequestDetails,
     updates: mpsc::UnboundedSender<String>,
 ) {
     let mut pools_updated = pathfinder::pools_updated();
@@ -121,11 +132,18 @@ async fn route_updates(
         pools_updated.borrow_and_update();
         let started_at = Instant::now();
         let timestamp = Utc::now();
-        let (quotes, route_stats) = find_routes(&request).await;
+        let (quotes, route_stats) = find_routes(&request, &request_details).await;
         let duration = started_at.elapsed();
 
         if sent_quotes.is_none() {
-            record_stats(&stats, ip, timestamp, &request, duration, route_stats);
+            record_stats(
+                &stats,
+                request_details.ip,
+                timestamp,
+                &request,
+                duration,
+                route_stats,
+            );
         }
         if sent_quotes.as_ref() != Some(&quotes) {
             let update = json!({ "id": id, "routes": &quotes }).to_string();

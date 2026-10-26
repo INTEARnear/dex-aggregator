@@ -1,0 +1,22 @@
+[package]
+name = "swap-router-types"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+bigdecimal = "0.4.8"
+num-traits = "0.2.19"
+sha2 = "0.10.9"
+near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "62fe007e64a5cfcc2960f7ee14d3272750cd0208", features = ["json"] }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "62fe007e64a5cfcc2960f7ee14d3272750cd0208" }
+otc-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "62fe007e64a5cfcc2960f7ee14d3272750cd0208" }
+# Native builds of the dex's types crates need this feature
+near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
+
+[features]
+# For usage in hooks
+hook = []

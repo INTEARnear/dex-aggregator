@@ -23,9 +23,9 @@ use xyk_dex_types::{
 use crate::{
     shared_utils::{
         base_token, convert_to_native, convert_to_nep141, deposit_storage_if_needed,
-        estimated_gas_paid, get_slippage, intear_registration, is_near, payable_referral_fees,
-        price_raw, register_input_in_wallet, swap_call_gas, swap_call_gas_paid, BaseTokenId,
-        Mainnet, NetworkView, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
+        estimated_gas_paid, get_slippage, is_near, payable_referral_fees, price_raw,
+        register_assets_on_intear, register_input_in_wallet, swap_call_gas, swap_call_gas_paid,
+        BaseTokenId, Mainnet, NetworkView, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
     },
     types::{ExecutionInstruction, TokenId},
     Amount, DexId, Provider, Route, SwapRequest,
@@ -35,7 +35,6 @@ pub struct IntearPlachProvider;
 
 pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-const CHAIN_ID: &str = "mainnet";
 const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
 const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);
 const WITHDRAWAL_CALLBACK_GAS: NearGas = NearGas::from_tgas(5);
@@ -161,7 +160,7 @@ impl FeeDiscounter {
 
 fn fee_discount_signature_payload(discount: &FeeDiscount) -> FeeDiscountSignaturePayload {
     FeeDiscountSignaturePayload {
-        chain_id: CHAIN_ID.to_string(),
+        chain_id: "mainnet".to_string(),
         engine_contract_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
         dex_id: PLACH_DEX_ID.parse().unwrap(),
         discount: discount.clone(),
@@ -457,7 +456,7 @@ async fn route(
         .collect::<Vec<_>>();
     let registration_transactions = match request.trader_account_id.as_ref() {
         Some(trader_account_id) => {
-            intear_registration(
+            register_assets_on_intear(
                 network,
                 trader_account_id,
                 registered_assets,
@@ -698,9 +697,10 @@ mod tests {
     use super::*;
     use crate::shared_utils::{
         create_rhea_withdraw_action, create_storage_deposit_action_for_contract,
-        create_unwrap_action, TestNetworkView, AGGREGATOR_FEE_RECEIVER_ID, WRAP_NEAR,
+        create_unwrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
+    use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
     struct TestPlachQuotes {

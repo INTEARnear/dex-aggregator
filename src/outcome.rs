@@ -619,7 +619,7 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
         (event["standard"] == standard && event["event"] == "swap").then(|| event["data"].clone())
     };
     match executor_id.as_str() {
-        INTEAR_DEX_CONTRACT_ID => event("inteardex")
+        s if s == INTEAR_DEX_CONTRACT_ID => event("inteardex")
             .and_then(|data| serde_json::from_value::<IntearDexSwap>(data).ok())
             .filter(|swap| &swap.trader == trader)
             .and_then(|swap| {
@@ -637,7 +637,7 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
             })
             .into_iter()
             .collect(),
-        RHEA_DCL_CONTRACT_ID => event("dcl.ref")
+        s if s == RHEA_DCL_CONTRACT_ID => event("dcl.ref")
             .and_then(|data| serde_json::from_value::<Vec<RheaDclSwap>>(data).ok())
             .unwrap_or_default()
             .into_iter()
@@ -650,7 +650,7 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
             })
             .collect(),
         // Rhea doesn't log the trader, but these are the trader's own transactions
-        RHEA_CONTRACT_ID => (|| {
+        s if s == RHEA_CONTRACT_ID => (|| {
             let words = log.strip_prefix("Swapped ")?.split(' ').collect::<Vec<_>>();
             let [amount_in, token_in, "for", amount_out, token_out] = words.as_slice() else {
                 return None;

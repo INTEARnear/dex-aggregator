@@ -1,3 +1,4 @@
-target
-.env
-stats.sqlite*
+/target
+/.env
+/stats.sqlite*
+/hooks/*.so

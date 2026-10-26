@@ -371,7 +371,7 @@ async fn intear_registration_pays_what_the_contract_charges() {
         let account_id = account(account_id);
         async move {
             registration_deposit(
-                &intear_registration(
+                &register_assets_on_intear(
                     &network,
                     &account_id,
                     &asset_ids.iter().collect::<Vec<_>>(),
@@ -2150,38 +2150,6 @@ fn estimated_gas_paid_of_swap_call() {
     gas_paid(
         "0x0000000000000000000000000000000000000000",
         NearGas::from_gas(7_423_182_562_500),
-    );
-}
-
-#[test]
-fn aggregator_gets_its_share_of_each_referral_fee() {
-    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"ref2.near":0.02,"zero.near":0}"#
-        .parse()
-        .unwrap();
-    // 80% of each fee to its referrer, 20% of all of them together to the aggregator, and nothing
-    // for the fee of 0
-    assert_eq!(
-        payable_referral_fees(&referral_fees).0,
-        vec![
-            ("ref.near".parse().unwrap(), 8_000),
-            ("ref2.near".parse().unwrap(), 16_000),
-            (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 6_000),
-        ]
-    );
-}
-
-#[test]
-fn aggregator_share_adds_to_the_aggregator_as_a_referrer() {
-    let referral_fees: QuoteFees = r#"{"ref.near":0.01,"dex-aggregator.intear.near":0.01}"#
-        .parse()
-        .unwrap();
-    assert_eq!(
-        payable_referral_fees(&referral_fees).0,
-        // Referrers come sorted by account ID. The aggregator's 80% and the 20% of both fees
-        vec![
-            (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), 12_000),
-            ("ref.near".parse().unwrap(), 8_000),
-        ]
     );
 }
 

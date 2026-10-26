@@ -2447,6 +2447,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3058,6 +3068,15 @@ dependencies = [
  "num-traits",
  "rand 0.8.8",
  "serde",
+]
+
+[[package]]
+name = "otc-dex-types"
+version = "0.1.0"
+source = "git+https://github.com/INTEARnear/dex?rev=62fe007e64a5cfcc2960f7ee14d3272750cd0208#62fe007e64a5cfcc2960f7ee14d3272750cd0208"
+dependencies = [
+ "intear-dex-types",
+ "near-sdk",
 ]
 
 [[package]]
@@ -4562,9 +4581,11 @@ dependencies = [
  "intear-dex-types",
  "ipnet",
  "lazy_static",
+ "libloading",
  "near-min-api",
  "near-sdk",
  "num-traits",
+ "otc-dex-types",
  "pathfinder",
  "reqwest 0.12.28",
  "serde",
@@ -4572,10 +4593,27 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.10.9",
  "sqlx",
+ "swap-router-types",
  "tokio",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "xyk-dex-types",
+]
+
+[[package]]
+name = "swap-router-types"
+version = "0.1.0"
+dependencies = [
+ "bigdecimal",
+ "intear-dex-types",
+ "near-min-api",
+ "near-sdk",
+ "num-traits",
+ "otc-dex-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "xyk-dex-types",
 ]
 

@@ -11,7 +11,7 @@ use std::{
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
 use intear_dex_types::DirectWithdrawAmount;
-use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
+use intear_dex_types::FULL_FEE_FRACTION;
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
@@ -24,8 +24,8 @@ use near_min_api::{
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
+pub use swap_router_types::fees::payable_referral_fees;
 use tracing::{error, info, warn};
-use xyk_dex_types::{FeeFractionFraction, FULL_FEE_FRACTION_FRACTION};
 
 use crate::{
     providers::intear_plach::AssetId,
@@ -34,12 +34,6 @@ use crate::{
 
 pub const WRAP_NEAR: &str = "wrap.near";
 pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
-/// Gets the aggregator's share of every referral fee of Rhea and Rhea DCL routes
-pub const AGGREGATOR_FEE_RECEIVER_ID: &AccountIdRef =
-    AccountIdRef::new_or_panic("dex-aggregator.intear.near");
-/// The part of each referral fee that goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the
-/// referrer
-const AGGREGATOR_FEE_SHARE: FeeFractionFraction = FULL_FEE_FRACTION_FRACTION / 5; // 20%
 pub const STORAGE_BYTE_COST: NearToken = NearToken::from_yoctonear(10u128.pow(19));
 
 // Fees burnt on top of the gas attached to actions, `send_not_sir` + `execution` of mainnet's
@@ -339,33 +333,6 @@ pub trait NetworkView: Send + Sync {
 pub struct ReferrerFee {
     pub referrer_id: AccountId,
     pub amount: Balance,
-}
-
-/// The referral fees of the request, without the ones of 0. [`AGGREGATOR_FEE_SHARE`] of each fee
-/// goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the referrer.
-pub fn payable_referral_fees(referral_fees: &QuoteFees) -> QuoteFees {
-    let mut payable = Vec::new();
-    let mut protocol_share = 0;
-    for (referrer_id, fee_fraction) in &referral_fees.0 {
-        if *fee_fraction == 0 {
-            continue;
-        }
-        // Rounded down
-        let share = (u64::from(*fee_fraction) * u64::from(AGGREGATOR_FEE_SHARE)
-            / u64::from(FULL_FEE_FRACTION)) as FeeFraction;
-        protocol_share += share;
-        payable.push((referrer_id.clone(), fee_fraction - share));
-    }
-    if protocol_share > 0 {
-        match payable
-            .iter_mut()
-            .find(|(referrer_id, _)| referrer_id == AGGREGATOR_FEE_RECEIVER_ID)
-        {
-            Some((_, fee_fraction)) => *fee_fraction += protocol_share,
-            None => payable.push((AGGREGATOR_FEE_RECEIVER_ID.to_owned(), protocol_share)),
-        }
-    }
-    QuoteFees(payable)
 }
 
 /// Each referrer's fee out of `total`, without the ones rounded down to nothing
@@ -1055,7 +1022,7 @@ fn intear_balances_bytes(
 /// Registers the assets the account has no balance of on Intear DEX yet, and each fee receiver's
 /// asset it hasn't registered, so the engine pays it its fee. The account deposits the storage
 /// all of them lack.
-pub async fn intear_registration(
+pub async fn register_assets_on_intear(
     network: &impl NetworkView,
     account_id: &AccountId,
     asset_ids: &[&AssetId],
@@ -1728,7 +1695,7 @@ pub async fn deposit_storage_if_needed(
             rhea_registration(network, &trader_account_id, &[token_id]).await
         }
         TokenId::TokenOnIntearDex(asset_id) => {
-            intear_registration(network, &trader_account_id, &[asset_id], &[]).await
+            register_assets_on_intear(network, &trader_account_id, &[asset_id], &[]).await
         }
     }
 }
