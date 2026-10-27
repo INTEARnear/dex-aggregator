@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
-use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken};
+use near_min_api::types::{AccountId, NearToken};
 use num_traits::FromPrimitive;
 
 use super::*;
-use crate::types::{ExecutionInstruction, Slippage, TokenId};
+use crate::route::{fee_transactions_amount, merge_transactions, storage_deposits};
+use crate::types::{Slippage, TokenId};
 use intear_dex_types::AssetId;
 
 fn account(id: &str) -> AccountId {
@@ -53,42 +54,28 @@ fn trader() -> AccountId {
     account("trader.near")
 }
 
-fn function_call_from_action(action: &Action) -> &FunctionCallAction {
-    match action {
-        Action::FunctionCall(function_call) => function_call,
-        other => panic!("expected FunctionCall, got {other:?}"),
-    }
+fn call_args(call: &RouteCall) -> serde_json::Value {
+    serde_json::from_slice(&call.args).expect("function call args should be JSON")
 }
 
-fn args_from_action(action: &Action) -> serde_json::Value {
-    serde_json::from_slice(&function_call_from_action(action).args)
-        .expect("function call args should be JSON")
-}
-
-fn near_tx(instruction: &ExecutionInstruction) -> (&AccountId, &[Action]) {
-    match instruction {
-        ExecutionInstruction::NearTransaction {
-            receiver_id,
-            actions,
-            ..
-        } => (receiver_id, actions),
-    }
+fn near_tx(transaction: &RouteTransaction) -> (&AccountId, &[RouteCall]) {
+    (&transaction.receiver_id, &transaction.calls)
 }
 
 fn assert_near_tx(
-    instruction: &ExecutionInstruction,
+    instruction: &RouteTransaction,
     expected_receiver: &str,
-    expected_actions: &[Action],
+    expected_actions: &[RouteCall],
 ) {
     let (receiver_id, actions) = near_tx(instruction);
     assert_eq!(receiver_id.as_str(), expected_receiver);
     assert_eq!(actions, expected_actions);
 }
 
-fn wrap_tx(receiver: &str, amount: u128) -> ExecutionInstruction {
-    ExecutionInstruction::NearTransaction {
+fn wrap_tx(receiver: &str, amount: u128) -> RouteTransaction {
+    RouteTransaction {
         receiver_id: account(receiver),
-        actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+        calls: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
         is_fee_transaction: false,
     }
 }
@@ -115,10 +102,10 @@ fn expected_auto_slippage(min: &str, max: &str, scale: BigDecimal) -> BigDecimal
 fn create_wrap_action_fields() {
     let amount = NearToken::from_near(2);
     let action = create_wrap_action(amount);
-    let function_call = function_call_from_action(&action);
+    let function_call = &action;
     assert_eq!(function_call.method_name, "near_deposit");
-    assert_eq!(args_from_action(&action), serde_json::json!({}));
-    assert_eq!(function_call.gas, NEAR_DEPOSIT_GAS.attached());
+    assert_eq!(call_args(&action), serde_json::json!({}));
+    assert_eq!(function_call.gas, NEAR_DEPOSIT_GAS);
     assert_eq!(function_call.deposit, amount);
 }
 
@@ -126,15 +113,12 @@ fn create_wrap_action_fields() {
 fn create_unwrap_action_fields() {
     let amount = NearToken::from_near(3);
     let action = create_unwrap_action(amount, None);
-    let function_call = function_call_from_action(&action);
+    let function_call = &action;
     assert_eq!(function_call.method_name, "near_withdraw");
-    assert_eq!(
-        args_from_action(&action),
-        serde_json::json!({ "amount": amount })
-    );
+    assert_eq!(call_args(&action), serde_json::json!({ "amount": amount }));
     assert_eq!(
         function_call.gas,
-        (NEAR_WITHDRAW_GAS + near_receive_gas(None)).attached()
+        NEAR_WITHDRAW_GAS + near_receive_gas(None)
     );
     assert_eq!(function_call.deposit, NearToken::from_yoctonear(1));
 }
@@ -144,23 +128,14 @@ fn create_rhea_withdraw_action_skip_unwrap_near_is_inverted() {
     let token_id = account(WRAP_NEAR);
     let unwrap = create_rhea_withdraw_action(&token_id, 10, true, None);
     let skip = create_rhea_withdraw_action(&token_id, 10, false, None);
-    let unwrap_call = function_call_from_action(&unwrap);
+    let unwrap_call = &unwrap;
 
     assert_eq!(unwrap_call.method_name, "withdraw");
-    assert_eq!(
-        unwrap_call.gas,
-        helper_call_gas(
-            &account("v2.ref-finance.near"),
-            "withdraw",
-            &unwrap_call.args,
-            None
-        )
-        .attached()
-    );
+    assert_eq!(unwrap_call.gas, rhea::withdraw_gas(true, None));
     assert_eq!(unwrap_call.deposit, NearToken::from_yoctonear(1));
-    assert_eq!(function_call_from_action(&skip).method_name, "withdraw");
+    assert_eq!(skip.method_name, "withdraw");
     assert_eq!(
-        args_from_action(&unwrap),
+        call_args(&unwrap),
         serde_json::json!({
             "token_id": WRAP_NEAR,
             "amount": "10",
@@ -168,7 +143,7 @@ fn create_rhea_withdraw_action_skip_unwrap_near_is_inverted() {
         })
     );
     assert_eq!(
-        args_from_action(&skip),
+        call_args(&skip),
         serde_json::json!({
             "token_id": WRAP_NEAR,
             "amount": "10",
@@ -181,21 +156,12 @@ fn create_rhea_withdraw_action_skip_unwrap_near_is_inverted() {
 fn create_intear_dex_withdraw_action_uses_exact_amount() {
     let asset_id = AssetId::Nep141(account(WRAP_NEAR));
     let action = create_intear_dex_withdraw_action(&asset_id, 42, None);
-    let function_call = function_call_from_action(&action);
+    let function_call = &action;
     assert_eq!(function_call.method_name, "withdraw");
-    assert_eq!(
-        function_call.gas,
-        helper_call_gas(
-            &account("dex.intear.near"),
-            "withdraw",
-            &function_call.args,
-            None
-        )
-        .attached()
-    );
+    assert_eq!(function_call.gas, inteardex::withdraw_gas(&asset_id, None));
     assert_eq!(function_call.deposit, NearToken::from_yoctonear(1));
     assert_eq!(
-        args_from_action(&action),
+        call_args(&action),
         serde_json::json!({
             "asset_id": AssetId::Nep141(account(WRAP_NEAR)),
             "amount": { "Exact": "42" },
@@ -205,15 +171,14 @@ fn create_intear_dex_withdraw_action_uses_exact_amount() {
 
 #[test]
 fn create_rhea_and_intear_nep141_deposit_actions_match_ft_transfer_call_shape() {
-    let token_id = account("ft");
-    let rhea = create_rhea_nep141_deposit_action(&token_id, 7);
-    let intear = create_intear_nep141_deposit_action(&token_id, 7);
+    let rhea = create_rhea_nep141_deposit_action(7);
+    let intear = create_intear_nep141_deposit_action(7);
     for (action, receiver_id) in [(&rhea, "v2.ref-finance.near"), (&intear, "dex.intear.near")] {
-        let function_call = function_call_from_action(action);
+        let function_call = action;
         assert_eq!(function_call.method_name, "ft_transfer_call");
         assert_eq!(function_call.deposit, NearToken::from_yoctonear(1));
         assert_eq!(
-            args_from_action(action),
+            call_args(action),
             serde_json::json!({
                 "receiver_id": receiver_id,
                 "amount": "7",
@@ -226,28 +191,29 @@ fn create_rhea_and_intear_nep141_deposit_actions_match_ft_transfer_call_shape() 
 #[test]
 fn create_storage_deposit_action_for_contract_and_someone() {
     let amount = NearToken::from_millinear(1250);
-    let for_self = create_storage_deposit_action_for_contract(&account("ft"), amount, true);
+    let for_self =
+        create_storage_deposit_action_for_contract(amount, true, TOKEN_STORAGE_DEPOSIT_GAS);
     let for_someone = create_storage_deposit_action_for_someone(
-        &account("ft"),
         amount,
         &account("bob.near"),
         true,
+        TOKEN_STORAGE_DEPOSIT_GAS,
     );
 
-    let self_call = function_call_from_action(&for_self);
+    let self_call = &for_self;
     assert_eq!(self_call.method_name, "storage_deposit");
-    assert_eq!(self_call.gas, Gas(NearGas::from_tgas(10)));
+    assert_eq!(self_call.gas, TOKEN_STORAGE_DEPOSIT_GAS);
     assert_eq!(self_call.deposit, amount);
     assert_eq!(
-        args_from_action(&for_self),
+        call_args(&for_self),
         serde_json::json!({ "registration_only": true })
     );
 
-    let someone_call = function_call_from_action(&for_someone);
+    let someone_call = &for_someone;
     assert_eq!(someone_call.method_name, "storage_deposit");
     assert_eq!(someone_call.deposit, amount);
     assert_eq!(
-        args_from_action(&for_someone),
+        call_args(&for_someone),
         serde_json::json!({
             "registration_only": true,
             "account_id": "bob.near",
@@ -261,25 +227,18 @@ fn storage_bytes(bytes: u128) -> NearToken {
 }
 
 /// The storage deposit and registration `deposit_storage_if_needed` makes on Rhea or Intear DEX
-fn registration_deposit(instructions: &[ExecutionInstruction]) -> Option<NearToken> {
+fn registration_deposit(instructions: &[RouteTransaction]) -> Option<NearToken> {
     assert_eq!(instructions.len(), 1, "{instructions:?}");
     let (_, actions) = near_tx(&instructions[0]);
     match actions {
         [registration] => {
-            assert!(function_call_from_action(registration)
-                .method_name
-                .starts_with("register_"));
+            assert!(registration.method_name.starts_with("register_"));
             None
         }
         [storage_deposit, registration] => {
-            assert_eq!(
-                function_call_from_action(storage_deposit).method_name,
-                "storage_deposit"
-            );
-            assert!(function_call_from_action(registration)
-                .method_name
-                .starts_with("register_"));
-            Some(function_call_from_action(storage_deposit).deposit)
+            assert_eq!(storage_deposit.method_name, "storage_deposit");
+            assert!(registration.method_name.starts_with("register_"));
+            Some(storage_deposit.deposit)
         }
         _ => panic!("Not a registration: {actions:?}"),
     }
@@ -295,9 +254,9 @@ async fn deposit_storage_if_needed_nep141_deposits_the_token_minimum() {
         &instructions[0],
         "ft",
         &[create_storage_deposit_action_for_contract(
-            &account("ft"),
             "0.00125 NEAR".parse().unwrap(),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
     assert_eq!(
@@ -317,26 +276,20 @@ async fn rhea_registration_shape() {
     assert_eq!(
         actions[0],
         create_storage_deposit_action_for_contract(
-            &account("v2.ref-finance.near"),
             storage_bytes(102 + 148),
-            false
+            false,
+            crate::providers::rhea::STORAGE_DEPOSIT_GAS
         )
     );
-    let register = function_call_from_action(&actions[1]);
+    let register = &actions[1];
     assert_eq!(register.method_name, "register_tokens");
     assert_eq!(
         register.gas,
-        helper_call_gas(
-            &account("v2.ref-finance.near"),
-            "register_tokens",
-            &register.args,
-            None
-        )
-        .attached()
+        rhea::REGISTER_TOKENS_GAS + rhea::REGISTERED_TOKEN_GAS
     );
     assert_eq!(register.deposit, NearToken::from_yoctonear(1));
     assert_eq!(
-        args_from_action(&actions[1]),
+        call_args(&actions[1]),
         serde_json::json!({ "token_ids": ["ft"] })
     );
 }
@@ -580,9 +533,9 @@ async fn wallet_inputs_need_no_registration() {
         &instructions[0],
         "ft",
         &[create_storage_deposit_action_for_contract(
-            &account("ft"),
             "0.00125 NEAR".parse().unwrap(),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
 }
@@ -631,41 +584,39 @@ async fn create_token_storage_deposit_action_for_someone_uses_token_min() {
     assert_eq!(
         create_nep141_storage_deposit_action(&network, &account("ft"), Some(&contract_id)).await,
         Some(create_storage_deposit_action_for_someone(
-            &account("ft"),
             "0.0025 NEAR".parse().unwrap(),
             &contract_id,
-            true
+            true,
+            TOKEN_STORAGE_DEPOSIT_GAS
         ))
     );
 }
 
 #[test]
-fn optimize_empty_input() {
-    assert!(optimize_execution_instructions(vec![]).is_empty());
+fn merge_empty_input() {
+    assert!(merge_transactions(vec![]).is_empty());
 }
 
 #[test]
-fn optimize_skips_empty_actions() {
-    assert!(
-        optimize_execution_instructions(vec![ExecutionInstruction::NearTransaction {
-            receiver_id: account(WRAP_NEAR),
-            actions: vec![],
-            is_fee_transaction: false,
-        }])
-        .is_empty()
-    );
+fn merge_skips_empty_actions() {
+    assert!(merge_transactions(vec![RouteTransaction {
+        receiver_id: account(WRAP_NEAR),
+        calls: vec![],
+        is_fee_transaction: false,
+    }])
+    .is_empty());
 }
 
 #[test]
-fn optimize_merges_neighboring_same_receiver() {
-    let optimized = optimize_execution_instructions(vec![
+fn merge_merges_neighboring_same_receiver() {
+    let merged = merge_transactions(vec![
         wrap_tx(WRAP_NEAR, 1),
         wrap_tx(WRAP_NEAR, 2),
         wrap_tx(WRAP_NEAR, 3),
     ]);
-    assert_eq!(optimized.len(), 1);
+    assert_eq!(merged.len(), 1);
     assert_near_tx(
-        &optimized[0],
+        &merged[0],
         WRAP_NEAR,
         &[
             create_wrap_action(NearToken::from_yoctonear(1)),
@@ -676,37 +627,36 @@ fn optimize_merges_neighboring_same_receiver() {
 }
 
 #[test]
-fn optimize_does_not_merge_different_receivers() {
-    let optimized = optimize_execution_instructions(vec![wrap_tx(WRAP_NEAR, 1), wrap_tx("ft", 2)]);
-    assert_eq!(optimized.len(), 2);
+fn merge_does_not_merge_different_receivers() {
+    let merged = merge_transactions(vec![wrap_tx(WRAP_NEAR, 1), wrap_tx("ft", 2)]);
+    assert_eq!(merged.len(), 2);
     assert_near_tx(
-        &optimized[0],
+        &merged[0],
         WRAP_NEAR,
         &[create_wrap_action(NearToken::from_yoctonear(1))],
     );
     assert_near_tx(
-        &optimized[1],
+        &merged[1],
         "ft",
         &[create_wrap_action(NearToken::from_yoctonear(2))],
     );
 }
 
 #[test]
-fn optimize_merges_fee_transactions_only_with_each_other() {
-    let fee_tx = |amount| ExecutionInstruction::NearTransaction {
+fn merge_merges_fee_transactions_only_with_each_other() {
+    let fee_tx = |amount| RouteTransaction {
         receiver_id: account(WRAP_NEAR),
-        actions: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
+        calls: vec![create_wrap_action(NearToken::from_yoctonear(amount))],
         is_fee_transaction: true,
     };
-    let optimized =
-        optimize_execution_instructions(vec![wrap_tx(WRAP_NEAR, 1), fee_tx(2), fee_tx(3)]);
+    let merged = merge_transactions(vec![wrap_tx(WRAP_NEAR, 1), fee_tx(2), fee_tx(3)]);
     assert_eq!(
-        optimized,
+        merged,
         vec![
             wrap_tx(WRAP_NEAR, 1),
-            ExecutionInstruction::NearTransaction {
+            RouteTransaction {
                 receiver_id: account(WRAP_NEAR),
-                actions: vec![
+                calls: vec![
                     create_wrap_action(NearToken::from_yoctonear(2)),
                     create_wrap_action(NearToken::from_yoctonear(3)),
                 ],
@@ -717,29 +667,29 @@ fn optimize_merges_fee_transactions_only_with_each_other() {
 }
 
 #[test]
-fn optimize_does_not_merge_non_adjacent_same_receiver() {
-    let optimized = optimize_execution_instructions(vec![
+fn merge_does_not_merge_non_adjacent_same_receiver() {
+    let merged = merge_transactions(vec![
         wrap_tx(WRAP_NEAR, 1),
         wrap_tx("ft", 2),
         wrap_tx(WRAP_NEAR, 3),
     ]);
-    assert_eq!(optimized.len(), 3);
+    assert_eq!(merged.len(), 3);
 }
 
 #[test]
-fn optimize_skips_empty_actions_then_merges_neighbors() {
-    let optimized = optimize_execution_instructions(vec![
+fn merge_skips_empty_actions_then_merges_neighbors() {
+    let merged = merge_transactions(vec![
         wrap_tx(WRAP_NEAR, 1),
-        ExecutionInstruction::NearTransaction {
+        RouteTransaction {
             receiver_id: account(WRAP_NEAR),
-            actions: vec![],
+            calls: vec![],
             is_fee_transaction: false,
         },
         wrap_tx(WRAP_NEAR, 2),
     ]);
-    assert_eq!(optimized.len(), 1);
+    assert_eq!(merged.len(), 1);
     assert_near_tx(
-        &optimized[0],
+        &merged[0],
         WRAP_NEAR,
         &[
             create_wrap_action(NearToken::from_yoctonear(1)),
@@ -1140,10 +1090,10 @@ async fn register_receiver_on_token_only_when_the_contract_has_no_storage() {
         &instructions[0],
         "ft",
         &[create_storage_deposit_action_for_someone(
-            &account("ft"),
             "0.00125 NEAR".parse().unwrap(),
             &contract_id,
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
 }
@@ -1179,9 +1129,9 @@ async fn deposit_storage_if_needed_with_trader_depends_on_existing_deposit() {
         &instructions[0],
         "ft",
         &[create_storage_deposit_action_for_contract(
-            &account("ft"),
             "0.00125 NEAR".parse().unwrap(),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
 }
@@ -1191,7 +1141,13 @@ async fn deposit_storage_on_contract_if_needed_none_trader_is_empty() {
     let network = TestNetworkView::default();
     let contract = account("dclv2.ref-labs.near");
     assert_eq!(
-        deposit_storage_on_contract_if_needed(&network, &contract, None).await,
+        deposit_storage_on_contract_if_needed(
+            &network,
+            &contract,
+            None,
+            crate::providers::rhea_dcl::STORAGE_DEPOSIT_GAS
+        )
+        .await,
         Some(vec![])
     );
 }
@@ -1207,23 +1163,34 @@ async fn deposit_storage_on_contract_if_needed_deposits_the_contract_minimum() {
         storage_deposit_amount(),
     );
     assert_eq!(
-        deposit_storage_on_contract_if_needed(&already, &contract, Some(trader())).await,
+        deposit_storage_on_contract_if_needed(
+            &already,
+            &contract,
+            Some(trader()),
+            crate::providers::rhea_dcl::STORAGE_DEPOSIT_GAS
+        )
+        .await,
         Some(vec![])
     );
 
     // dclv2.ref-labs.near's storage_balance_bounds min on mainnet
     let needs = TestNetworkView::default();
-    let instructions = deposit_storage_on_contract_if_needed(&needs, &contract, Some(trader()))
-        .await
-        .unwrap();
+    let instructions = deposit_storage_on_contract_if_needed(
+        &needs,
+        &contract,
+        Some(trader()),
+        crate::providers::rhea_dcl::STORAGE_DEPOSIT_GAS,
+    )
+    .await
+    .unwrap();
     assert_eq!(instructions.len(), 1);
     assert_near_tx(
         &instructions[0],
         "dclv2.ref-labs.near",
         &[create_storage_deposit_action_for_contract(
-            &account("dclv2.ref-labs.near"),
             NearToken::from_millinear(500),
             true,
+            crate::providers::rhea_dcl::STORAGE_DEPOSIT_GAS,
         )],
     );
 }
@@ -1355,10 +1322,10 @@ async fn convert_to_rhea_destination_without_trader_registers_contract_then_depo
         &instructions[0],
         WRAP_NEAR,
         &[create_storage_deposit_action_for_someone(
-            &account(WRAP_NEAR),
             "0.00125 NEAR".parse().unwrap(),
             &account("v2.ref-finance.near"),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
     assert_near_tx(
@@ -1369,7 +1336,7 @@ async fn convert_to_rhea_destination_without_trader_registers_contract_then_depo
     assert_near_tx(
         &instructions[2],
         WRAP_NEAR,
-        &[create_rhea_nep141_deposit_action(&account(WRAP_NEAR), 5)],
+        &[create_rhea_nep141_deposit_action(5)],
     );
 }
 
@@ -1394,7 +1361,7 @@ async fn convert_to_rhea_destination_skips_ft_registration_when_contract_is_stor
     assert_near_tx(
         &instructions[1],
         WRAP_NEAR,
-        &[create_rhea_nep141_deposit_action(&account(WRAP_NEAR), 5)],
+        &[create_rhea_nep141_deposit_action(5)],
     );
 }
 
@@ -1412,31 +1379,28 @@ async fn convert_to_rhea_destination_with_trader_includes_rhea_and_ft_storage() 
     assert_eq!(
         rhea_actions[0],
         create_storage_deposit_action_for_contract(
-            &account("v2.ref-finance.near"),
             storage_bytes(102 + 148),
-            false
+            false,
+            crate::providers::rhea::STORAGE_DEPOSIT_GAS
         )
     );
-    assert_eq!(
-        function_call_from_action(&rhea_actions[1]).method_name,
-        "register_tokens"
-    );
+    assert_eq!(rhea_actions[1].method_name, "register_tokens");
 
     // The trader holds ft already, so only Rhea is registered on it
     assert_near_tx(
         &instructions[1],
         "ft",
         &[create_storage_deposit_action_for_someone(
-            &account("ft"),
             "0.00125 NEAR".parse().unwrap(),
             &account("v2.ref-finance.near"),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
     assert_near_tx(
         &instructions[2],
         "ft",
-        &[create_rhea_nep141_deposit_action(&account("ft"), 5)],
+        &[create_rhea_nep141_deposit_action(5)],
     );
 }
 
@@ -1455,7 +1419,7 @@ async fn convert_to_intear_nep141_destination_deposits_via_ft_transfer_call() {
     assert_near_tx(
         &instructions[0],
         "ft",
-        &[create_intear_nep141_deposit_action(&account("ft"), 5)],
+        &[create_intear_nep141_deposit_action(5)],
     );
 }
 
@@ -1469,14 +1433,11 @@ async fn convert_to_intear_near_destination_uses_deposit_near() {
     let (receiver_id, actions) = near_tx(&instructions[0]);
     assert_eq!(receiver_id.as_str(), "dex.intear.near");
     assert_eq!(actions.len(), 1);
-    let function_call = function_call_from_action(&actions[0]);
+    let function_call = &actions[0];
     assert_eq!(function_call.method_name, "deposit_near");
-    assert_eq!(
-        function_call.gas,
-        helper_call_gas(&account("dex.intear.near"), "deposit_near", b"{}", None).attached()
-    );
+    assert_eq!(function_call.gas, inteardex::DEPOSIT_NEAR_GAS);
     assert_eq!(function_call.deposit, NearToken::from_yoctonear(5));
-    assert_eq!(args_from_action(&actions[0]), serde_json::json!({}));
+    assert_eq!(call_args(&actions[0]), serde_json::json!({}));
 }
 
 #[tokio::test]
@@ -1488,19 +1449,10 @@ async fn convert_to_intear_near_destination_with_trader_prepends_storage() {
     assert_eq!(instructions.len(), 2, "{instructions:?}");
     let (storage_receiver, storage_actions) = near_tx(&instructions[0]);
     assert_eq!(storage_receiver.as_str(), "dex.intear.near");
-    assert_eq!(
-        function_call_from_action(&storage_actions[0]).method_name,
-        "storage_deposit"
-    );
-    assert_eq!(
-        function_call_from_action(&storage_actions[1]).method_name,
-        "register_assets"
-    );
+    assert_eq!(storage_actions[0].method_name, "storage_deposit");
+    assert_eq!(storage_actions[1].method_name, "register_assets");
     assert_eq!(near_tx(&instructions[1]).0.as_str(), "dex.intear.near");
-    assert_eq!(
-        function_call_from_action(&near_tx(&instructions[1]).1[0]).method_name,
-        "deposit_near"
-    );
+    assert_eq!(near_tx(&instructions[1]).1[0].method_name, "deposit_near");
 }
 
 #[tokio::test]
@@ -1512,7 +1464,7 @@ async fn convert_to_instruction_order_is_register_withdraw_convert_deposit() {
     let methods: Vec<&str> = instructions
         .iter()
         .flat_map(|instruction| near_tx(instruction).1)
-        .map(|action| function_call_from_action(action).method_name.as_str())
+        .map(|action| action.method_name.as_str())
         .collect();
     assert_eq!(
         methods,
@@ -1539,9 +1491,9 @@ async fn convert_to_registers_the_trader_on_a_withdrawn_token() {
         &instructions[0],
         WRAP_NEAR,
         &[create_storage_deposit_action_for_contract(
-            &account(WRAP_NEAR),
             "0.00125 NEAR".parse().unwrap(),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
     assert_near_tx(
@@ -1589,9 +1541,9 @@ async fn convert_to_registers_the_trader_on_wrapped_near() {
         &instructions[0],
         WRAP_NEAR,
         &[create_storage_deposit_action_for_contract(
-            &account(WRAP_NEAR),
             "0.00125 NEAR".parse().unwrap(),
             true,
+            TOKEN_STORAGE_DEPOSIT_GAS,
         )],
     );
     assert_near_tx(
@@ -1625,7 +1577,7 @@ async fn convert_to_doesnt_register_the_trader_on_their_wallet_token() {
     assert_near_tx(
         &instructions[0],
         "ft",
-        &[create_intear_nep141_deposit_action(&account("ft"), 5)],
+        &[create_intear_nep141_deposit_action(5)],
     );
 }
 
@@ -2066,21 +2018,21 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
 #[test]
 fn storage_deposits_add_up_every_deposit() {
     let execution_instructions = vec![
-        ExecutionInstruction::NearTransaction {
+        RouteTransaction {
             receiver_id: account("dclv2.ref-labs.near"),
-            actions: vec![create_storage_deposit_action_for_contract(
-                &account("dclv2.ref-labs.near"),
+            calls: vec![create_storage_deposit_action_for_contract(
                 NearToken::from_millinear(500),
                 true,
+                crate::providers::rhea_dcl::STORAGE_DEPOSIT_GAS,
             )],
             is_fee_transaction: false,
         },
-        ExecutionInstruction::NearTransaction {
+        RouteTransaction {
             receiver_id: account("ft"),
-            actions: vec![create_storage_deposit_action_for_contract(
-                &account("ft"),
+            calls: vec![create_storage_deposit_action_for_contract(
                 NearToken::from_micronear(1_250),
                 true,
+                TOKEN_STORAGE_DEPOSIT_GAS,
             )],
             is_fee_transaction: false,
         },
@@ -2094,22 +2046,20 @@ fn storage_deposits_add_up_every_deposit() {
 #[test]
 fn fee_transactions_amount_adds_up_fee_transfers_only() {
     let execution_instructions = vec![
-        ExecutionInstruction::NearTransaction {
+        RouteTransaction {
             receiver_id: account("ft"),
-            actions: vec![create_fee_ft_transfer_action(
-                &account("ft"),
+            calls: vec![create_fee_ft_transfer_action(
                 &account("trader.near"),
                 1000,
                 "app.near",
             )],
             is_fee_transaction: false,
         },
-        ExecutionInstruction::NearTransaction {
+        RouteTransaction {
             receiver_id: account("ft"),
-            actions: vec![
-                create_fee_ft_transfer_action(&account("ft"), &account("ref.near"), 8, "app.near"),
+            calls: vec![
+                create_fee_ft_transfer_action(&account("ref.near"), 8, "app.near"),
                 create_fee_ft_transfer_action(
-                    &account("ft"),
                     &account("dex-aggregator.intear.near"),
                     2,
                     "app.near",
@@ -2122,98 +2072,29 @@ fn fee_transactions_amount_adds_up_fee_transfers_only() {
 }
 
 #[test]
-fn helper_calls_burn_what_they_are_measured_to() {
-    let transaction = vec![ExecutionInstruction::NearTransaction {
-        receiver_id: account("wrap.near"),
-        actions: vec![create_wrap_action(NearToken::from_near(1))],
-        is_fee_transaction: false,
-    }];
-    let fees = TRANSACTION_FEE_GAS.as_gas()
-        + FUNCTION_CALL_FEE_GAS.as_gas()
-        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * ("near_deposit".len() + "{}".len()) as u64;
-    assert_eq!(
-        estimated_gas_paid(&transaction, None, None),
-        NearGas::from_gas(fees + NEAR_DEPOSIT_GAS.estimated_burn.as_gas())
-    );
-    assert_eq!(
-        max_gas_cost(&transaction),
-        pathfinder::MIN_GAS_PRICE
-            .saturating_mul((fees + NEAR_DEPOSIT_GAS.needs_attached.as_gas()).into())
-    );
-}
-
-#[test]
-fn estimated_gas_paid_of_swap_call() {
-    let swap_call = Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "ft_transfer_call".to_string(),
-        args: vec![],
-        gas: Gas(NearGas::from_tgas(80)),
-        deposit: NearToken::from_yoctonear(1),
-    }));
-    let instructions = [
-        ExecutionInstruction::NearTransaction {
-            receiver_id: account("wrap.near"),
-            actions: vec![create_wrap_action(NearToken::from_near(1))],
-            is_fee_transaction: false,
-        },
-        ExecutionInstruction::NearTransaction {
-            receiver_id: account("wrap.near"),
-            actions: vec![swap_call.clone()],
-            is_fee_transaction: false,
-        },
-    ];
-    let wrap_fees = FUNCTION_CALL_FEE_GAS.as_gas()
-        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * ("near_deposit".len() + "{}".len()) as u64;
-    let swap_call_fees = FUNCTION_CALL_FEE_GAS.as_gas()
-        + FUNCTION_CALL_BYTE_FEE_GAS.as_gas() * "ft_transfer_call".len() as u64;
-    let gas_paid = |trader_account_id: &str, transfer_gas: NearGas| {
-        let trader_account_id = account(trader_account_id);
-        assert_eq!(
-            near_receive_gas(Some(&trader_account_id)).estimated_burn,
-            transfer_gas
-        );
-        let swap_call_gas_paid =
-            NearGas::from_gas(NearGas::from_tgas(15).as_gas() + transfer_gas.as_gas());
-        // Wrapping goes in the swap's transaction
-        assert_eq!(
-            estimated_gas_paid(
-                &instructions,
-                Some((&swap_call, swap_call_gas_paid)),
-                Some(&trader_account_id),
-            ),
-            NearGas::from_gas(
-                TRANSACTION_FEE_GAS.as_gas()
-                    + wrap_fees
-                    + NEAR_DEPOSIT_GAS.estimated_burn.as_gas()
-                    + swap_call_fees
-                    + swap_call_gas_paid.as_gas()
-            )
-        );
-    };
+fn near_receive_gas_creates_implicit_accounts() {
     // Named and NEAR implicit accounts as measured on mainnet
-    gas_paid("trader.near", NearGas::from_gas(223_182_562_500));
-    gas_paid(
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        NearGas::from_gas(7_524_947_687_500),
+    let burn = |trader_account_id: &str| {
+        near_receive_gas(Some(&account(trader_account_id)))
+            .estimated_burn
+            .as_gas()
+    };
+    assert_eq!(burn("trader.near"), 223_182_562_500);
+    assert_eq!(
+        burn("0000000000000000000000000000000000000000000000000000000000000000"),
+        7_524_947_687_500
     );
     // An ETH implicit account is charged for creating the account, but not for its key
-    gas_paid(
-        "0x0000000000000000000000000000000000000000",
-        NearGas::from_gas(7_423_182_562_500),
+    assert_eq!(
+        burn("0x0000000000000000000000000000000000000000"),
+        7_423_182_562_500
     );
 }
 
 #[test]
 fn fee_transfers_have_a_trading_fee_memo_naming_the_swap_referrer() {
-    let args = |action: Action| match action {
-        Action::FunctionCall(call) => {
-            serde_json::from_slice::<serde_json::Value>(&call.args).unwrap()
-        }
-        _ => panic!("Not a function call"),
-    };
     assert_eq!(
-        args(create_fee_ft_transfer_action(
-            &account("wrap.near"),
+        call_args(&create_fee_ft_transfer_action(
             &account("ref.near"),
             8,
             "app.near"
@@ -2225,7 +2106,7 @@ fn fee_transfers_have_a_trading_fee_memo_naming_the_swap_referrer() {
         })
     );
     assert_eq!(
-        args(create_rhea_fee_mft_transfer_action(
+        call_args(&create_rhea_fee_mft_transfer_action(
             &account("ft"),
             &account("ref.near"),
             8,

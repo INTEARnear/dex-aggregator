@@ -31,10 +31,11 @@ use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::{
+    route::ProviderRoute,
     shared_utils::{BaseTokenId, Mainnet, NetworkView, TOKEN_INFOS_REFRESH_INTERVAL},
     stats::RouteOutcome,
     types::Quote,
-    Amount, DexId, Route, SwapRequest,
+    Amount, DexId, SwapRequest,
 };
 
 const HOOK_DIRECTORY: &str = "hooks";
@@ -290,7 +291,7 @@ pub async fn routes(
     request: &SwapRequest,
     trade: &IntearDexTrade,
     swaps: Vec<inteardex::IntearDexSwap>,
-) -> (RouteOutcome, Vec<Route>) {
+) -> (RouteOutcome, Vec<ProviderRoute>) {
     let routes = AssertUnwindSafe(async {
         let mut routes = Vec::new();
         for swap in swaps {

@@ -24,9 +24,10 @@ use intear_dex_types::AssetId;
 use crate::{
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
     providers::{rhea::RHEA_CONTRACT_ID, rhea_dcl::RHEA_DCL_CONTRACT_ID},
+    route::merge_transactions,
     shared_utils::{
-        base_token, convert_to, is_near, optimize_execution_instructions, BaseTokenId, Mainnet,
-        NetworkView, REQWEST_CLIENT, RPC_CLIENT, RPC_URLS, WRAP_NEAR,
+        base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
+        RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
     types::{BalanceChange, OutcomeRequest, OutcomeWaitUntil, SwapOutcome, TokenId},
 };
@@ -1021,7 +1022,10 @@ async fn outcome_of(
             .filter(|(_, change)| *change != 0)
             .map(|(token, change)| BalanceChange { token, change })
             .collect(),
-        next_steps: optimize_execution_instructions(next_steps),
+        next_steps: merge_transactions(next_steps)
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         error,
         settled: true,
     })

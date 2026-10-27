@@ -368,9 +368,6 @@ pub struct Route {
     /// provided `Amount::AmountOut`. The estimated amounts already include it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discount: Option<Amount>,
-    /// Gas the execution instructions are expected to cost.
-    #[serde(skip)]
-    pub estimated_gas_paid: NearGas,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

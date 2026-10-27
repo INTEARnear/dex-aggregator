@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use intear_dex_types::FULL_FEE_FRACTION;
-use near_min_api::types::{AccountId, Action, FunctionCallAction, NearGas, NearToken};
+use near_min_api::types::{AccountId, NearGas, NearToken};
 use pathfinder::{
     dcl::{self, RouteApiResponse},
     MaxHops, QuoteAmount,
@@ -9,15 +9,16 @@ use pathfinder::{
 use tracing::info;
 
 use crate::{
+    route::{ProviderRoute, RouteCall, RouteTransaction},
     shared_utils::{
         base_token, convert_to_nep141, convert_to_nep141_with_fees, deposit_storage_if_needed,
-        deposit_storage_on_contract_if_needed, estimated_gas_paid, get_slippage, near_receive_gas,
-        payable_referral_fees, price_raw, referrer_fees_of_total, register_input_in_wallet,
-        total_fee_amount, BaseTokenId, Mainnet, NetworkView, ReferrerFee, DEFAULT_REFERRER_ID,
-        TOKEN_GAS,
+        deposit_storage_on_contract_if_needed, ft_transfer_call_gas, get_slippage,
+        near_receive_gas, payable_referral_fees, price_raw, referrer_fees_of_total,
+        register_input_in_wallet, total_fee_amount, BaseTokenId, Mainnet, NetworkView, ReferrerFee,
+        DEFAULT_REFERRER_ID, TOKEN_FT_TRANSFER_GAS,
     },
-    types::{ExecutionInstruction, Gas, TokenId},
-    Amount, DexId, Provider, Route, SwapRequest,
+    types::{Gas, TokenId},
+    Amount, DexId, Provider, SwapRequest,
 };
 
 pub struct RheaDclProvider;
@@ -28,14 +29,7 @@ const OUTPUT_RESERVED_GAS: NearGas = NearGas::from_ggas(31_800);
 const CALLBACK_POST_WITHDRAW_ASSET_GAS: NearGas = NearGas::from_ggas(2_360);
 const OUTPUT_NEAR_WITHDRAW_GAS: NearGas = NearGas::from_ggas(2_000);
 const CALLBACK_POST_WITHDRAW_NEAR_GAS: NearGas = NearGas::from_ggas(3_160);
-const STORAGE_DEPOSIT_GAS: Gas = Gas::from_ggas(2_000, 3_000);
-
-pub fn helper_call_gas(method_name: &str) -> Gas {
-    match method_name {
-        "storage_deposit" => STORAGE_DEPOSIT_GAS,
-        method_name => panic!("Routes don't call {method_name} on Rhea DCL"),
-    }
-}
+pub const STORAGE_DEPOSIT_GAS: Gas = Gas::from_ggas(3_000, 4_000);
 
 trait RheaDclQuotes: Send + Sync {
     fn find_path(
@@ -60,7 +54,10 @@ impl Provider for RheaDclProvider {
         DexId::RheaDcl
     }
 
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
+    fn route(
+        &self,
+        request: SwapRequest,
+    ) -> Pin<Box<dyn Future<Output = Option<ProviderRoute>> + Send>> {
         Box::pin(async move { route(request, &Mainnet, &MainnetRheaDclQuotes).await })
     }
 }
@@ -69,7 +66,7 @@ async fn route(
     request: SwapRequest,
     network: &impl NetworkView,
     quotes: &impl RheaDclQuotes,
-) -> Option<Route> {
+) -> Option<ProviderRoute> {
     let slippage = get_slippage(
         network,
         request.slippage,
@@ -201,29 +198,28 @@ async fn route(
                 .estimated_burn
                 .as_gas()
     } else {
-        TOKEN_GAS.ft_transfer.estimated_burn.as_gas() + CALLBACK_POST_WITHDRAW_ASSET_GAS.as_gas()
+        TOKEN_FT_TRANSFER_GAS.estimated_burn.as_gas() + CALLBACK_POST_WITHDRAW_ASSET_GAS.as_gas()
     };
-    let swap_call_gas = TOKEN_GAS.ft_transfer_call(
+    let swap_call_gas = ft_transfer_call_gas(
         swap_gas
             + Gas {
                 estimated_burn: NearGas::from_gas(output_burn),
                 needs_attached: OUTPUT_RESERVED_GAS,
             },
     );
-    let swap_action = Action::FunctionCall(Box::new(FunctionCallAction {
-        method_name: "ft_transfer_call".to_string(),
-        args: serde_json::to_vec(&serde_json::json!({
+    let swap_call = RouteCall::new(
+        "ft_transfer_call",
+        serde_json::json!({
             "receiver_id": RHEA_DCL_CONTRACT_ID,
             "amount": amount_in.to_string(),
             "msg": serde_json::to_string(&message).unwrap(),
-        }))
-        .unwrap(),
-        gas: swap_call_gas.attached(),
-        deposit: NearToken::from_yoctonear(1),
-    }));
-    let swap_transactions = vec![ExecutionInstruction::NearTransaction {
+        }),
+        NearToken::from_yoctonear(1),
+        swap_call_gas,
+    );
+    let swap_transactions = vec![RouteTransaction {
         receiver_id: token_in,
-        actions: vec![swap_action.clone()],
+        calls: vec![swap_call],
         is_fee_transaction: false,
     }];
 
@@ -245,6 +241,7 @@ async fn route(
         network,
         &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
         request.trader_account_id.clone(),
+        STORAGE_DEPOSIT_GAS,
     )
     .await?;
     let transactions = [
@@ -263,34 +260,24 @@ async fn route(
         send_fees,
     ]
     .concat();
-    let estimated_gas_paid = estimated_gas_paid(
-        &transactions,
-        Some((&swap_action, swap_call_gas.estimated_burn)),
-        request.trader_account_id.as_ref(),
-    );
-    Some(Route {
+    Some(ProviderRoute {
         dex_id: DexId::RheaDcl,
         estimated_amount,
-
         worst_case_amount,
-        execution_instructions: transactions,
-        deprecated_needs_unwrap_always_false: false,
+        transactions,
         discount: None,
         token_output,
-        estimated_gas_paid,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use near_min_api::types::{
-        Action, FunctionCallAction, Gas as AttachedGas, NearGas, NearToken, U128,
-    };
+    use near_min_api::types::{NearGas, NearToken, U128};
 
     use super::*;
     use crate::shared_utils::{
         create_fee_ft_transfer_action, create_storage_deposit_action_for_contract,
-        create_wrap_action, TestNetworkView, WRAP_NEAR,
+        create_wrap_action, TestNetworkView, TOKEN_STORAGE_DEPOSIT_GAS, WRAP_NEAR,
     };
     use crate::types::Slippage;
     use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
@@ -384,46 +371,46 @@ mod tests {
                 &TestRheaDclQuotes::default(),
             )
             .await,
-            Some(Route {
+            Some(ProviderRoute {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
+                transactions: vec![
+                    RouteTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
-                            true
+                            true,
+                            STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &"ft".parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
-                            true
+                            true,
+                            TOKEN_STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
-                            true
+                            true,
+                            TOKEN_STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_wrap_action(NearToken::from_yoctonear(100))],
+                        calls: vec![create_wrap_action(NearToken::from_yoctonear(100))],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        calls: vec![RouteCall {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
@@ -440,16 +427,14 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: AttachedGas(NearGas::from_ggas(81_800)),
+                            gas: Gas::from_ggas(29_760, 82_800),
                             deposit: NearToken::from_yoctonear(1),
-                        }))],
+                        }],
                         is_fee_transaction: false,
                     },
                 ],
-                deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(39_628_674_297_143),
             })
         );
     }
@@ -475,23 +460,23 @@ mod tests {
                 &TestRheaDclQuotes::default(),
             )
             .await,
-            Some(Route {
+            Some(ProviderRoute {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
                 dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
+                transactions: vec![
+                    RouteTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
-                            true
+                            true,
+                            STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: "ft".parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        calls: vec![RouteCall {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
@@ -508,16 +493,17 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: AttachedGas(NearGas::from_ggas(81_800)),
+                            gas: Gas {
+                                estimated_burn: NearGas::from_gas(30_783_182_562_500),
+                                needs_attached: NearGas::from_gas(82_800_000_000_000)
+                            },
                             deposit: NearToken::from_yoctonear(1),
-                        }))],
+                        }],
                         is_fee_transaction: false,
                     },
                 ],
-                deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Near,
-                estimated_gas_paid: NearGas::from_gas(34_191_344_930_531),
             })
         );
     }
@@ -543,46 +529,46 @@ mod tests {
                 &TestRheaDclQuotes::default(),
             )
             .await,
-            Some(Route {
+            Some(ProviderRoute {
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
+                transactions: vec![
+                    RouteTransaction {
                         receiver_id: RHEA_DCL_CONTRACT_ID.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &RHEA_DCL_CONTRACT_ID.parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             NearToken::from_millinear(500),
-                            true
+                            true,
+                            STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: "ft".parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &"ft".parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
-                            true
+                            true,
+                            TOKEN_STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_storage_deposit_action_for_contract(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
+                        calls: vec![create_storage_deposit_action_for_contract(
                             "0.00125 NEAR".parse().unwrap(),
-                            true
+                            true,
+                            TOKEN_STORAGE_DEPOSIT_GAS
                         )],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_wrap_action(NearToken::from_yoctonear(101))],
+                        calls: vec![create_wrap_action(NearToken::from_yoctonear(101))],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        calls: vec![RouteCall {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
@@ -599,16 +585,14 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: AttachedGas(NearGas::from_ggas(81_800)),
+                            gas: Gas::from_ggas(29_760, 82_800),
                             deposit: NearToken::from_yoctonear(1),
-                        }))],
+                        }],
                         is_fee_transaction: false,
                     },
                 ],
-                deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(39_628_873_975_739),
             })
         );
     }
@@ -684,19 +668,19 @@ mod tests {
                 &TestRheaDclQuotes::default(),
             )
             .await,
-            Some(Route {
+            Some(ProviderRoute {
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
                 dex_id: DexId::RheaDcl,
-                execution_instructions: vec![
-                    ExecutionInstruction::NearTransaction {
+                transactions: vec![
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![create_wrap_action(NearToken::from_yoctonear(101))],
+                        calls: vec![create_wrap_action(NearToken::from_yoctonear(101))],
                         is_fee_transaction: false,
                     },
-                    ExecutionInstruction::NearTransaction {
+                    RouteTransaction {
                         receiver_id: WRAP_NEAR.parse().unwrap(),
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                        calls: vec![RouteCall {
                             method_name: "ft_transfer_call".to_string(),
                             args: serde_json::to_vec(&serde_json::json!({
                                 "receiver_id": RHEA_DCL_CONTRACT_ID,
@@ -713,16 +697,14 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: AttachedGas(NearGas::from_ggas(81_800)),
+                            gas: Gas::from_ggas(29_760, 82_800),
                             deposit: NearToken::from_yoctonear(1),
-                        }))],
+                        }],
                         is_fee_transaction: false,
                     },
                 ],
-                deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(31_650_495_858_912),
             })
         );
     }
@@ -766,16 +748,16 @@ mod tests {
         assert_eq!(route.estimated_amount, Amount::AmountIn(105));
         assert_eq!(route.worst_case_amount, Amount::AmountIn(106));
         assert_eq!(
-            route.execution_instructions,
+            route.transactions,
             vec![
-                ExecutionInstruction::NearTransaction {
+                RouteTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
-                    actions: vec![create_wrap_action(NearToken::from_yoctonear(106))],
+                    calls: vec![create_wrap_action(NearToken::from_yoctonear(106))],
                     is_fee_transaction: false,
                 },
-                ExecutionInstruction::NearTransaction {
+                RouteTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
-                    actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    calls: vec![RouteCall {
                         method_name: "ft_transfer_call".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({
                             "receiver_id": RHEA_DCL_CONTRACT_ID,
@@ -792,23 +774,21 @@ mod tests {
                             .unwrap(),
                         }))
                         .unwrap(),
-                        gas: AttachedGas(NearGas::from_ggas(81_800)),
+                        gas: Gas::from_ggas(29_760, 82_800),
                         deposit: NearToken::from_yoctonear(1),
-                    }))],
+                    }],
                     is_fee_transaction: false,
                 },
                 // After the swap
-                ExecutionInstruction::NearTransaction {
+                RouteTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
-                    actions: vec![
+                    calls: vec![
                         create_fee_ft_transfer_action(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
                             &"ref.near".parse().unwrap(),
                             4,
                             DEFAULT_REFERRER_ID
                         ),
                         create_fee_ft_transfer_action(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
                             &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                             1,
                             DEFAULT_REFERRER_ID
@@ -855,29 +835,27 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            route.execution_instructions[0],
-            ExecutionInstruction::NearTransaction {
+            route.transactions[0],
+            RouteTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
-                actions: vec![create_wrap_action(NearToken::from_yoctonear(1000))],
+                calls: vec![create_wrap_action(NearToken::from_yoctonear(1000))],
                 is_fee_transaction: false,
             }
         );
         // After the swap
         assert_eq!(
-            route.execution_instructions[route.execution_instructions.len() - 1..],
+            route.transactions[route.transactions.len() - 1..],
             [
                 // 1% of 1000, 80% to the referrer and 20% to the protocol
-                ExecutionInstruction::NearTransaction {
+                RouteTransaction {
                     receiver_id: WRAP_NEAR.parse().unwrap(),
-                    actions: vec![
+                    calls: vec![
                         create_fee_ft_transfer_action(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
                             &"ref.near".parse().unwrap(),
                             8,
                             DEFAULT_REFERRER_ID
                         ),
                         create_fee_ft_transfer_action(
-                            &WRAP_NEAR.parse::<AccountId>().unwrap(),
                             &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                             2,
                             DEFAULT_REFERRER_ID
@@ -934,33 +912,30 @@ mod tests {
         assert_eq!(route.estimated_amount, Amount::AmountIn(104));
         assert_eq!(route.worst_case_amount, Amount::AmountIn(105));
         assert_eq!(
-            route.execution_instructions[0],
-            ExecutionInstruction::NearTransaction {
+            route.transactions[0],
+            RouteTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
-                actions: vec![create_wrap_action(NearToken::from_yoctonear(105))],
+                calls: vec![create_wrap_action(NearToken::from_yoctonear(105))],
                 is_fee_transaction: false,
             }
         );
         // After the swap
         assert_eq!(
-            route.execution_instructions[route.execution_instructions.len() - 1..],
-            [ExecutionInstruction::NearTransaction {
+            route.transactions[route.transactions.len() - 1..],
+            [RouteTransaction {
                 receiver_id: WRAP_NEAR.parse().unwrap(),
-                actions: vec![
+                calls: vec![
                     create_fee_ft_transfer_action(
-                        &WRAP_NEAR.parse::<AccountId>().unwrap(),
                         &"ref.near".parse().unwrap(),
                         1,
                         DEFAULT_REFERRER_ID
                     ),
                     create_fee_ft_transfer_action(
-                        &WRAP_NEAR.parse::<AccountId>().unwrap(),
                         &"ref2.near".parse().unwrap(),
                         2,
                         DEFAULT_REFERRER_ID
                     ),
                     create_fee_ft_transfer_action(
-                        &WRAP_NEAR.parse::<AccountId>().unwrap(),
                         &AGGREGATOR_FEE_RECEIVER_ID.to_owned(),
                         1,
                         DEFAULT_REFERRER_ID
