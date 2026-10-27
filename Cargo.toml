@@ -40,4 +40,10 @@ near-sdk = { version = "5.29", default-features = false, features = ["non-contra
 overflow-checks = true
 
 [workspace]
-members = ["pathfinder", "pool-indexer", "shadow-proxy", "swap-router-types"]
+members = [
+    "pathfinder",
+    "plach-hook",
+    "pool-indexer",
+    "shadow-proxy",
+    "swap-router-types",
+]

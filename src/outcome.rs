@@ -19,12 +19,11 @@ use near_sdk::{json_types::U128, NearToken};
 use serde::Deserialize;
 use tokio::time::Instant;
 
+use intear_dex_types::AssetId;
+
 use crate::{
-    providers::{
-        intear_plach::{AssetId, INTEAR_DEX_CONTRACT_ID},
-        rhea::RHEA_CONTRACT_ID,
-        rhea_dcl::RHEA_DCL_CONTRACT_ID,
-    },
+    hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
+    providers::{rhea::RHEA_CONTRACT_ID, rhea_dcl::RHEA_DCL_CONTRACT_ID},
     shared_utils::{
         base_token, convert_to, is_near, optimize_execution_instructions, BaseTokenId, Mainnet,
         NetworkView, REQWEST_CLIENT, RPC_CLIENT, RPC_URLS, WRAP_NEAR,

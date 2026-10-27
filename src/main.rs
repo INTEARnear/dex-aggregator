@@ -28,15 +28,18 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use swap_router_types::{hook::RequestDetails, types};
+use swap_router_types::{
+    hook::{IntearDexTrade, RequestDetails},
+    types,
+};
 
 use crate::{
-    hooks::Hook,
+    hooks::inteardex::IntearDexSwap,
     rate_limit::{ClientIp, RateLimiter},
     shared_utils::{
         base_token, convert_to, estimated_gas_paid, fee_transactions_amount, final_block_hash,
         max_gas_cost, optimize_execution_instructions, price_raw, storage_deposits, BaseTokenId,
-        Mainnet, RPC_CLIENT,
+        Mainnet, NetworkView, RPC_CLIENT,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
@@ -196,15 +199,13 @@ async fn find_routes(
         &providers::rhea::RheaProvider,
         &providers::wrap::WrapProvider,
         &providers::rhea_dcl::RheaDclProvider,
-        &providers::intear_plach::IntearPlachProvider,
     ];
 
-    let dexes = request.dexes.clone().unwrap_or_else(|| {
-        [DexId::Wrap, DexId::Rhea, DexId::RheaDcl, DexId::Plach]
-            .into_iter()
-            .chain(hooks::loaded().iter().map(Hook::dex_id))
-            .collect()
-    });
+    // Hooks are in IntearDex, and quoted alone only when they're asked for
+    let dexes = request
+        .dexes
+        .clone()
+        .unwrap_or_else(|| vec![DexId::Wrap, DexId::Rhea, DexId::RheaDcl, DexId::IntearDex]);
 
     let mut routes = Vec::new();
     for provider in providers {
@@ -260,39 +261,116 @@ async fn find_routes(
     }
     sort_quotes(request, &mut quotes);
 
-    for hook in hooks::loaded() {
-        if !dexes.contains(&hook.dex_id()) {
-            continue;
+    let intear_dex_requested = dexes.contains(&DexId::IntearDex);
+    let asked_hooks = hooks::loaded()
+        .iter()
+        .filter(|hook| intear_dex_requested || dexes.contains(&hook.dex_id()))
+        .collect::<Vec<_>>();
+    let hook_trade = if asked_hooks.is_empty() {
+        None
+    } else {
+        let block_height = Mainnet
+            .current_block_height()
+            .inspect_err(|err| tracing::warn!("No block height for hooks: {err}"))
+            .ok();
+        let trade = hooks::inteardex::trade_of_request(&Mainnet, request).await;
+        if let (Some(block_height), Some(trade)) = (block_height, trade) {
+            Some((trade, block_height))
+        } else {
+            None
         }
+    };
+    let intear_dex_started_at = Instant::now();
+    let mut intear_dex_hook_quotes = Vec::new();
+    for hook in asked_hooks {
         let started_at = Instant::now();
-        let (mut outcome, hook_routes) = hook.routes(request, request_details, &quotes).await;
-        let mut hook_quotes = Vec::new();
-        for route in hook_routes {
-            if let Some(route) = finish_route(request, route).await {
-                hook_quotes.push(quote_of_route(route, signing.clone()));
-            }
+        let Some((trade, block_height)) = &hook_trade else {
+            route_stats.push(RouteStats {
+                dex_id: hook.dex_id(),
+                duration: started_at.elapsed(),
+                outcome: RouteOutcome::NotFound,
+                estimated_amount: None,
+            });
+            continue;
+        };
+        let (mut outcome, hook_quotes) = hook
+            .quotes(request, request_details, trade, *block_height, &quotes)
+            .await;
+        intear_dex_hook_quotes.extend(hook_quotes.iter().cloned());
+        let mut estimated_amount = hook_quotes.first().map(|quote| quote.estimated_amount.0);
+        if dexes.contains(&hook.dex_id()) && matches!(outcome, RouteOutcome::Found) {
+            let swaps = hook_quotes
+                .into_iter()
+                .map(IntearDexSwap::of_quote)
+                .collect();
+            let (routes_outcome, hook_route_quotes) =
+                intear_dex_quotes(hook.dex_id(), request, trade, swaps, &signing).await;
+            outcome = routes_outcome;
+            estimated_amount = hook_route_quotes.first().map(estimated_amount_of);
+            quotes.extend(hook_route_quotes);
+            sort_quotes(request, &mut quotes);
         }
-        if matches!(outcome, RouteOutcome::Found) && hook_quotes.is_empty() {
-            outcome = RouteOutcome::NotFound;
-        }
-        sort_quotes(request, &mut hook_quotes);
         route_stats.push(RouteStats {
             dex_id: hook.dex_id(),
             duration: started_at.elapsed(),
             outcome,
-            estimated_amount: hook_quotes
-                .first()
-                .map(|quote| match quote.route.estimated_amount {
-                    Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
-                }),
+            estimated_amount,
         });
-        quotes.extend(hook_quotes);
+    }
+    if intear_dex_requested {
+        let (outcome, intear_dex_quote) = match &hook_trade {
+            Some((trade, _)) => {
+                match IntearDexSwap::fallback_queue(trade, intear_dex_hook_quotes) {
+                    Some(swap) => {
+                        intear_dex_quotes(DexId::IntearDex, request, trade, vec![swap], &signing)
+                            .await
+                    }
+                    None => (RouteOutcome::NotFound, vec![]),
+                }
+            }
+            None => (RouteOutcome::NotFound, vec![]),
+        };
+        route_stats.push(RouteStats {
+            dex_id: DexId::IntearDex,
+            duration: intear_dex_started_at.elapsed(),
+            outcome,
+            estimated_amount: intear_dex_quote.first().map(estimated_amount_of),
+        });
+        quotes.extend(intear_dex_quote);
         sort_quotes(request, &mut quotes);
     }
 
     tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
 
     (quotes, route_stats)
+}
+
+/// The quotes of the routes of the swaps on Intear DEX, best first, and how building them went
+async fn intear_dex_quotes(
+    dex_id: DexId,
+    request: &SwapRequest,
+    trade: &IntearDexTrade,
+    swaps: Vec<IntearDexSwap>,
+    signing: &Option<SigningContext>,
+) -> (RouteOutcome, Vec<Quote>) {
+    let (mut outcome, routes) = hooks::routes(dex_id, request, trade, swaps).await;
+    let mut quotes = Vec::new();
+    for route in routes {
+        if let Some(route) = finish_route(request, route).await {
+            quotes.push(quote_of_route(route, signing.clone()));
+        }
+    }
+    if matches!(outcome, RouteOutcome::Found) && quotes.is_empty() {
+        outcome = RouteOutcome::NotFound;
+    }
+    sort_quotes(request, &mut quotes);
+    (outcome, quotes)
+}
+
+fn estimated_amount_of(quote: &Quote) -> u128 {
+    match quote.route.estimated_amount {
+        Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
+    }
 }
 
 /// The route with its output converted to the requested token location, and its fee transactions
@@ -457,11 +535,11 @@ async fn main() {
     info!("Starting swap-router HTTP server...");
 
     hooks::load();
-    lazy_static::initialize(&providers::intear_plach::FEE_DISCOUNTER);
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;
 
     shared_utils::start_background_refresh().await;
+    tokio::spawn(hooks::follow_prices(Mainnet));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -495,7 +573,7 @@ async fn main() {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         ) => result.unwrap(),
-        error = pathfinder::run(Arc::new(shared_utils::RPC_CLIENT.clone())) => {
+        error = pathfinder::run(Arc::new(shared_utils::RPC_CLIENT.clone()), hooks::indexed()) => {
             error!("Pool indexing stopped: {error:#}");
             std::process::exit(1);
         }

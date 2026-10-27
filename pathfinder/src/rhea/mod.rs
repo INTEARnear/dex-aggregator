@@ -16,8 +16,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use pool_indexer::{AccountState, PoolIndexer};
+#[cfg(feature = "indexer")]
+use pool_indexer::PoolIndexer;
 use serde::Serialize;
+use swap_router_types::indexed::AccountState;
 use tracing::{info, warn};
 
 use crate::search::{
@@ -37,6 +39,7 @@ pub struct SplitRouteApiResponse {
     pub amount_in: Balance,
     #[serde(with = "dec_format")]
     pub amount_out: Balance,
+    /// What the route's pools burn in Rhea's call that swaps
     pub swap_gas: NearGas,
 }
 
@@ -457,6 +460,7 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
 }
 
 /// Builds pools from indexed storage after every block, returns why it stopped
+#[cfg(feature = "indexer")]
 pub async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
     let account_id: AccountId = RHEA_CONTRACT_ID.parse().unwrap();
     let mut blocks = indexer.blocks();
@@ -498,28 +502,27 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-const HOP_GAS: NearGas = NearGas::from_ggas(3_500);
+const HOP_GAS: NearGas = NearGas::from_ggas(2_600);
 
 impl Pool {
     fn hop_gas(&self) -> NearGas {
         match self.detail {
             PoolDetailInfo::SimplePoolInfo(_) => HOP_GAS,
-            PoolDetailInfo::StablePoolInfo(_) => NearGas::from_ggas(4_000),
-            PoolDetailInfo::RatedPoolInfo(_) => NearGas::from_ggas(5_800),
-            PoolDetailInfo::DegenPoolInfo(_) => NearGas::from_ggas(5_000),
+            PoolDetailInfo::StablePoolInfo(_) => NearGas::from_ggas(2_900),
+            PoolDetailInfo::RatedPoolInfo(_) => NearGas::from_ggas(6_200),
+            PoolDetailInfo::DegenPoolInfo(_) => NearGas::from_ggas(4_100),
         }
     }
 }
 
 fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> NearGas {
     NearGas::from_gas(
-        NearGas::from_ggas(1_500).as_gas()
-            + split_route
-                .parts
-                .iter()
-                .flat_map(|part| &part.route.hops)
-                .map(|hop| graph.pools()[hop.pool].hop_gas().as_gas())
-                .sum::<u64>(),
+        split_route
+            .parts
+            .iter()
+            .flat_map(|part| &part.route.hops)
+            .map(|hop| graph.pools()[hop.pool].hop_gas().as_gas())
+            .sum(),
     )
 }
 

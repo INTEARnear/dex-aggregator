@@ -1,6 +1,6 @@
 mod storage;
 
-pub use storage::{AccountState, BlockInfo};
+pub use swap_router_types::indexed::{AccountState, BlockInfo, Watch};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -19,13 +19,6 @@ use tracing::{info, warn};
 use crate::storage::{Change, Storage, WatchedAccount};
 
 const LOAD_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Storage of an account to follow, only keys that start with one of the prefixes
-#[derive(Clone)]
-pub struct Watch {
-    pub account_id: AccountId,
-    pub prefixes: Vec<Vec<u8>>,
-}
 
 #[derive(Clone)]
 pub struct PoolIndexer {

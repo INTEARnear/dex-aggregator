@@ -15,8 +15,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-use pool_indexer::{AccountState, PoolIndexer};
+#[cfg(feature = "indexer")]
+use pool_indexer::PoolIndexer;
 use serde::{Deserialize, Serialize};
+use swap_router_types::indexed::AccountState;
 use tracing::{error, info, warn};
 
 use self::math::{SwapResult, as_u128, mul_div_floor};
@@ -50,6 +52,7 @@ pub struct ExactInRoute {
     pub amount_in: U128,
     pub min_amount_out: U128,
     pub amount_out: U128,
+    /// What `ft_on_transfer` burns for the route
     pub swap_gas: NearGas,
 }
 
@@ -60,6 +63,7 @@ pub struct ExactOutRoute {
     pub amount_in: U128,
     pub max_amount_in: U128,
     pub amount_out: U128,
+    /// What `ft_on_transfer` burns for the route
     pub swap_gas: NearGas,
 }
 
@@ -255,6 +259,7 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
 }
 
 /// Builds pools from indexed storage after every block, returns why it stopped
+#[cfg(feature = "indexer")]
 pub async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
     let account_id: AccountId = RHEA_DCL_CONTRACT_ID.parse().unwrap();
     let mut blocks = indexer.blocks();
@@ -312,10 +317,12 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     )?)
 }
 
-const HOP_GAS: NearGas = NearGas::from_ggas(273 + 2_855);
+const SWAP_GAS: NearGas = NearGas::from_tgas(7);
+const RANGE_GAS: NearGas = NearGas::from_tgas(3);
+const CROSSING_GAS: NearGas = NearGas::from_ggas(500);
+const ORDER_GAS: NearGas = NearGas::from_tgas(4);
+const BITMAP_WORD_GAS: NearGas = NearGas::from_ggas(50);
 
-/// Gas the contract burns for the swaps of a route in the receipt that swaps, from the steps the
-/// swaps take. Fitted to fuzzing of random quotes on mainnet state.
 fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> NearGas {
     let work = route
         .hops
@@ -327,13 +334,12 @@ fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> NearGas {
             orders: total.orders + work.orders,
             words: total.words + work.words,
         });
-    NearGas::from_ggas(
-        7_050
-            + 273 * route.hops.len() as u64
-            + 2_855 * work.ranges
-            + 511 * work.crossings
-            + 4_075 * work.orders
-            + 54 * work.words,
+    NearGas::from_gas(
+        SWAP_GAS.as_gas()
+            + RANGE_GAS.as_gas() * work.ranges
+            + CROSSING_GAS.as_gas() * work.crossings
+            + ORDER_GAS.as_gas() * work.orders
+            + BITMAP_WORD_GAS.as_gas() * work.words,
     )
 }
 
@@ -440,7 +446,7 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            HOP_GAS,
+            RANGE_GAS,
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,

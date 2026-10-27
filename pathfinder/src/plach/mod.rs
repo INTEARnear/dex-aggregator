@@ -4,21 +4,19 @@ use self::storage::StoredPool;
 pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
-use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
+use near_min_api::types::{Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU128;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 pub use intear_dex_types::AssetId;
 use near_sdk::Timestamp;
-use pool_indexer::{AccountState, PoolIndexer};
+use swap_router_types::indexed::AccountState;
 use xyk_dex_types::math::{
     exact_in_amount_out, exact_out_amount_in, fee_converted_to_quote_asset, mul_div,
 };
@@ -367,10 +365,6 @@ impl search::Pool for Pool {
     }
 }
 
-lazy_static! {
-    static ref POOLS_CACHE: Arc<RwLock<Option<Arc<Pools>>>> = Arc::new(RwLock::new(None));
-}
-
 pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
@@ -433,46 +427,22 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
     storage::pools_source(state).map(build_pools)
 }
 
-/// Builds pools from indexed storage after every block, returns why it stopped
-pub async fn update_pools(indexer: PoolIndexer) -> anyhow::Error {
-    let account_id: AccountId = INTEAR_DEX_CONTRACT_ID.parse().unwrap();
-    let mut blocks = indexer.blocks();
-    loop {
-        if blocks.changed().await.is_err() {
-            return anyhow::anyhow!("Pool indexer stopped");
-        }
-        let Some(state) = indexer.account_state(&account_id) else {
-            continue;
-        };
-        let height = state.block.height;
-        let pools = tokio::task::spawn_blocking(move || build_indexed_pools(&state)).await;
-        match pools {
-            Ok(Ok(pools)) => {
-                *POOLS_CACHE.write().await = Some(Arc::new(pools));
-                crate::pools_built(crate::PoolsDex::Plach, height);
-            }
-            Ok(Err(e)) => {
-                return e.context(format!("Failed to build Plach pools at block {height}"));
-            }
-            Err(e) => {
-                return anyhow::anyhow!("Building Plach pools at block {height} panicked: {e}");
-            }
-        }
+impl Pools {
+    pub fn block_height(&self) -> BlockHeight {
+        self.block_height
     }
-}
 
-async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
-    let Some(pools) = POOLS_CACHE.read().await.clone() else {
-        return Err(anyhow::anyhow!("Pools are not loaded"));
-    };
-    let age = pools.updated_at.elapsed();
-    if age > MAX_SNAPSHOT_AGE {
-        return Err(anyhow::anyhow!(
-            "Pools were last updated {age:?} ago, at block {}",
-            pools.block_height
-        ));
+    /// An error if they weren't updated in a while, which they are after every block
+    pub fn check_fresh(&self) -> Result<(), anyhow::Error> {
+        let age = self.updated_at.elapsed();
+        if age > MAX_SNAPSHOT_AGE {
+            anyhow::bail!(
+                "Pools were last updated {age:?} ago, at block {}",
+                self.block_height
+            );
+        }
+        Ok(())
     }
-    Ok(pools)
 }
 
 const SETTINGS: Settings = Settings {
@@ -482,17 +452,23 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-const SWAP_BASE_GAS: NearGas = NearGas::from_tgas(23);
-const HOP_GAS: NearGas = NearGas::from_tgas(2);
+const SWAP_GAS: NearGas = NearGas::from_tgas(17);
+const HOP_GAS: NearGas = NearGas::from_ggas(1_700);
+const REPEATED_HOP_GAS: NearGas = NearGas::from_ggas(900);
+const FEE_DISCOUNT_GAS: NearGas = NearGas::from_ggas(1_800);
 
-/// Gas the DEX burns for `split_route`
 fn swap_gas(split_route: &SplitRoute) -> NearGas {
     let hops = split_route
         .parts
         .iter()
-        .map(|part| part.route.hops.len())
-        .sum::<usize>();
-    NearGas::from_gas(SWAP_BASE_GAS.as_gas() + HOP_GAS.as_gas() * hops as u64)
+        .flat_map(|part| &part.route.hops)
+        .map(|hop| hop.pool)
+        .collect::<Vec<_>>();
+    let pools = hops.iter().collect::<HashSet<_>>().len() as u64;
+    let repeated_hops = hops.len() as u64 - pools;
+    NearGas::from_gas(
+        SWAP_GAS.as_gas() + HOP_GAS.as_gas() * pools + REPEATED_HOP_GAS.as_gas() * repeated_hops,
+    )
 }
 
 fn to_api_response(
@@ -666,11 +642,6 @@ pub struct Request {
     pub fee_discount: FeeFractionFraction,
 }
 
-pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
-    let pools = get_pools().await?;
-    tokio::task::spawn_blocking(move || find_path_in(&pools, &request)).await?
-}
-
 pub fn find_path_in(
     pools: &Pools,
     request: &Request,
@@ -707,20 +678,23 @@ pub fn find_path_in(
     if request.fee_discount != 0 {
         // Compared to the same route without the fee discount
         let undiscounted = emulate_total(&split_route, &pools.graph_for(0), request.amount)?;
-        let (saved, discount) = match &mut response {
+        let (saved, discount, swap_gas) = match &mut response {
             SplitRouteApiResponse::ExactIn {
                 amount_out,
                 discount,
+                swap_gas,
                 ..
-            } => (amount_out.0.checked_sub(undiscounted), discount),
+            } => (amount_out.0.checked_sub(undiscounted), discount, swap_gas),
             SplitRouteApiResponse::ExactOut {
                 amount_in,
                 discount,
+                swap_gas,
                 ..
-            } => (undiscounted.checked_sub(amount_in.0), discount),
+            } => (undiscounted.checked_sub(amount_in.0), discount, swap_gas),
         };
         *discount =
             U128(saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?);
+        *swap_gas = NearGas::from_gas(swap_gas.as_gas() + FEE_DISCOUNT_GAS.as_gas());
     }
     match &response {
         SplitRouteApiResponse::ExactIn { amount_out, .. } => info!(
@@ -894,10 +868,10 @@ mod tests {
             },
         )
         .unwrap();
-        // 23 base and 2 for the hop
+        // 17 to load the DEX and 1.7 for the pool
         assert!(matches!(
             response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == NearGas::from_tgas(25)
+            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == NearGas::from_ggas(18_700)
         ));
     }
 }

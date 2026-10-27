@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use borsh::BorshDeserialize;
 use near_min_api::types::AccountId;
 use near_sdk::json_types::U128;
-use pool_indexer::{AccountState, Watch};
+use swap_router_types::indexed::{AccountState, Watch};
 use xyk_dex_types::{AssetWithBalance, CurrentFees, FeeConfiguration, SharesBalance};
 
 use super::{INTEAR_DEX_CONTRACT_ID, PLACH_DEX_ID, PoolsSource};

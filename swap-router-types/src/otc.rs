@@ -1,7 +1,7 @@
-use intear_dex_types::{AssetId, ReferralFees};
+use intear_dex_types::AssetId;
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
-    AccountId,
+    AccountId, NearGas,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
 use otc_dex_types::{
@@ -9,10 +9,10 @@ use otc_dex_types::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{
-    fees::payable_referral_fees,
-    types::{Amount, SwapRequest, TokenId},
-};
+use crate::{hook::IntearDexTrade, types::Amount};
+
+pub const OTC_SWAP_GAS: NearGas = NearGas::from_ggas(23_500);
+pub const OTC_WORST_CASE_SWAP_GAS: NearGas = NearGas::from_tgas(45);
 
 /// What a market maker's intent takes the other side of: the trader sends `asset_in` and gets
 /// `asset_out`
@@ -20,43 +20,20 @@ use crate::{
 pub struct OtcTrade {
     pub asset_in: AssetId,
     pub asset_out: AssetId,
-    /// The market maker's share of the swap: the engine takes the app fees out of an exact-in input
-    /// and adds them on top of an exact-out one. `AmountIn` is what the market maker gets,
-    /// `AmountOut` what it gives.
+    /// The market maker's share of the swap, after the app fees: `AmountIn` is what the market
+    /// maker gets, `AmountOut` what it gives
     pub amount: Amount,
     pub trader_account_id: AccountId,
-    /// The app fees with the aggregator's share, as the engine pays them
-    pub referral_fees: ReferralFees,
 }
 
 impl OtcTrade {
-    /// None when the swap can't go through the OTC DEX: without a trader to whitelist the intent
-    /// to, or with a token that isn't NEAR or a NEP-141 in the trader's wallet
-    pub fn of_request(request: &SwapRequest) -> Option<Self> {
-        let trader_account_id = request.trader_account_id.clone()?;
-        let asset_in = wallet_asset(&request.token_in)?;
-        let asset_out = wallet_asset(&request.token_out)?;
-        if asset_in == asset_out {
-            return None;
-        }
-        let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
-        let amount = match request.amount {
-            Amount::AmountIn(amount_in) => Amount::AmountIn(
-                amount_in
-                    - referral_fees
-                        .amounts_out_of(U128(amount_in))
-                        .iter()
-                        .map(|(_, fee)| fee.0)
-                        .sum::<u128>(),
-            ),
-            Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
-        };
+    /// None without a trader to whitelist the intent to
+    pub fn of_trade(trade: &IntearDexTrade) -> Option<Self> {
         Some(Self {
-            asset_in,
-            asset_out,
-            amount,
-            trader_account_id,
-            referral_fees,
+            asset_in: trade.asset_in.clone(),
+            asset_out: trade.asset_out.clone(),
+            amount: trade.amount,
+            trader_account_id: trade.trader_account_id.clone()?,
         })
     }
 
@@ -80,36 +57,6 @@ impl OtcTrade {
             amount_out: U128(maker_gets),
             validity,
         }
-    }
-
-    /// Whether `maker_trade` takes exactly the other side of this trade
-    pub fn check_maker_trade(&self, maker_trade: &TradeIntent) -> Result<(), String> {
-        if maker_trade.asset_in != self.asset_out || maker_trade.asset_out != self.asset_in {
-            return Err(format!(
-                "The intent trades {} for {} on a {} to {} swap",
-                maker_trade.asset_in, maker_trade.asset_out, self.asset_in, self.asset_out,
-            ));
-        }
-        let quoted_requested_amount = match self.amount {
-            Amount::AmountIn(maker_gets) => maker_trade.amount_out.0 == maker_gets,
-            Amount::AmountOut(maker_gives) => maker_trade.amount_in.0 == maker_gives,
-        };
-        if !quoted_requested_amount {
-            return Err(format!(
-                "The intent {maker_trade:?} isn't for {:?}",
-                self.amount
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// The asset a wallet token is deposited into Intear DEX as. Other locations aren't supported yet.
-fn wallet_asset(token_id: &TokenId) -> Option<AssetId> {
-    match token_id {
-        TokenId::Near => Some(AssetId::Near),
-        TokenId::Nep141(account_id) => Some(AssetId::Nep141(account_id.clone())),
-        TokenId::Nep141OnRhea(_) | TokenId::TokenOnIntearDex(_) => None,
     }
 }
 
@@ -158,82 +105,42 @@ mod tests {
         AssetId::Nep141("usdc.near".parse().unwrap())
     }
 
-    fn request(query: &str) -> SwapRequest {
-        serde_json::from_str(query).unwrap()
+    fn trade(amount: Amount, trader_account_id: Option<&str>) -> IntearDexTrade {
+        IntearDexTrade {
+            asset_in: AssetId::Near,
+            asset_out: usdc(),
+            amount,
+            slippage: "0.01".parse().unwrap(),
+            trader_account_id: trader_account_id.map(|id| id.parse().unwrap()),
+        }
     }
 
     #[test]
-    fn exact_in_trade_is_what_is_left_after_app_fees() {
-        let otc_trade = OtcTrade::of_request(&request(
-            r#"{"token_in":"near","token_out":"nep141:usdc.near","amount_in":"1000000","slippage_type":"Fixed","slippage":"0.01","trader_account_id":"trader.near","fees":"{\"app.near\":0.01}"}"#,
-        ))
-        .unwrap();
-        assert_eq!(otc_trade.asset_in, AssetId::Near);
-        assert_eq!(otc_trade.asset_out, usdc());
-        // 1% of the input: 0.8% to the app, 0.2% to the aggregator
-        assert_eq!(otc_trade.amount, Amount::AmountIn(990_000));
-        assert_eq!(
-            otc_trade.referral_fees.0,
-            vec![
-                ("app.near".parse().unwrap(), 8_000),
-                ("dex-aggregator.intear.near".parse().unwrap(), 2_000),
-            ]
-        );
-
+    fn exact_in_maker_gives_what_the_trader_gets() {
+        let otc_trade =
+            OtcTrade::of_trade(&trade(Amount::AmountIn(990_000), Some("trader.near"))).unwrap();
         let maker_trade =
             otc_trade.maker_trade_intent("maker.near".parse().unwrap(), 42, Validity::default());
-        // The market maker gives what the trader gets, for what's left of the trader's input
         assert_eq!(maker_trade.asset_in, usdc());
         assert_eq!(maker_trade.amount_in, U128(42));
         assert_eq!(maker_trade.asset_out, AssetId::Near);
         assert_eq!(maker_trade.amount_out, U128(990_000));
-        otc_trade.check_maker_trade(&maker_trade).unwrap();
-
-        let mut whole_input = maker_trade.clone();
-        whole_input.amount_out = U128(1_000_000);
-        assert!(otc_trade.check_maker_trade(&whole_input).is_err());
-        let mut same_direction = maker_trade;
-        (same_direction.asset_in, same_direction.asset_out) =
-            (same_direction.asset_out, same_direction.asset_in);
-        assert!(otc_trade.check_maker_trade(&same_direction).is_err());
     }
 
     #[test]
-    fn exact_out_trade_is_the_requested_output() {
-        let otc_trade = OtcTrade::of_request(&request(
-            r#"{"token_in":"nep141:usdc.near","token_out":"near","amount_out":"7","slippage_type":"Fixed","slippage":"0.01","trader_account_id":"trader.near","fees":"{\"app.near\":0.01}"}"#,
-        ))
-        .unwrap();
-        assert_eq!(otc_trade.amount, Amount::AmountOut(7));
+    fn exact_out_maker_wants_the_quoted_input() {
+        let otc_trade =
+            OtcTrade::of_trade(&trade(Amount::AmountOut(7), Some("trader.near"))).unwrap();
         let maker_trade =
             otc_trade.maker_trade_intent("maker.near".parse().unwrap(), 30, Validity::default());
-        assert_eq!(maker_trade.asset_in, AssetId::Near);
         assert_eq!(maker_trade.amount_in, U128(7));
-        assert_eq!(maker_trade.asset_out, usdc());
         assert_eq!(maker_trade.amount_out, U128(30));
-        otc_trade.check_maker_trade(&maker_trade).unwrap();
     }
 
     #[test]
-    fn no_trade_without_a_trader_or_for_tokens_outside_the_wallet() {
-        let request_without = |field: &str| {
-            let mut request: serde_json::Value = serde_json::from_str(
-                r#"{"token_in":"near","token_out":"nep141:usdc.near","amount_in":"1","slippage_type":"Fixed","slippage":"0.01","trader_account_id":"trader.near"}"#,
-            )
-            .unwrap();
-            match field {
-                "trader" => {
-                    request.as_object_mut().unwrap().remove("trader_account_id");
-                }
-                token => request["token_in"] = token.into(),
-            }
-            serde_json::from_value::<SwapRequest>(request).unwrap()
-        };
-        assert!(OtcTrade::of_request(&request_without("trader")).is_none());
-        assert!(OtcTrade::of_request(&request_without("rhea-nep141:usdc.near")).is_none());
-        assert!(OtcTrade::of_request(&request_without("intear-dex:near")).is_none());
+    fn no_trade_without_a_trader() {
+        assert!(OtcTrade::of_trade(&trade(Amount::AmountIn(1), None)).is_none());
     }
-
     #[test]
     fn signs_the_payload_the_otc_dex_verifies_with_both_key_types() {
         let otc_dex_id: intear_dex_types::DexId = "owner.near/otc".parse().unwrap();

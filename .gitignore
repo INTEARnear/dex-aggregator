@@ -2,3 +2,4 @@
 /.env
 /stats.sqlite*
 /hooks/*.so
+/hook-times.txt

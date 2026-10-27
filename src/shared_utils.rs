@@ -10,13 +10,13 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
-use intear_dex_types::DirectWithdrawAmount;
 use intear_dex_types::FULL_FEE_FRACTION;
+use intear_dex_types::{AssetId, DirectWithdrawAmount};
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
         near_account_id::AccountType, AccountId, AccountIdRef, Action, Balance, BlockHeight,
-        BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken, U128,
+        BlockReference, CryptoHash, Finality, FunctionCallAction, Gas, NearGas, NearToken,
     },
     utils::dec_format,
     QueryFinality, RpcClient,
@@ -25,12 +25,9 @@ use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Deserializer};
 pub use swap_router_types::fees::payable_referral_fees;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use crate::{
-    providers::intear_plach::AssetId,
-    types::{ExecutionInstruction, QuoteFees, Slippage, TokenId},
-};
+use crate::types::{ExecutionInstruction, QuoteFees, Slippage, TokenId};
 
 pub const WRAP_NEAR: &str = "wrap.near";
 pub const DEFAULT_REFERRER_ID: &str = "dex-aggregator.intear.near";
@@ -49,29 +46,9 @@ const FUNCTION_CALL_FEE_GAS: NearGas = NearGas::from_gas(200_000_000_000 + 780_0
 /// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/69.yaml#L34-L45
 const FUNCTION_CALL_BYTE_FEE_GAS: NearGas = NearGas::from_gas(47_683_715 + 2_235_934);
 
-const MAX_SWAP_GAS: NearGas = NearGas::from_tgas(900);
-const FT_TRANSFER_CALL_GAS: NearGas = NearGas::from_tgas(10);
-const SWAP_GAS_MARGIN: NearGas = NearGas::from_tgas(18);
-
-/// Gas to attach to a call that swaps: the gas the DEX is predicted to burn for the swaps with a
-/// margin, `reserved` for everything else the DEX needs in the call, its callbacks and transfers,
-/// and `FT_TRANSFER_CALL_GAS` if it's `ft_transfer_call`.
-pub fn swap_call_gas(swap_gas: NearGas, reserved: NearGas, ft_transfer_call: bool) -> Gas {
-    let gas = swap_gas.as_gas()
-        + SWAP_GAS_MARGIN.as_gas()
-        + reserved.as_gas()
-        + if ft_transfer_call {
-            FT_TRANSFER_CALL_GAS.as_gas()
-        } else {
-            0
-        };
-    let gas = NearGas::from_gas(gas);
-    if gas > MAX_SWAP_GAS {
-        warn!("A swap needs {gas}, attaching {MAX_SWAP_GAS}");
-        return Gas(MAX_SWAP_GAS);
-    }
-    Gas(gas)
-}
+pub const FT_TRANSFER_CALL_GAS: NearGas = NearGas::from_tgas(30);
+/// Source: mainnet data
+pub const FT_TRANSFER_CALL_GAS_BURNT: NearGas = NearGas::from_ggas(4_500);
 
 /// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L43-L47
 const ACTION_RECEIPT_EXECUTION_GAS: NearGas = NearGas::from_gas(108_059_500_000);
@@ -82,10 +59,8 @@ const CREATE_ACCOUNT_EXECUTION_GAS: NearGas = NearGas::from_gas(7_200_000_000_00
 /// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L98-L102
 const ADD_FULL_ACCESS_KEY_EXECUTION_GAS: NearGas = NearGas::from_gas(101_765_125_000);
 
-/// Share of the swap gas the pathfinder predicts for dexes to burn compared to what is needed to be attached.
-pub const SWAP_GAS_BURNT_PERCENT: u64 = 80;
-
-fn near_transfer_gas(trader_account_id: Option<&AccountId>) -> NearGas {
+/// Gas that sending NEAR to the trader burns, creating their account if it's implicit
+pub fn near_transfer_gas(trader_account_id: Option<&AccountId>) -> NearGas {
     let account_creation_gas =
         match trader_account_id.map(|account_id| account_id.get_account_type()) {
             Some(AccountType::NearImplicitAccount) => {
@@ -100,22 +75,6 @@ fn near_transfer_gas(trader_account_id: Option<&AccountId>) -> NearGas {
         ACTION_RECEIPT_EXECUTION_GAS.as_gas()
             + TRANSFER_EXECUTION_GAS.as_gas()
             + account_creation_gas,
-    )
-}
-
-/// Gas a swap call is expected to cost with all the receipts it causes: `swap_gas` the DEX is
-/// predicted to burn for the swaps, `overhead` for the rest of the DEX's and the tokens' work, and
-/// `near_transfers` of NEAR to the trader. Its refunds burn gas too, but nobody pays for it.
-pub fn swap_call_gas_paid(
-    swap_gas: NearGas,
-    overhead: NearGas,
-    near_transfers: u64,
-    trader_account_id: Option<&AccountId>,
-) -> NearGas {
-    NearGas::from_gas(
-        swap_gas.as_gas()
-            + overhead.as_gas()
-            + near_transfers * near_transfer_gas(trader_account_id).as_gas(),
     )
 }
 
@@ -311,18 +270,6 @@ pub trait NetworkView: Send + Sync {
         asset_id: &AssetId,
     ) -> impl Future<Output = Result<bool, String>> + Send;
 
-    fn ft_balance(
-        &self,
-        token_id: AccountId,
-        account_id: &AccountId,
-    ) -> impl Future<Output = Result<Balance, String>> + Send;
-
-    fn ft_lockup_balance(
-        &self,
-        lockup_id: AccountId,
-        account_id: &AccountId,
-    ) -> impl Future<Output = Result<Balance, String>> + Send;
-
     fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>;
 
     fn current_block_height(&self) -> Result<BlockHeight, String>;
@@ -509,49 +456,6 @@ impl NetworkView for Mainnet {
             .map_err(|err| format!("{err:?}"))
     }
 
-    async fn ft_balance(
-        &self,
-        token_id: AccountId,
-        account_id: &AccountId,
-    ) -> Result<Balance, String> {
-        RPC_CLIENT
-            .call::<near_sdk::json_types::U128>(
-                token_id,
-                "ft_balance_of",
-                serde_json::json!({
-                    "account_id": account_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .map(|balance| balance.0)
-            .map_err(|err| format!("{err:?}"))
-    }
-
-    async fn ft_lockup_balance(
-        &self,
-        lockup_id: AccountId,
-        account_id: &AccountId,
-    ) -> Result<Balance, String> {
-        #[derive(Debug, Clone, Deserialize)]
-        struct FtLockupAccount {
-            locked: U128,
-        }
-
-        RPC_CLIENT
-            .call::<Option<FtLockupAccount>>(
-                lockup_id,
-                "get_account",
-                serde_json::json!({
-                    "account_id": account_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .map(|account| account.map_or(0, |account| account.locked.0))
-            .map_err(|err| format!("{err:?}"))
-    }
-
     fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
         TOKEN_INFOS.read().unwrap().clone()
     }
@@ -571,8 +475,6 @@ pub(crate) struct TestNetworkView {
     tokens: Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>,
     block_height: Result<BlockHeight, String>,
     native_balances: HashMap<AccountId, NearToken>,
-    ft_balances: HashMap<(AccountId, AccountId), Balance>,
-    ft_lockup_balances: HashMap<(AccountId, AccountId), Balance>,
     storage_balance_bounds_errors: HashSet<AccountId>,
     intear_balances: HashSet<AccountId>,
     intear_untracked_assets: HashSet<AssetId>,
@@ -590,8 +492,6 @@ impl Default for TestNetworkView {
             tokens: Ok(Arc::default()),
             block_height: Ok(1_000_000),
             native_balances: HashMap::new(),
-            ft_balances: HashMap::new(),
-            ft_lockup_balances: HashMap::new(),
             storage_balance_bounds_errors: Default::default(),
             intear_balances: Default::default(),
             intear_untracked_assets: Default::default(),
@@ -725,32 +625,6 @@ impl TestNetworkView {
         self
     }
 
-    pub(crate) fn with_ft_balance(
-        mut self,
-        token_id: &str,
-        account_id: &str,
-        amount: Balance,
-    ) -> Self {
-        self.ft_balances.insert(
-            (token_id.parse().unwrap(), account_id.parse().unwrap()),
-            amount,
-        );
-        self
-    }
-
-    pub(crate) fn with_ft_lockup_balance(
-        mut self,
-        lockup_id: &str,
-        account_id: &str,
-        amount: Balance,
-    ) -> Self {
-        self.ft_lockup_balances.insert(
-            (lockup_id.parse().unwrap(), account_id.parse().unwrap()),
-            amount,
-        );
-        self
-    }
-
     #[allow(dead_code)]
     pub(crate) fn with_native_balance(mut self, account_id: &str, amount: NearToken) -> Self {
         self.native_balances
@@ -829,30 +703,6 @@ impl NetworkView for TestNetworkView {
 
     async fn is_intear_asset_in_custody(&self, asset_id: &AssetId) -> Result<bool, String> {
         Ok(!self.intear_untracked_assets.contains(asset_id))
-    }
-
-    async fn ft_balance(
-        &self,
-        token_id: AccountId,
-        account_id: &AccountId,
-    ) -> Result<Balance, String> {
-        Ok(self
-            .ft_balances
-            .get(&(token_id, account_id.clone()))
-            .copied()
-            .unwrap_or(0))
-    }
-
-    async fn ft_lockup_balance(
-        &self,
-        lockup_id: AccountId,
-        account_id: &AccountId,
-    ) -> Result<Balance, String> {
-        Ok(self
-            .ft_lockup_balances
-            .get(&(lockup_id, account_id.clone()))
-            .copied()
-            .unwrap_or(0))
     }
 
     fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
@@ -1238,7 +1088,7 @@ lazy_static! {
         RwLock::new(Err("Final block hash is not loaded yet".to_string()));
 }
 
-const TOKEN_INFOS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+pub const TOKEN_INFOS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const BLOCK_HEIGHT_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const FINAL_BLOCK_HASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -1952,10 +1802,13 @@ pub fn max_gas_cost(execution_instructions: &[ExecutionInstruction]) -> NearToke
     pathfinder::MIN_GAS_PRICE.saturating_mul(gas.into())
 }
 
+/// Calls besides swaps are attached more gas than they need, and are guessed to burn this much less
+const UNUSED_GAS_OF_OTHER_CALLS: NearGas = NearGas::from_tgas(18);
+
 /// Gas the execution instructions are expected to cost: the fees of their transactions and function
 /// calls, and what each function call burns. `swap_call` costs the gas paired with it, other calls
-/// burn what's attached to them but the swap margin. Refunds of unused gas burn gas too, but nobody
-/// pays for it.
+/// burn what's attached to them but `UNUSED_GAS_OF_OTHER_CALLS`. Refunds of unused gas burn gas too,
+/// but nobody pays for it.
 pub fn estimated_gas_paid(
     execution_instructions: &[ExecutionInstruction],
     swap_call: Option<(&Action, NearGas)>,
@@ -1963,7 +1816,10 @@ pub fn estimated_gas_paid(
     let transactions = optimize_execution_instructions(execution_instructions.to_vec());
     NearGas::from_gas(total_gas(&transactions, |call| match swap_call {
         Some((Action::FunctionCall(swap), gas_paid)) if **swap == *call => gas_paid.as_gas(),
-        _ => call.gas.as_gas().saturating_sub(SWAP_GAS_MARGIN.as_gas()),
+        _ => call
+            .gas
+            .as_gas()
+            .saturating_sub(UNUSED_GAS_OF_OTHER_CALLS.as_gas()),
     }))
 }
 

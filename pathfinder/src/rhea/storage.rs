@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, Balance};
-use pool_indexer::{AccountState, Watch};
+use swap_router_types::indexed::{AccountState, Watch};
 
 use super::{DegenPoolInfo, U256};
 use super::{

@@ -10,6 +10,7 @@ serde_json = "1.0.140"
 bigdecimal = "0.4.8"
 num-traits = "0.2.19"
 sha2 = "0.10.9"
+borsh = { version = "1.6.0", features = ["derive"] }
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
 intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
 xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }

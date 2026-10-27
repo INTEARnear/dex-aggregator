@@ -1,5 +1,6 @@
 pub mod fees;
 pub mod hook;
+pub mod indexed;
 pub mod otc;
 pub mod types;
 

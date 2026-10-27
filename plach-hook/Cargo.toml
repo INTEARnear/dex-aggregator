@@ -1,0 +1,26 @@
+[package]
+name = "plach-hook"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# Loaded by the aggregator as hooks/Plach.so
+name = "plach"
+crate-type = ["cdylib"]
+
+[dependencies]
+swap-router-types = { path = "../swap-router-types", features = ["hook"] }
+pathfinder = { path = "../pathfinder", default-features = false }
+near-min-api = { git = "https://github.com/INTEARnear/wallet" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
+# Native builds of the dex's types crates need this feature
+near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
+borsh = "1.6.0"
+sha2 = "0.10.9"
+bigdecimal = "0.4.8"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.45.1", features = ["rt", "sync", "macros"] }
+anyhow = "1"

@@ -1,32 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-use borsh::BorshDeserialize;
-use near_min_api::types::{AccountId, BlockHeight, CryptoHash};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshDeserialize)]
-pub struct BlockInfo {
-    pub height: BlockHeight,
-    pub hash: CryptoHash,
-    pub timestamp_nanosec: u64,
-}
-
-/// Storage of an account after a block, only keys under the watched prefixes
-#[derive(BorshDeserialize)]
-pub struct AccountState {
-    pub block: BlockInfo,
-    pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
-}
-
-impl AccountState {
-    pub fn with_prefix<'a>(
-        &'a self,
-        prefix: &'a [u8],
-    ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a {
-        self.entries
-            .range(prefix.to_vec()..)
-            .take_while(move |(key, _)| key.starts_with(prefix))
-    }
-}
+use near_min_api::types::AccountId;
+use swap_router_types::indexed::{AccountState, BlockInfo};
 
 pub(crate) struct WatchedAccount {
     pub prefixes: Vec<Vec<u8>>,

@@ -3172,6 +3172,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "smallvec",
+ "swap-router-types",
  "tokio",
  "tracing",
  "xyk-dex-types",
@@ -3218,6 +3219,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plach-hook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bigdecimal",
+ "borsh",
+ "intear-dex-types",
+ "near-min-api",
+ "near-sdk",
+ "pathfinder",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "swap-router-types",
+ "tokio",
+ "xyk-dex-types",
+]
+
+[[package]]
 name = "pool-indexer"
 version = "0.1.0"
 dependencies = [
@@ -3225,6 +3245,7 @@ dependencies = [
  "borsh",
  "inindexer",
  "near-min-api",
+ "swap-router-types",
  "tokio",
  "tracing",
 ]
@@ -4606,6 +4627,7 @@ name = "swap-router-types"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "borsh",
  "intear-dex-types",
  "near-min-api",
  "near-sdk",

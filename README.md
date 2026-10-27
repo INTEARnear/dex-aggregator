@@ -8,12 +8,13 @@ Refer to https://docs.intear.tech/docs/dex-aggregator/ for integration instructi
 
 ## Architecture
 
-It's separated into 4 crates:
+It's separated into 5 crates:
 
 - `swap-router`: the main aggregator crate, hosts the API and builds transactions. Example URL: https://router.intear.tech/route?token_in=rhea-nep141:wrap.near&token_out=juij.launch.intear.near&amount_in=1000000000000000000000000&slippage_type=Fixed&slippage=0.01&dexes=Rhea%2CWrap%2CRheaDcl%2CPlach&trader_account_id=intear.near&signing_public_key=ed25519%3A4WZAP6JoruNHR2W4mi9fM219viZKYskqLRDYkwBHCUY8&referrer_id=intear.near
-- `pathfinder`: library that indexes the pools of Rhea, Intear Plach and Rhea DCL and finds the best route within one of them. Rhea DCL swap math in `pathfinder::dcl` is ported from iZiSwap (GPL-2.0-or-later). `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block and keeps each DEX's pool snapshot up to date, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread.
+- `pathfinder`: library that finds the best route within the pools of Rhea, Intear Plach or Rhea DCL. Rhea DCL swap math in `pathfinder::dcl` is ported from iZiSwap (GPL-2.0-or-later). `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block, keeps Rhea's and Rhea DCL's pool snapshots up to date and gives hooks the storage they watch, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread. Without its `indexer` feature, it's only the search.
 - `pool-indexer`: keeps a copy of the contract storage that pools are built from=
-- `swap-router-types`: the API's types, the app fee split, and filling OTC DEX intents, shared by `swap-router` and its hooks. With the `hook` feature, `Hook` and `export_hook!` build a hook library without writing its C ABI.
+- `swap-router-types`: the API's types, the app fee split, the indexed storage, and filling OTC DEX intents, shared by `swap-router` and its hooks. With the `hook` feature, `Hook` and `export_hook!` build a hook library without writing its C ABI.
+- `plach-hook`: Plach as a hook, built with `cargo build --release -p plach-hook` and installed as `hooks/Plach.so` from `target/release/libplach.so`. It signs TEAR fee discounts with `FEE_DISCOUNTER_ACCOUNT_ID` and `FEE_DISCOUNTER_PRIVATE_KEY`.
 
 Routing is deterministic, so running `quote` again on the same block heights and queries gives identical output.
 
@@ -22,8 +23,8 @@ Routing is deterministic, so running `quote` again on the same block heights and
 - `Rhea`: uses `pathfinder`
 - `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different-output-token-locations))
 - `RheaDcl`: uses `pathfinder`
-- `Plach`: uses `pathfinder`
-- `hook:<name>`: a hook, loaded at startup from `hooks/<name>.so` in the working directory. After the other DEXes are routed, it gets the request data and current quotes, and can add quotes of its own, which `swap-router` builds the routes of. Today a quote is a trade intent signed for the Intear DEX OTC. Limited to 10ms execution time. The ABI is in `swap_router_types::hook`.
+- `IntearDex`: every hook's quote in one swap on Intear DEX, a `SwapAdvanced` that tries the best quote first and falls back to the next ones in `FallbackQueue` mode when one fails.
+- `<name>`: a hook, loaded at startup from `hooks/<name>.so` in the working directory, like `Plach` from `plach-hook`.
 
 ## Different output token locations
 

@@ -1,396 +1,264 @@
-use std::{future::Future, pin::Pin};
-
+use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
 use intear_dex_types::{
-    Operation, ReferralFees, SwapOperationAmount, SwapRequestAmount, WithdrawAmount,
+    AssetId, Operation, ReferralFees, SwapAdvancedMode, SwapOperationAmount, SwapOption,
+    SwapRequestAmount, WithdrawAmount,
 };
-use lazy_static::lazy_static;
-use near_min_api::types::{
-    near_crypto::{SecretKey, Signature},
-    AccountId, Action, Balance, BlockHeight, FunctionCallAction, NearGas, NearToken,
-};
-use near_sdk::json_types::{Base64VecU8, U128};
-use pathfinder::{
-    plach::{self, SplitRouteApiResponse},
-    MaxHops, QuoteAmount,
-};
-use sha2::{Digest, Sha256};
-use tracing::info;
-use xyk_dex_types::{
-    FeeDiscount, FeeDiscountSignaturePayload, FeeFractionFraction, SignedFeeDiscount, SwapArgs,
-    SwapRoute, FULL_FEE_FRACTION_FRACTION,
-};
+use near_min_api::types::{AccountId, Action, FunctionCallAction, Gas, NearGas, NearToken};
+use near_sdk::json_types::U128;
+use swap_router_types::hook::{HookQuote, IntearDexTrade};
 
 use crate::{
     shared_utils::{
         base_token, convert_to_native, convert_to_nep141, deposit_storage_if_needed,
-        estimated_gas_paid, get_slippage, is_near, payable_referral_fees, price_raw,
-        register_assets_on_intear, register_input_in_wallet, swap_call_gas, swap_call_gas_paid,
-        BaseTokenId, Mainnet, NetworkView, DEFAULT_REFERRER_ID, SWAP_GAS_BURNT_PERCENT,
+        estimated_gas_paid, get_slippage, is_near, near_transfer_gas, payable_referral_fees,
+        register_assets_on_intear, register_input_in_wallet, NetworkView, DEFAULT_REFERRER_ID,
+        FT_TRANSFER_CALL_GAS, FT_TRANSFER_CALL_GAS_BURNT,
     },
     types::{ExecutionInstruction, TokenId},
-    Amount, DexId, Provider, Route, SwapRequest,
+    Amount, DexId, Route, SwapRequest,
 };
 
-pub struct IntearPlachProvider;
-
 pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
-const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-pub const FT_TRANSFER_CALL_RESERVED_GAS: NearGas = NearGas::from_tgas(20);
-const WITHDRAWAL_TRANSFER_GAS: NearGas = NearGas::from_tgas(10);
-const WITHDRAWAL_CALLBACK_GAS: NearGas = NearGas::from_tgas(5);
-const SPARE_RESERVED_GAS: NearGas = NearGas::from_tgas(2);
 
-pub fn reserved_gas(operations: &[Operation]) -> NearGas {
-    let withdrawals_gas = operations
-        .iter()
-        .map(|operation| match operation {
-            Operation::Withdraw {
-                asset_id: AssetId::Near,
-                ..
-            } => WITHDRAWAL_CALLBACK_GAS.as_gas(),
-            Operation::Withdraw { .. } => {
-                WITHDRAWAL_TRANSFER_GAS.as_gas() + WITHDRAWAL_CALLBACK_GAS.as_gas()
-            }
-            _ => 0,
-        })
-        .sum::<u64>();
-    NearGas::from_gas(SPARE_RESERVED_GAS.as_gas() + withdrawals_gas)
-}
+/// What the engine burns in the call that swaps, besides the DEX and the withdrawals
+const ENGINE_GAS: NearGas = NearGas::from_ggas(2_600);
+/// What each withdrawal adds to the call
+const WITHDRAWAL_GAS: NearGas = NearGas::from_ggas(500);
+/// What each referral fee adds to the call
+const REFERRAL_FEE_GAS: NearGas = NearGas::from_ggas(600);
+/// What a withdrawal of a NEP-141 needs the call to be attached: 10 TGas of `ft_transfer` and 5 TGas
+/// of `after_withdraw`, and the fees of their receipts
+const FT_WITHDRAWAL_RESERVED_GAS: NearGas = NearGas::from_tgas(17);
+/// What a withdrawal of NEAR needs the call to be attached: 5 TGas of `after_withdraw`, and the fees
+/// of its receipt and the transfer's
+const NEAR_WITHDRAWAL_RESERVED_GAS: NearGas = NearGas::from_tgas(6);
+/// What `ft_transfer` and `after_withdraw` of a NEP-141 withdrawal burn, 2.3 and 2.9 TGas at most
+/// on mainnet
+const FT_WITHDRAWAL_GAS_BURNT: NearGas = NearGas::from_tgas(5);
+/// What `after_withdraw` of a NEAR withdrawal burns, besides the transfer
+const NEAR_WITHDRAWAL_GAS_BURNT: NearGas = NearGas::from_ggas(2_900);
+/// What the engine's gas changes by between swaps, 0.3 TGas in the sandbox
+const GAS_MARGIN: NearGas = NearGas::from_tgas(3);
 
-pub const SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(3_260);
-pub const FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS: NearGas = NearGas::from_ggas(8_530);
-const WITHDRAWAL_OVERHEAD_GAS: NearGas = NearGas::from_ggas(4_540);
-const NEAR_WITHDRAWAL_OVERHEAD_GAS: NearGas = NearGas::from_ggas(2_100);
-const REFERRAL_FEE_OVERHEAD_GAS: NearGas = NearGas::from_ggas(600);
-
-/// Gas a swap call with the operations and referral fees costs, with `entry_overhead` for how the
-/// call gets the input to the DEX and `near_transfers` of NEAR to the trader
-pub fn swap_call_gas_paid_with_operations(
+fn swap_call_gas(
     swap_gas: NearGas,
+    worst_case_swap_gas: NearGas,
     operations: &[Operation],
     referral_fees: &ReferralFees,
-    entry_overhead: NearGas,
-    near_transfers: u64,
     trader_account_id: Option<&AccountId>,
-) -> NearGas {
-    let withdrawals_overhead = operations
-        .iter()
-        .map(|operation| match operation {
-            Operation::Withdraw {
-                asset_id: AssetId::Near,
-                ..
-            } => NEAR_WITHDRAWAL_OVERHEAD_GAS.as_gas(),
-            Operation::Withdraw { .. } => WITHDRAWAL_OVERHEAD_GAS.as_gas(),
-            _ => 0,
-        })
-        .sum::<u64>();
-    let referral_fees_overhead = REFERRAL_FEE_OVERHEAD_GAS.as_gas() * referral_fees.0.len() as u64;
-    swap_call_gas_paid(
-        NearGas::from_gas(swap_gas.as_gas() * SWAP_GAS_BURNT_PERCENT / 100),
-        NearGas::from_gas(entry_overhead.as_gas() + withdrawals_overhead + referral_fees_overhead),
-        near_transfers,
-        trader_account_id,
-    )
-}
-
-pub use intear_dex_types::AssetId;
-
-const TEAR_TOKEN_ID: &str = "token.intear.near";
-const TEAR_STAKING_CONTRACT_ID: &str = "stakeyourtears.intear.near";
-const ONE_TEAR: Balance = 10u128.pow(24);
-
-const TEAR_FEE_DISCOUNTS: [(Balance, FeeFractionFraction); 3] = [
-    (100_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION * 3 / 4), // 100,000 = 75% discount
-    (1_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 4),       // 1,000 = 25% discount
-    (10 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 10),         // 10 = 10% discount
-];
-
-/// How long a quote's fee discount can be used, ~10 minutes
-const FEE_DISCOUNT_VALIDITY_BLOCKS: BlockHeight = 1000;
-
-fn tear_fee_discount(tear_balance: Balance) -> Option<FeeFractionFraction> {
-    TEAR_FEE_DISCOUNTS
-        .into_iter()
-        .find(|(min_balance, _)| tear_balance >= *min_balance)
-        .map(|(_, fee_discount)| fee_discount)
-}
-
-lazy_static! {
-    pub static ref FEE_DISCOUNTER: FeeDiscounter = FeeDiscounter::from_env();
-}
-
-/// Signs fee discounts with the key set as the xyk DEX's fee discount signer
-pub struct FeeDiscounter {
-    secret_key: SecretKey,
-}
-
-impl FeeDiscounter {
-    fn from_env() -> Self {
-        let account_id: AccountId = std::env::var("FEE_DISCOUNTER_ACCOUNT_ID")
-            .expect("FEE_DISCOUNTER_ACCOUNT_ID must be set")
-            .parse()
-            .expect("Invalid FEE_DISCOUNTER_ACCOUNT_ID");
-        let secret_key: SecretKey = std::env::var("FEE_DISCOUNTER_PRIVATE_KEY")
-            .expect("FEE_DISCOUNTER_PRIVATE_KEY must be set")
-            .parse()
-            .expect("Invalid FEE_DISCOUNTER_PRIVATE_KEY");
-        info!(
-            "Signing Plach fee discounts as {account_id} with {}",
-            secret_key.public_key()
-        );
-        Self { secret_key }
-    }
-
-    /// Signs sha256(borsh(`discount`)), which the DEX verifies
-    fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
-        let hash =
-            Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap());
-        let signature = match self.secret_key.sign(&hash) {
-            Signature::ED25519(signature) => signature.to_bytes().to_vec(),
-            // Borsh puts the key type before the 65 bytes of r, s, and the recovery id
-            signature @ Signature::SECP256K1(_) => borsh::to_vec(&signature).unwrap()[1..].to_vec(),
-            Signature::MLDSA65(_) => panic!("The DEX can't verify ML-DSA-65 fee discounts"),
-        };
-        SignedFeeDiscount {
-            discount,
-            signature,
+) -> (NearGas, NearGas) {
+    let call_gas = ENGINE_GAS.as_gas() + REFERRAL_FEE_GAS.as_gas() * referral_fees.0.len() as u64;
+    let mut attached = call_gas + worst_case_swap_gas.as_gas() + GAS_MARGIN.as_gas();
+    let mut burnt = call_gas + swap_gas.as_gas();
+    for operation in operations {
+        if let Operation::Withdraw { asset_id, .. } = operation {
+            let (reserved, burnt_after) = match asset_id {
+                AssetId::Near => (
+                    NEAR_WITHDRAWAL_RESERVED_GAS.as_gas(),
+                    NEAR_WITHDRAWAL_GAS_BURNT.as_gas()
+                        + near_transfer_gas(trader_account_id).as_gas(),
+                ),
+                _ => (
+                    FT_WITHDRAWAL_RESERVED_GAS.as_gas(),
+                    FT_WITHDRAWAL_GAS_BURNT.as_gas(),
+                ),
+            };
+            attached += WITHDRAWAL_GAS.as_gas() + reserved;
+            burnt += WITHDRAWAL_GAS.as_gas() + burnt_after;
         }
     }
+    (NearGas::from_gas(attached), NearGas::from_gas(burnt))
 }
 
-fn fee_discount_signature_payload(discount: &FeeDiscount) -> FeeDiscountSignaturePayload {
-    FeeDiscountSignaturePayload {
-        chain_id: "mainnet".to_string(),
-        engine_contract_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-        dex_id: PLACH_DEX_ID.parse().unwrap(),
-        discount: discount.clone(),
-    }
-}
-
-trait PlachQuotes: Send + Sync {
-    fn find_path(
-        &self,
-        request: plach::Request,
-    ) -> impl Future<Output = Option<SplitRouteApiResponse>> + Send;
-}
-
-struct MainnetPlachQuotes;
-
-impl PlachQuotes for MainnetPlachQuotes {
-    async fn find_path(&self, request: plach::Request) -> Option<SplitRouteApiResponse> {
-        plach::find_path(request)
-            .await
-            .inspect_err(|e| info!("No Plach route: {e:#}"))
-            .ok()
-    }
-}
-
-impl Provider for IntearPlachProvider {
-    fn dex_id(&self) -> DexId {
-        DexId::Plach
-    }
-
-    fn route(&self, request: SwapRequest) -> Pin<Box<dyn Future<Output = Option<Route>> + Send>> {
-        Box::pin(async move {
-            route(
-                request,
-                &Mainnet,
-                &MainnetPlachQuotes,
-                Some(&*FEE_DISCOUNTER),
-            )
-            .await
-        })
-    }
-}
-
-async fn route(
-    request: SwapRequest,
+/// The swap on Intear DEX that the request goes through, which hooks quote. None if its tokens
+/// can't be swapped there.
+pub async fn trade_of_request(
     network: &impl NetworkView,
-    quotes: &impl PlachQuotes,
-    fee_discounter: Option<&FeeDiscounter>,
-) -> Option<Route> {
+    request: &SwapRequest,
+) -> Option<IntearDexTrade> {
     let amount_hint = match request.amount {
         Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
     };
-
+    let asset_in = intear_dex_asset(&request.token_in, amount_hint).await?;
+    let asset_out = intear_dex_asset(&request.token_out, amount_hint).await?;
+    if asset_in == asset_out {
+        return None;
+    }
     let slippage = get_slippage(
         network,
-        request.slippage,
-        &base_token(&request.token_in).unwrap(),
-        &base_token(&request.token_out).unwrap(),
+        request.slippage.clone(),
+        &base_token(&request.token_in)?,
+        &base_token(&request.token_out)?,
     );
-
-    let (_, token_in) = match &request.token_in {
-        TokenId::TokenOnIntearDex(asset_id) => (Vec::new(), asset_id.clone()),
-        t if is_near(t) => (
-            convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
-            AssetId::Near,
-        ),
-        _ => convert_to_nep141(&request.token_in, None, 0)
-            .await
-            .map(|(v, t)| (v, AssetId::Nep141(t)))?,
-    };
-    let (_, token_out) = match &request.token_out {
-        TokenId::TokenOnIntearDex(asset_id) => (Vec::new(), asset_id.clone()),
-        t if is_near(t) => (
-            convert_to_native(t, None, NearToken::from_yoctonear(amount_hint)).await?,
-            AssetId::Near,
-        ),
-        _ => convert_to_nep141(&request.token_out, None, 0)
-            .await
-            .map(|(v, t)| (v, AssetId::Nep141(t)))?,
-    };
-
-    if token_in == token_out {
-        return None;
-    }
-
-    // The engine takes them out of the input before the DEX gets it, and only pays referrers that
-    // registered the input, which the route does for them
+    // The engine takes them out of the input before the DEX gets it
     let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
-    let fees_total = |fees: Vec<(AccountId, U128)>| fees.iter().map(|(_, fee)| fee.0).sum::<u128>();
-
-    let fee_discount = match (fee_discounter, &request.trader_account_id) {
-        (Some(fee_discounter), Some(trader_account_id)) => {
-            let (tear_balance, staked_tear) = tokio::try_join!(
-                network.ft_balance(TEAR_TOKEN_ID.parse().unwrap(), trader_account_id),
-                network.ft_lockup_balance(
-                    TEAR_STAKING_CONTRACT_ID.parse().unwrap(),
-                    trader_account_id
-                ),
-            )
-            .inspect_err(|e| info!("No TEAR holdings to discount fees by: {e}"))
-            .ok()?;
-            tear_fee_discount(tear_balance + staked_tear)
-                .map(|fee_discount| (fee_discounter, fee_discount))
+    let amount = match request.amount {
+        Amount::AmountIn(amount_in) => {
+            Amount::AmountIn(amount_in - fees_total(referral_fees.amounts_out_of(U128(amount_in))))
         }
-        _ => None,
+        Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
     };
+    Some(IntearDexTrade {
+        asset_in,
+        asset_out,
+        amount,
+        slippage,
+        trader_account_id: request.trader_account_id.clone(),
+    })
+}
 
-    let response = quotes
-        .find_path(plach::Request {
-            token_in: token_in.clone(),
-            token_out: token_out.clone(),
-            amount: match request.amount {
-                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(
-                    amount_in - fees_total(referral_fees.amounts_out_of(U128(amount_in))),
-                ),
-                Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
-            },
-            max_hops: MaxHops::Four,
-            slippage,
-            near_price_raw: price_raw(network, &BaseTokenId::Near)?,
-            quoted_token_price_raw: price_raw(
-                network,
-                &match request.amount {
-                    Amount::AmountIn(_) => base_token(&request.token_out).unwrap(),
-                    Amount::AmountOut(_) => base_token(&request.token_in).unwrap(),
-                },
-            )?,
-            fee_discount: fee_discount.map_or(0, |(_, fee_discount)| fee_discount),
-        })
-        .await?;
-
-    let swap_gas = match response {
-        SplitRouteApiResponse::ExactIn { swap_gas, .. }
-        | SplitRouteApiResponse::ExactOut { swap_gas, .. } => swap_gas,
-    };
-    let discount = fee_discount.map(|_| match response {
-        SplitRouteApiResponse::ExactIn { discount, .. } => Amount::AmountOut(discount.0),
-        SplitRouteApiResponse::ExactOut { discount, .. } => Amount::AmountIn(discount.0),
-    });
-    // `dex_amount` is what the DEX swaps, `swap_amount` what the engine takes with the fees
-    let (swap_routes, dex_amount, swap_amount, constraint, estimated_amount, worst_case_amount) =
-        match response {
-            SplitRouteApiResponse::ExactIn {
-                routes,
-                amount_in,
-                amount_out,
-                ..
-            } => {
-                let total_min_amount_out = routes.iter().map(|route| route.min_amount_out.0).sum();
-                let swap_routes = routes
-                    .into_iter()
-                    .map(|route| SwapRoute {
-                        fraction: route.split_fraction,
-                        pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
-                    })
-                    .collect::<Vec<_>>();
-                let Amount::AmountIn(amount_in_with_fees) = request.amount else {
-                    unreachable!("Exact in is quoted for an amount in");
-                };
-                (
-                    swap_routes,
-                    SwapRequestAmount::ExactIn(U128(amount_in.0)),
-                    SwapRequestAmount::ExactIn(U128(amount_in_with_fees)),
-                    total_min_amount_out,
-                    Amount::AmountOut(amount_out.0),
-                    Amount::AmountOut(total_min_amount_out),
-                )
-            }
-            SplitRouteApiResponse::ExactOut {
-                routes,
-                amount_in,
-                max_amount_in,
-                amount_out,
-                ..
-            } => {
-                let swap_routes = routes
-                    .into_iter()
-                    .map(|route| SwapRoute {
-                        fraction: route.split_fraction,
-                        pool_ids: route.pools.iter().map(|step| step.pool_id).collect(),
-                    })
-                    .collect::<Vec<_>>();
-                // Fees on top of the input the DEX takes, so the most it can take with them is the
-                // constraint
-                let with_fees = |amount_in: u128| {
-                    amount_in + fees_total(referral_fees.amounts_on_top_of(U128(amount_in)))
-                };
-                (
-                    swap_routes,
-                    SwapRequestAmount::ExactOut(U128(amount_out.0)),
-                    SwapRequestAmount::ExactOut(U128(amount_out.0)),
-                    with_fees(max_amount_in.0),
-                    Amount::AmountIn(with_fees(amount_in.0)),
-                    Amount::AmountIn(with_fees(max_amount_in.0)),
-                )
-            }
-        };
-    if swap_routes.is_empty() {
-        return None;
+/// The asset the token is swapped as on Intear DEX: NEAR and wNEAR as NEAR, a token outside of it
+/// as the NEP-141 that the route converts it to
+async fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
+    match token_id {
+        TokenId::TokenOnIntearDex(asset_id) => Some(asset_id.clone()),
+        token_id if is_near(token_id) => {
+            convert_to_native(token_id, None, NearToken::from_yoctonear(amount_hint)).await?;
+            Some(AssetId::Near)
+        }
+        token_id => convert_to_nep141(token_id, None, 0)
+            .await
+            .map(|(_, nep141)| AssetId::Nep141(nep141)),
     }
-    let fee_discount = match fee_discount {
-        Some((fee_discounter, fee_discount)) => {
-            let current_block_height = network
-                .current_block_height()
-                .inspect_err(|e| info!("No block height to expire a fee discount at: {e}"))
-                .ok()?;
-            Some(fee_discounter.sign(FeeDiscount {
-                routes: swap_routes.clone(),
-                asset_in: token_in.clone(),
-                asset_out: token_out.clone(),
-                trader_id: request.trader_account_id.clone(),
-                amount: dex_amount,
-                fee_discount,
-                expiration_block_height: current_block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
-            }))
+}
+
+fn fees_total(fees: Vec<(AccountId, U128)>) -> u128 {
+    fees.iter().map(|(_, fee)| fee.0).sum()
+}
+
+/// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, or on the first of several that
+/// fills it within the trade's slippage
+pub struct IntearDexSwap {
+    /// Best first
+    options: Vec<SwapOption>,
+    /// Of the first option, as in [`HookQuote`]
+    estimated_amount: u128,
+    /// The least the swap gives, or the most it takes, as in [`HookQuote`]
+    worst_case_amount: u128,
+    /// Of the first option, which usually fills the swap
+    swap_gas: NearGas,
+    /// Of all options, which the engine tries until one fills the swap
+    worst_case_swap_gas: NearGas,
+    discount: Option<U128>,
+}
+
+impl IntearDexSwap {
+    pub fn of_quote(quote: HookQuote) -> Self {
+        Self {
+            options: vec![SwapOption {
+                dex_id: quote.dex_id,
+                message: quote.message,
+            }],
+            estimated_amount: quote.estimated_amount.0,
+            worst_case_amount: quote.worst_case_amount.0,
+            swap_gas: quote.swap_gas,
+            worst_case_swap_gas: quote.worst_case_swap_gas,
+            discount: quote.discount,
         }
-        None => None,
-    };
-    let swaps = vec![Operation::SwapSimple {
-        dex_id: PLACH_DEX_ID.parse().unwrap(),
-        message: Base64VecU8(
-            borsh::to_vec(&SwapArgs {
-                routes: swap_routes,
-                fee_discount,
-            })
-            .unwrap(),
+    }
+
+    /// The quotes, best first, as options that the engine falls back through when one fails or
+    /// doesn't meet the trade's slippage from the best one. None without quotes, one quote is
+    /// swapped on alone.
+    pub fn fallback_queue(trade: &IntearDexTrade, mut quotes: Vec<HookQuote>) -> Option<Self> {
+        match trade.amount {
+            Amount::AmountIn(_) => {
+                quotes.sort_by_key(|quote| std::cmp::Reverse(quote.estimated_amount.0))
+            }
+            Amount::AmountOut(_) => quotes.sort_by_key(|quote| quote.estimated_amount.0),
+        }
+        if quotes.len() < 2 {
+            return quotes.into_iter().next().map(Self::of_quote);
+        }
+        let best = &quotes[0];
+        let estimated_amount = BigDecimal::from(best.estimated_amount.0);
+        let worst_case_amount = match trade.amount {
+            Amount::AmountIn(_) => (estimated_amount * (BigDecimal::from(1) - &trade.slippage))
+                .with_scale_round(0, RoundingMode::Down),
+            Amount::AmountOut(_) => (estimated_amount * (BigDecimal::from(1) + &trade.slippage))
+                .with_scale_round(0, RoundingMode::Up),
+        }
+        .to_u128()?;
+        Some(Self {
+            estimated_amount: best.estimated_amount.0,
+            worst_case_amount,
+            swap_gas: best.swap_gas,
+            worst_case_swap_gas: NearGas::from_gas(
+                quotes
+                    .iter()
+                    .map(|quote| quote.worst_case_swap_gas.as_gas())
+                    .sum(),
+            ),
+            discount: best.discount,
+            options: quotes
+                .into_iter()
+                .map(|quote| SwapOption {
+                    dex_id: quote.dex_id,
+                    message: quote.message,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// The route of a swap for `trade`, which [`trade_of_request`] made of `request`
+pub async fn route(
+    network: &impl NetworkView,
+    dex_id: DexId,
+    request: &SwapRequest,
+    trade: &IntearDexTrade,
+    swap: IntearDexSwap,
+) -> Option<Route> {
+    let token_in = trade.asset_in.clone();
+    let token_out = trade.asset_out.clone();
+    let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
+    let discount = swap.discount.map(|discount| match request.amount {
+        Amount::AmountIn(_) => Amount::AmountOut(discount.0),
+        Amount::AmountOut(_) => Amount::AmountIn(discount.0),
+    });
+    // `swap_amount` is what the engine takes with the fees
+    let (swap_amount, constraint, estimated_amount, worst_case_amount) = match request.amount {
+        Amount::AmountIn(amount_in_with_fees) => (
+            SwapRequestAmount::ExactIn(U128(amount_in_with_fees)),
+            swap.worst_case_amount,
+            Amount::AmountOut(swap.estimated_amount),
+            Amount::AmountOut(swap.worst_case_amount),
         ),
-        asset_in: token_in.clone(),
-        asset_out: token_out.clone(),
-        amount: SwapOperationAmount::Amount(swap_amount),
-        constraint: Some(U128(constraint)),
+        Amount::AmountOut(amount_out) => {
+            // Fees on top of the input the DEX takes, so the most it can take with them is the
+            // constraint
+            let with_fees = |amount_in: u128| {
+                amount_in + fees_total(referral_fees.amounts_on_top_of(U128(amount_in)))
+            };
+            (
+                SwapRequestAmount::ExactOut(U128(amount_out)),
+                with_fees(swap.worst_case_amount),
+                Amount::AmountIn(with_fees(swap.estimated_amount)),
+                Amount::AmountIn(with_fees(swap.worst_case_amount)),
+            )
+        }
+    };
+    let (swap_gas, worst_case_swap_gas) = (swap.swap_gas, swap.worst_case_swap_gas);
+    let mut options = swap.options;
+    let swaps = vec![if options.len() == 1 {
+        let SwapOption { dex_id, message } = options.remove(0);
+        Operation::SwapSimple {
+            dex_id,
+            message,
+            asset_in: token_in.clone(),
+            asset_out: token_out.clone(),
+            amount: SwapOperationAmount::Amount(swap_amount),
+            constraint: Some(U128(constraint)),
+        }
+    } else {
+        Operation::SwapAdvanced {
+            asset_in: token_in.clone(),
+            asset_out: token_out.clone(),
+            amount: SwapOperationAmount::Amount(swap_amount),
+            constraint: Some(U128(constraint)),
+            options,
+            mode: SwapAdvancedMode::FallbackQueue,
+        }
     }];
 
     let use_fast_path = matches!(request.token_in, TokenId::TokenOnIntearDex(_));
@@ -472,24 +340,24 @@ async fn route(
         Amount::AmountOut(_) => constraint,
     };
 
-    let reserved_gas = reserved_gas(&operations);
-    // The output withdrawn as NEAR is sent to the trader, what's left of the input rarely is
-    let near_transfers = if output_withdrawn && token_out == AssetId::Near {
-        1
-    } else {
-        0
-    };
+    let (call_gas, call_gas_burnt) = swap_call_gas(
+        swap_gas,
+        worst_case_swap_gas,
+        &operations,
+        &referral_fees,
+        request.trader_account_id.as_ref(),
+    );
     let (transactions, swap_action, swap_gas_paid) = if use_fast_path {
         let execute_operations_action =
                     Action::FunctionCall(Box::new(FunctionCallAction {
                         method_name: "execute_operations".to_string(),
                         args: serde_json::to_vec(&serde_json::json!({
                             "operations": operations,
-                            "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                            "referrer": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                             "referral_fees": referral_fees,
                         }))
                         .unwrap(),
-                        gas: swap_call_gas(swap_gas, reserved_gas, false),
+                        gas: Gas(call_gas),
                         deposit: NearToken::from_yoctonear(1),
                     }));
         let output_storage = if output_withdrawn {
@@ -506,14 +374,6 @@ async fn route(
         } else {
             vec![]
         };
-        let gas_paid = swap_call_gas_paid_with_operations(
-            swap_gas,
-            &operations,
-            &referral_fees,
-            SWAP_OVERHEAD_GAS,
-            near_transfers,
-            request.trader_account_id.as_ref(),
-        );
         (
             [
                 output_storage,
@@ -525,7 +385,7 @@ async fn route(
             ]
             .concat(),
             execute_operations_action,
-            gas_paid,
+            call_gas_burnt,
         )
     } else {
         match token_in {
@@ -541,12 +401,12 @@ async fn route(
                             args: serde_json::to_vec(&serde_json::json!({
                                 "operations": {
                                     "operations": operations,
-                                    "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                                    "referrer": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                                     "referral_fees": referral_fees,
                                 },
                             }))
                             .unwrap(),
-                            gas: swap_call_gas(swap_gas, reserved_gas, false),
+                            gas: Gas(call_gas),
                             deposit: NearToken::from_yoctonear(input_amount),
                         }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -554,14 +414,6 @@ async fn route(
                     actions: vec![deposit_near_action.clone()],
                     is_fee_transaction: false,
                 }];
-                let gas_paid = swap_call_gas_paid_with_operations(
-                    swap_gas,
-                    &operations,
-                    &referral_fees,
-                    SWAP_OVERHEAD_GAS,
-                    near_transfers,
-                    request.trader_account_id.as_ref(),
-                );
                 let transactions = [
                     deposit_storage_if_needed(
                         network,
@@ -583,7 +435,7 @@ async fn route(
                     swap_transactions,
                 ]
                 .concat();
-                (transactions, deposit_near_action, gas_paid)
+                (transactions, deposit_near_action, call_gas_burnt)
             }
             AssetId::Nep141(token_in_id) => {
                 let ft_transfer_call_swap_action =
@@ -594,19 +446,14 @@ async fn route(
                                     "amount": input_amount.to_string(),
                                     "msg": serde_json::to_string(&serde_json::json!({
                                         "operations": operations,
-                                        "referrer": request.referrer_id.map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
+                                        "referrer": request.referrer_id.as_ref().map(|id| id.to_string()).unwrap_or_else(|| DEFAULT_REFERRER_ID.to_string()),
                                         "referral_fees": referral_fees,
                                     })).unwrap(),
                                 }))
                                 .unwrap(),
-                                gas: swap_call_gas(
-                                    swap_gas,
-                                    NearGas::from_gas(
-                                        reserved_gas.as_gas()
-                                            + FT_TRANSFER_CALL_RESERVED_GAS.as_gas(),
-                                    ),
-                                    true,
-                                ),
+                                gas: Gas(NearGas::from_gas(
+                                    FT_TRANSFER_CALL_GAS.as_gas() + call_gas.as_gas(),
+                                )),
                                 deposit: NearToken::from_yoctonear(1),
                             }));
                 let swap_transactions = vec![ExecutionInstruction::NearTransaction {
@@ -614,13 +461,8 @@ async fn route(
                     actions: vec![ft_transfer_call_swap_action.clone()],
                     is_fee_transaction: false,
                 }];
-                let gas_paid = swap_call_gas_paid_with_operations(
-                    swap_gas,
-                    &operations,
-                    &referral_fees,
-                    FT_TRANSFER_CALL_SWAP_OVERHEAD_GAS,
-                    near_transfers,
-                    request.trader_account_id.as_ref(),
+                let gas_burnt = NearGas::from_gas(
+                    FT_TRANSFER_CALL_GAS_BURNT.as_gas() + call_gas_burnt.as_gas(),
                 );
 
                 let (input_to_nep141, input_nep141) = convert_to_nep141(
@@ -653,7 +495,7 @@ async fn route(
                     swap_transactions,
                 ]
                 .concat();
-                (transactions, ft_transfer_call_swap_action, gas_paid)
+                (transactions, ft_transfer_call_swap_action, gas_burnt)
             }
             AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => {
                 unreachable!()
@@ -665,7 +507,7 @@ async fn route(
     let estimated_gas_paid =
         estimated_gas_paid(&execution_instructions, Some((&swap_action, swap_gas_paid)));
     Some(Route {
-        dex_id: DexId::Plach,
+        dex_id,
 
         estimated_amount,
         worst_case_amount,
@@ -694,13 +536,19 @@ mod tests {
 
     use near_min_api::types::{Action, FunctionCallAction, Gas, NearGas, NearToken};
 
+    use near_sdk::json_types::Base64VecU8;
+    use pathfinder::plach::{self, SplitRouteApiResponse};
+    use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
+    use xyk_dex_types::{SwapArgs, SwapRoute};
+
     use super::*;
     use crate::shared_utils::{
         create_rhea_withdraw_action, create_storage_deposit_action_for_contract,
         create_unwrap_action, TestNetworkView, WRAP_NEAR,
     };
     use crate::types::Slippage;
-    use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
+
+    const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 
     #[derive(Clone)]
     struct TestPlachQuotes {
@@ -733,12 +581,12 @@ mod tests {
         }
     }
 
-    impl PlachQuotes for TestPlachQuotes {
-        async fn find_path(&self, request: plach::Request) -> Option<SplitRouteApiResponse> {
+    impl TestPlachQuotes {
+        fn find_path(&self, trade: &IntearDexTrade) -> Option<SplitRouteApiResponse> {
             if !self.enabled {
                 return None;
             }
-            let (token_in, token_out) = (&request.token_in, &request.token_out);
+            let (token_in, token_out) = (&trade.asset_in, &trade.asset_out);
             if self.empty_routes {
                 return Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![],
@@ -750,12 +598,9 @@ mod tests {
                     swap_gas: NearGas::from_tgas(34),
                 });
             }
-            let discount = near_min_api::types::U128(match request.fee_discount {
-                0 => 0,
-                _ => 5,
-            });
-            match request.amount {
-                QuoteAmount::ExactIn(amount_in) => Some(SplitRouteApiResponse::ExactIn {
+            let discount = near_min_api::types::U128(0);
+            match trade.amount {
+                Amount::AmountIn(amount_in) => Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![plach::ExactInRoute {
                         split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
                         pools: vec![plach::ExactInPoolStep {
@@ -776,7 +621,7 @@ mod tests {
                     discount,
                     swap_gas: NearGas::from_tgas(34),
                 }),
-                QuoteAmount::ExactOut(_) => Some(SplitRouteApiResponse::ExactOut {
+                Amount::AmountOut(_) => Some(SplitRouteApiResponse::ExactOut {
                     routes: vec![plach::ExactOutRoute {
                         split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
                         pools: vec![plach::ExactOutPoolStep {
@@ -803,10 +648,220 @@ mod tests {
         }
     }
 
+    /// The route of the quote that the Plach hook makes of the test quotes, without a fee discount
+    async fn plach_route(
+        request: SwapRequest,
+        network: &impl NetworkView,
+        quotes: &TestPlachQuotes,
+    ) -> Option<Route> {
+        let trade = trade_of_request(network, &request).await?;
+        let swap_route = |split_fraction, pool_ids| SwapRoute {
+            fraction: split_fraction,
+            pool_ids,
+        };
+        let (swap_routes, estimated_amount, worst_case_amount, swap_gas) =
+            match quotes.find_path(&trade)? {
+                SplitRouteApiResponse::ExactIn {
+                    routes,
+                    amount_out,
+                    swap_gas,
+                    ..
+                } => (
+                    routes
+                        .iter()
+                        .map(|route| {
+                            swap_route(
+                                route.split_fraction,
+                                route.pools.iter().map(|step| step.pool_id).collect(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    amount_out.0,
+                    routes.iter().map(|route| route.min_amount_out.0).sum(),
+                    swap_gas,
+                ),
+                SplitRouteApiResponse::ExactOut {
+                    routes,
+                    amount_in,
+                    max_amount_in,
+                    swap_gas,
+                    ..
+                } => (
+                    routes
+                        .iter()
+                        .map(|route| {
+                            swap_route(
+                                route.split_fraction,
+                                route.pools.iter().map(|step| step.pool_id).collect(),
+                            )
+                        })
+                        .collect(),
+                    amount_in.0,
+                    max_amount_in.0,
+                    swap_gas,
+                ),
+            };
+        if swap_routes.is_empty() {
+            return None;
+        }
+        let quote = HookQuote {
+            dex_id: PLACH_DEX_ID.parse().unwrap(),
+            message: Base64VecU8(
+                borsh::to_vec(&SwapArgs {
+                    routes: swap_routes,
+                    fee_discount: None,
+                })
+                .unwrap(),
+            ),
+            estimated_amount: U128(estimated_amount),
+            worst_case_amount: U128(worst_case_amount),
+            swap_gas,
+            worst_case_swap_gas: swap_gas,
+            discount: None,
+        };
+        route(
+            network,
+            DexId::Hook("Plach".into()),
+            &request,
+            &trade,
+            IntearDexSwap::of_quote(quote),
+        )
+        .await
+    }
+
+    /// A quote of a swap that burns `tgas`, and 10 TGas more at most
+    fn quote(
+        dex_id: &str,
+        estimated_amount: u128,
+        worst_case_amount: u128,
+        tgas: u64,
+    ) -> HookQuote {
+        HookQuote {
+            dex_id: dex_id.parse().unwrap(),
+            message: Base64VecU8(dex_id.as_bytes().to_vec()),
+            estimated_amount: U128(estimated_amount),
+            worst_case_amount: U128(worst_case_amount),
+            swap_gas: NearGas::from_tgas(tgas),
+            worst_case_swap_gas: NearGas::from_tgas(tgas + 10),
+            discount: None,
+        }
+    }
+
+    /// Gas attached to swap on DEXes that burn `worst_case_swap_gas` at most, and withdraw a NEP-141
+    fn attached_gas(worst_case_swap_gas: NearGas) -> Gas {
+        Gas(NearGas::from_gas(
+            ENGINE_GAS.as_gas()
+                + WITHDRAWAL_GAS.as_gas()
+                + worst_case_swap_gas.as_gas()
+                + FT_WITHDRAWAL_RESERVED_GAS.as_gas()
+                + GAS_MARGIN.as_gas(),
+        ))
+    }
+
+    /// The operations of the route's swap, and the gas attached to them
+    async fn swap_operations(amount: Amount, quotes: Vec<HookQuote>) -> (serde_json::Value, Gas) {
+        let request = SwapRequest {
+            token_in: TokenId::Near,
+            token_out: TokenId::Nep141("ft".parse().unwrap()),
+            amount,
+            slippage: Slippage::Fixed {
+                slippage: "0.01".parse().unwrap(),
+            },
+            dexes: None,
+            trader_account_id: None,
+            signing_public_key: None,
+            referrer_id: None,
+            fees: Default::default(),
+        };
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request).await.unwrap();
+        let swap = IntearDexSwap::fallback_queue(&trade, quotes).unwrap();
+        let route = route(&network, DexId::IntearDex, &request, &trade, swap)
+            .await
+            .unwrap();
+        let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
+            route.execution_instructions.last()
+        else {
+            panic!("No swap transaction");
+        };
+        let [Action::FunctionCall(deposit_near)] = actions.as_slice() else {
+            panic!("Swap transaction isn't a single function call");
+        };
+        let args = serde_json::from_slice::<serde_json::Value>(&deposit_near.args).unwrap();
+        (args["operations"]["operations"].clone(), deposit_near.gas)
+    }
+
+    #[tokio::test]
+    async fn exact_in_falls_back_from_the_best_quote_within_slippage_of_it() {
+        let (operations, gas) = swap_operations(
+            Amount::AmountIn(100),
+            vec![
+                quote("slimedragon.near/xyk", 80, 79, 34),
+                quote("slimedragon.near/otc", 82, 82, 27),
+            ],
+        )
+        .await;
+        assert_eq!(
+            operations[0],
+            serde_json::json!({
+                "SwapAdvanced": {
+                    "asset_in": "near",
+                    "asset_out": "nep141:ft",
+                    "amount": { "Amount": { "ExactIn": "100" } },
+                    // 1% under the best quote's 82, so the fallback's 80 still fills it
+                    "constraint": "81",
+                    "options": [
+                        { "dex_id": "slimedragon.near/otc", "message": "c2xpbWVkcmFnb24ubmVhci9vdGM=" },
+                        { "dex_id": "slimedragon.near/xyk", "message": "c2xpbWVkcmFnb24ubmVhci94eWs=" },
+                    ],
+                    "mode": "FallbackQueue",
+                },
+            })
+        );
+        assert_eq!(
+            operations[1]["Withdraw"]["amount"]["Full"]["at_least"],
+            "81"
+        );
+        // Enough to try both
+        assert_eq!(gas, attached_gas(NearGas::from_tgas(44 + 37)));
+    }
+
+    #[tokio::test]
+    async fn exact_out_falls_back_from_the_cheapest_quote_within_slippage_of_it() {
+        let (operations, _) = swap_operations(
+            Amount::AmountOut(80),
+            vec![
+                quote("slimedragon.near/otc", 101, 101, 27),
+                quote("slimedragon.near/xyk", 100, 102, 34),
+            ],
+        )
+        .await;
+        let swap = &operations[0]["SwapAdvanced"];
+        // 1% over the cheapest quote's 100
+        assert_eq!(swap["constraint"], "101");
+        assert_eq!(swap["options"][0]["dex_id"], "slimedragon.near/xyk");
+        assert_eq!(swap["options"][1]["dex_id"], "slimedragon.near/otc");
+    }
+
+    #[tokio::test]
+    async fn one_quote_is_swapped_on_alone() {
+        let (operations, gas) = swap_operations(
+            Amount::AmountIn(100),
+            vec![quote("slimedragon.near/otc", 82, 82, 27)],
+        )
+        .await;
+        assert_eq!(
+            operations[0]["SwapSimple"]["dex_id"],
+            "slimedragon.near/otc"
+        );
+        assert_eq!(operations[0]["SwapSimple"]["constraint"], "82");
+        assert_eq!(gas, attached_gas(NearGas::from_tgas(37)));
+    }
+
     /// Operations are typed with the engine's own types, so this pins the JSON the engine reads
     #[tokio::test]
     async fn operations_json_matches_engine_format() {
-        let route = route(
+        let route = plach_route(
             SwapRequest {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -822,7 +877,6 @@ mod tests {
             },
             &TestNetworkView::default().with_test_prices(),
             &TestPlachQuotes::default(),
-            None,
         )
         .await
         .unwrap();
@@ -865,169 +919,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fee_discount_grows_with_tear_holdings() {
-        assert_eq!(tear_fee_discount(0), None);
-        assert_eq!(tear_fee_discount(10 * ONE_TEAR - 1), None);
-        assert_eq!(tear_fee_discount(10 * ONE_TEAR), Some(100_000));
-        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR - 1), Some(100_000));
-        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR), Some(250_000));
-        assert_eq!(tear_fee_discount(100_000 * ONE_TEAR), Some(750_000));
-        assert_eq!(tear_fee_discount(u128::MAX), Some(750_000));
-    }
-
-    #[tokio::test]
-    async fn no_fee_discount_without_tear() {
-        use near_min_api::types::near_crypto::KeyType;
-
-        let fee_discounter = FeeDiscounter {
-            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
-        };
-        let route = route(
-            SwapRequest {
-                token_in: TokenId::Near,
-                token_out: TokenId::Nep141("ft".parse().unwrap()),
-                amount: Amount::AmountIn(100),
-                slippage: Slippage::Fixed {
-                    slippage: "0.01".parse().unwrap(),
-                },
-                dexes: None,
-                trader_account_id: Some("trader.near".parse().unwrap()),
-                signing_public_key: None,
-                referrer_id: None,
-                fees: Default::default(),
-            },
-            &TestNetworkView::default()
-                .with_test_prices()
-                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 10 * ONE_TEAR - 1),
-            &TestPlachQuotes::default(),
-            Some(&fee_discounter),
-        )
-        .await
-        .unwrap();
-        assert_eq!(route.discount, None);
-    }
-
-    #[tokio::test]
-    async fn fee_discount_counts_staked_tear() {
-        use near_min_api::types::near_crypto::KeyType;
-
-        let fee_discounter = FeeDiscounter {
-            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
-        };
-        let route = route(
-            SwapRequest {
-                token_in: TokenId::Near,
-                token_out: TokenId::Nep141("ft".parse().unwrap()),
-                amount: Amount::AmountIn(100),
-                slippage: Slippage::Fixed {
-                    slippage: "0.01".parse().unwrap(),
-                },
-                dexes: None,
-                trader_account_id: Some("trader.near".parse().unwrap()),
-                signing_public_key: None,
-                referrer_id: None,
-                fees: Default::default(),
-            },
-            &TestNetworkView::default()
-                .with_test_prices()
-                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 400 * ONE_TEAR)
-                .with_ft_lockup_balance(TEAR_STAKING_CONTRACT_ID, "trader.near", 600 * ONE_TEAR),
-            &TestPlachQuotes::default(),
-            Some(&fee_discounter),
-        )
-        .await
-        .unwrap();
-        // The 25% discount of 1,000 TEAR, as `signs_fee_discount` gets from the wallet alone
-        assert_eq!(
-            serde_json::to_value(&route).unwrap()["discount"],
-            serde_json::json!({ "amount_out": "5" })
-        );
-    }
-
-    #[tokio::test]
-    async fn signs_fee_discount() {
-        use base64::Engine;
-        use near_min_api::types::near_crypto::KeyType;
-
-        let fee_discounter = FeeDiscounter {
-            secret_key: SecretKey::from_seed(KeyType::ED25519, "fee discounter"),
-        };
-        let route = route(
-            SwapRequest {
-                token_in: TokenId::Near,
-                token_out: TokenId::Nep141("ft".parse().unwrap()),
-                amount: Amount::AmountIn(100),
-                slippage: Slippage::Fixed {
-                    slippage: "0.01".parse().unwrap(),
-                },
-                dexes: None,
-                trader_account_id: Some("trader.near".parse().unwrap()),
-                signing_public_key: None,
-                referrer_id: None,
-                fees: Default::default(),
-            },
-            &TestNetworkView::default()
-                .with_test_prices()
-                .with_ft_balance(TEAR_TOKEN_ID, "trader.near", 1_000 * ONE_TEAR),
-            &TestPlachQuotes::default(),
-            Some(&fee_discounter),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(&route).unwrap()["discount"],
-            serde_json::json!({ "amount_out": "5" })
-        );
-        let Some(ExecutionInstruction::NearTransaction { actions, .. }) =
-            route.execution_instructions.last()
-        else {
-            panic!("No swap transaction");
-        };
-        let [Action::FunctionCall(deposit_near)] = actions.as_slice() else {
-            panic!("Swap transaction isn't a single function call");
-        };
-        let args = serde_json::from_slice::<serde_json::Value>(&deposit_near.args).unwrap();
-        let message = base64::engine::general_purpose::STANDARD
-            .decode(
-                args["operations"]["operations"][0]["SwapSimple"]["message"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-        let SwapArgs {
-            routes,
-            fee_discount:
-                Some(SignedFeeDiscount {
-                    discount,
-                    signature,
-                }),
-            ..
-        } = borsh::from_slice(&message).unwrap()
-        else {
-            panic!("No fee discount");
-        };
-        assert_eq!(discount.routes, routes);
-        assert_eq!(discount.asset_in, AssetId::Near);
-        assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
-        assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
-        assert_eq!(discount.amount, SwapRequestAmount::ExactIn(U128(100)));
-        assert_eq!(discount.fee_discount, 250_000);
-        assert_eq!(discount.expiration_block_height, 1_001_000);
-        assert!(Signature::from_parts(KeyType::ED25519, &signature)
-            .unwrap()
-            .verify(
-                &Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap()),
-                &fee_discounter.secret_key.public_key(),
-            ));
-    }
-
     #[tokio::test]
     async fn amount_in_near_to_ft() {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1043,13 +940,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1109,7 +1005,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(69)),
+                            gas: Gas(NearGas::from_ggas(58_000)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                         is_fee_transaction: false,
@@ -1118,7 +1014,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(39_592_118_752_924),
+                estimated_gas_paid: NearGas::from_gas(47_592_118_752_924),
             })
         );
     }
@@ -1128,7 +1024,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1144,13 +1040,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1215,7 +1110,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(69)),
+                            gas: Gas(NearGas::from_ggas(58_000)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                         is_fee_transaction: false,
@@ -1224,7 +1119,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(52_789_685_422_745),
+                estimated_gas_paid: NearGas::from_gas(60_789_685_422_745),
             })
         );
     }
@@ -1234,7 +1129,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Nep141OnRhea(WRAP_NEAR.parse().unwrap()),
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1250,13 +1145,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1325,7 +1219,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(69)),
+                            gas: Gas(NearGas::from_ggas(58_000)),
                             deposit: NearToken::from_yoctonear(100),
                         }))],
                         is_fee_transaction: false,
@@ -1334,7 +1228,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(72_791_831_967_652),
+                estimated_gas_paid: NearGas::from_gas(80_791_831_967_652),
             })
         );
     }
@@ -1344,7 +1238,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::TokenOnIntearDex(AssetId::Near),
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1360,13 +1254,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1406,7 +1299,7 @@ mod tests {
                                 "referral_fees": [],
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(54)),
+                            gas: Gas(NearGas::from_ggas(40_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                         is_fee_transaction: false,
@@ -1415,7 +1308,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::TokenOnIntearDex(token_out),
-                estimated_gas_paid: NearGas::from_gas(33_632_442_725_223),
+                estimated_gas_paid: NearGas::from_gas(40_672_442_725_223),
             })
         );
     }
@@ -1425,7 +1318,7 @@ mod tests {
         let token_in = AssetId::Nep141("ft".parse().unwrap());
         let token_out = AssetId::Near;
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Nep141("ft".parse().unwrap()),
                     token_out: TokenId::Near,
@@ -1441,13 +1334,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1503,7 +1395,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(89)),
+                            gas: Gas(NearGas::from_ggas(77_000)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                         is_fee_transaction: false,
@@ -1512,7 +1404,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Near,
-                estimated_gas_paid: NearGas::from_gas(41_451_728_217_523),
+                estimated_gas_paid: NearGas::from_gas(49_021_728_217_523),
             })
         );
     }
@@ -1522,7 +1414,7 @@ mod tests {
         let token_in = AssetId::Nep141("ft".parse().unwrap());
         let token_out = AssetId::Near;
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Nep141OnRhea("ft".parse().unwrap()),
                     token_out: TokenId::Near,
@@ -1538,13 +1430,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1616,7 +1507,7 @@ mod tests {
                                 .unwrap(),
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(89)),
+                            gas: Gas(NearGas::from_ggas(77_000)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                         is_fee_transaction: false,
@@ -1625,7 +1516,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Near,
-                estimated_gas_paid: NearGas::from_gas(75_849_207_780_668),
+                estimated_gas_paid: NearGas::from_gas(83_419_207_780_668),
             })
         );
     }
@@ -1635,7 +1526,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1651,13 +1542,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1722,7 +1612,7 @@ mod tests {
                                 },
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(74)),
+                            gas: Gas(NearGas::from_ggas(64_500)),
                             deposit: NearToken::from_yoctonear(101),
                         }))],
                         is_fee_transaction: false,
@@ -1731,7 +1621,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(41_697_559_994_665),
+                estimated_gas_paid: NearGas::from_gas(51_220_742_557_165),
             })
         );
     }
@@ -1741,7 +1631,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::TokenOnIntearDex(AssetId::Near),
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1757,13 +1647,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1819,7 +1708,7 @@ mod tests {
                                 "referral_fees": [],
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(69)),
+                            gas: Gas(NearGas::from_ggas(58_000)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                         is_fee_transaction: false,
@@ -1828,7 +1717,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(39_591_469_797_487),
+                estimated_gas_paid: NearGas::from_gas(47_591_469_797_487),
             })
         );
     }
@@ -1838,7 +1727,7 @@ mod tests {
         let token_in = AssetId::Near;
         let token_out = AssetId::Nep141("ft".parse().unwrap());
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::TokenOnIntearDex(AssetId::Near),
                     token_out: TokenId::TokenOnIntearDex(AssetId::Nep141("ft".parse().unwrap())),
@@ -1854,13 +1743,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountIn(100),
                 worst_case_amount: Amount::AmountIn(101),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![
                     ExecutionInstruction::NearTransaction {
                         receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
@@ -1900,7 +1788,7 @@ mod tests {
                                 "referral_fees": [],
                             }))
                             .unwrap(),
-                            gas: Gas(NearGas::from_tgas(54)),
+                            gas: Gas(NearGas::from_ggas(40_500)),
                             deposit: NearToken::from_yoctonear(1),
                         }))],
                         is_fee_transaction: false,
@@ -1909,7 +1797,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::TokenOnIntearDex(token_out),
-                estimated_gas_paid: NearGas::from_gas(33_632_492_644_872),
+                estimated_gas_paid: NearGas::from_gas(40_672_492_644_872),
             })
         );
     }
@@ -1917,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn same_near_family_returns_none() {
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141(WRAP_NEAR.parse().unwrap()),
@@ -1933,7 +1821,6 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             None
@@ -1943,7 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn missing_quote_returns_none() {
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1959,7 +1846,6 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::none(),
-                None,
             )
             .await,
             None
@@ -1969,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn empty_routes_returns_none() {
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -1985,7 +1871,6 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::empty_routes(),
-                None,
             )
             .await,
             None
@@ -1995,7 +1880,7 @@ mod tests {
     #[tokio::test]
     async fn no_trader_omits_registration_and_storage() {
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -2011,13 +1896,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![ExecutionInstruction::NearTransaction {
                     receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
                     actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -2047,7 +1931,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(69)),
+                        gas: Gas(NearGas::from_ggas(58_000)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                     is_fee_transaction: false,
@@ -2055,7 +1939,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(36_214_888_788_024),
+                estimated_gas_paid: NearGas::from_gas(44_214_888_788_024),
             })
         );
     }
@@ -2063,7 +1947,7 @@ mod tests {
     #[tokio::test]
     async fn custom_referrer_id_is_passed_in_operations() {
         assert_eq!(
-            route(
+            plach_route(
                 SwapRequest {
                     token_in: TokenId::Near,
                     token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -2079,13 +1963,12 @@ mod tests {
                 },
                 &TestNetworkView::default().with_test_prices(),
                 &TestPlachQuotes::default(),
-                None,
             )
             .await,
             Some(Route {
                 estimated_amount: Amount::AmountOut(80),
                 worst_case_amount: Amount::AmountOut(79),
-                dex_id: DexId::Plach,
+                dex_id: DexId::Hook("Plach".into()),
                 execution_instructions: vec![ExecutionInstruction::NearTransaction {
                     receiver_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
                     actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -2115,7 +1998,7 @@ mod tests {
                             },
                         }))
                         .unwrap(),
-                        gas: Gas(NearGas::from_tgas(69)),
+                        gas: Gas(NearGas::from_ggas(58_000)),
                         deposit: NearToken::from_yoctonear(100),
                     }))],
                     is_fee_transaction: false,
@@ -2123,14 +2006,14 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 discount: None,
                 token_output: TokenId::Nep141("ft".parse().unwrap()),
-                estimated_gas_paid: NearGas::from_gas(36_213_990_234_342),
+                estimated_gas_paid: NearGas::from_gas(44_213_990_234_342),
             })
         );
     }
 
     #[tokio::test]
     async fn referral_fees_are_taken_by_the_engine_and_their_receivers_registered() {
-        let route = route(
+        let route = plach_route(
             SwapRequest {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -2159,7 +2042,6 @@ mod tests {
                 )
                 .with_intear_registered("ref2.near", &AssetId::Near, true),
             &TestPlachQuotes::default(),
-            None,
         )
         .await
         .unwrap();
@@ -2228,7 +2110,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_out_referral_fees_go_on_top_of_the_input() {
-        let route = route(
+        let route = plach_route(
             SwapRequest {
                 token_in: TokenId::Near,
                 token_out: TokenId::Nep141("ft".parse().unwrap()),
@@ -2244,7 +2126,6 @@ mod tests {
             },
             &TestNetworkView::default().with_test_prices(),
             &TestPlachQuotes::default(),
-            None,
         )
         .await
         .unwrap();

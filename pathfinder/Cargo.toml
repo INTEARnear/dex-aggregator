@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
-pool-indexer = { path = "../pool-indexer" }
+pool-indexer = { path = "../pool-indexer", optional = true }
+swap-router-types = { path = "../swap-router-types" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,3 +23,8 @@ intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28f
 xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "ad794a28fb51c4cbac6ef28ea81e6f038f885666" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
+
+[features]
+default = ["indexer"]
+# Indexes the pools of the DEXes, which hooks get them from the aggregator instead
+indexer = ["dep:pool-indexer"]

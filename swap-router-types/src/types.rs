@@ -101,14 +101,14 @@ pub struct SwapRequest {
     /// The public key to use for signing.
     pub signing_public_key: Option<PublicKey>,
     /// The account ID of the referrer. If provided, the route will include referral
-    /// parameter for DEXes that support it (DexId::Rhea, DexId::Plach)
+    /// parameter for tracking.
     pub referrer_id: Option<AccountId>,
     /// Fees the route pays to referrers, as a JSON object of referrer account IDs and
     /// fractions of the input, e.g. `{"ref.near":0.005}` for 0.5%. Intear DEX takes them out
-    /// of Plach swaps' input into the referrers' balances on it, Rhea fast-path makes an
-    /// internal balance transfer, and Rhea slow-path and Rhea DCL routes send them in the
-    /// input token after the swap call. Routes register the referrers to receive them, so
-    /// the first swap on a new token for a referrer can be slower.
+    /// of the input of swaps on it, like Plach's, into the referrers' balances on it, Rhea
+    /// fast-path makes an internal balance transfer, Rhea slow-path and Rhea DCL routes send
+    /// them in the input token after the swap call. Routes register the referrers to receive
+    /// them, so the first swap on a new token for a referrer can be slower.
     #[serde(default)]
     pub fees: QuoteFees,
 }
@@ -250,7 +250,7 @@ mod comma_separated {
     }
 }
 
-fn from_str<'de, D, S>(deserializer: D) -> Result<S, D::Error>
+pub(crate) fn from_str<'de, D, S>(deserializer: D) -> Result<S, D::Error>
 where
     D: serde::Deserializer<'de>,
     S: std::str::FromStr,
@@ -260,7 +260,7 @@ where
     S::from_str(&s).map_err(|_| D::Error::custom("could not parse string"))
 }
 
-fn to_str<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn to_str<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
     T: Display,
@@ -480,15 +480,15 @@ pub enum DexId {
     /// AMM DEX
     ///
     /// Supports both AmountIn and AmountOut
-    Plach,
-    /// A hook loaded at startup from `hooks/<name>.so`, named `hook:<name>`, that adds quotes on
-    /// top of the other DEXes' ones. Any name parses, the aggregator checks that it's loaded.
+    IntearDex,
+    /// A hook loaded at startup from `hooks/<name>.so` that quotes swaps on Intear DEX after the
+    /// other DEXes, like `Plach` (https://dex.intea.rs/). Any name that isn't one of the other
+    /// DEXes parses, and the aggregator checks that it's loaded.
     ///
     /// Supports what the hook supports
     Hook(Arc<str>),
 }
 
-const HOOK_PREFIX: &str = "hook:";
 const RHEA_STR: &str = "Rhea";
 const AIDOLS_STR: &str = "Aidols";
 const WRAP_STR: &str = "Wrap";
@@ -497,7 +497,7 @@ const METAPOOL_STR: &str = "MetaPool";
 const LINEAR_STR: &str = "Linear";
 const XRHEA_STR: &str = "XRhea";
 const RNEAR_STR: &str = "RNear";
-const PLACH_STR: &str = "Plach";
+const INTEAR_DEX_STR: &str = "IntearDex";
 
 impl Display for DexId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -510,8 +510,8 @@ impl Display for DexId {
             DexId::Linear => f.write_str(LINEAR_STR),
             DexId::XRhea => f.write_str(XRHEA_STR),
             DexId::RNear => f.write_str(RNEAR_STR),
-            DexId::Plach => f.write_str(PLACH_STR),
-            DexId::Hook(name) => write!(f, "{HOOK_PREFIX}{name}"),
+            DexId::IntearDex => f.write_str(INTEAR_DEX_STR),
+            DexId::Hook(name) => f.write_str(name),
         }
     }
 }
@@ -539,12 +539,6 @@ impl FromStr for DexId {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(name) = s.strip_prefix(HOOK_PREFIX) {
-            if name.is_empty() {
-                return Err(format!("Invalid dex id: {s}"));
-            }
-            return Ok(DexId::Hook(name.into()));
-        }
         Ok(match s {
             RHEA_STR => DexId::Rhea,
             AIDOLS_STR => DexId::Aidols,
@@ -554,8 +548,9 @@ impl FromStr for DexId {
             LINEAR_STR => DexId::Linear,
             XRHEA_STR => DexId::XRhea,
             RNEAR_STR => DexId::RNear,
-            PLACH_STR => DexId::Plach,
-            _ => return Err(format!("Invalid dex id: {s}")),
+            INTEAR_DEX_STR => DexId::IntearDex,
+            "" => return Err("Empty dex id".to_string()),
+            name => DexId::Hook(name.into()),
         })
     }
 }

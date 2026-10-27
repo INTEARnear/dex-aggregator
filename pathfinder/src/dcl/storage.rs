@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, Balance};
-use pool_indexer::{AccountState, Watch};
+use swap_router_types::indexed::{AccountState, Watch};
 
 use super::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT};
 use super::pool::PoolTax;
