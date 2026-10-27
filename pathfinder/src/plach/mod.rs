@@ -4,7 +4,7 @@ use self::storage::StoredPool;
 pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
-use near_min_api::types::{Balance, BlockHeight, NearGas, U128};
+use near_min_api::types::{Balance, BlockHeight, U128};
 use near_min_api::utils::dec_format;
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 pub use intear_dex_types::AssetId;
 use near_sdk::Timestamp;
-use swap_router_types::indexed::AccountState;
+use swap_router_types::{indexed::AccountState, types::Gas};
 use xyk_dex_types::math::{
     exact_in_amount_out, exact_out_amount_in, fee_converted_to_quote_asset, mul_div,
 };
@@ -42,7 +42,7 @@ pub enum SplitRouteApiResponse {
         amount_out: U128,
         /// Added to `amount_out` by the fee discount, 0 without one
         discount: U128,
-        swap_gas: NearGas,
+        swap_gas: Gas,
     },
     ExactOut {
         routes: Vec<ExactOutRoute>,
@@ -53,7 +53,7 @@ pub enum SplitRouteApiResponse {
         amount_out: U128,
         /// Taken off `amount_in` by the fee discount, 0 without one
         discount: U128,
-        swap_gas: NearGas,
+        swap_gas: Gas,
     },
 }
 
@@ -452,12 +452,13 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-const SWAP_GAS: NearGas = NearGas::from_tgas(17);
-const HOP_GAS: NearGas = NearGas::from_ggas(1_700);
-const REPEATED_HOP_GAS: NearGas = NearGas::from_ggas(900);
-const FEE_DISCOUNT_GAS: NearGas = NearGas::from_ggas(1_800);
+const SWAP_GAS: Gas = Gas::from_ggas(17_000, 17_000);
+const HOP_GAS: Gas = Gas::from_ggas(1_700, 1_700);
+const REPEATED_HOP_GAS: Gas = Gas::from_ggas(900, 900);
+const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_800, 1_800);
+const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
 
-fn swap_gas(split_route: &SplitRoute) -> NearGas {
+fn swap_gas(split_route: &SplitRoute) -> Gas {
     let hops = split_route
         .parts
         .iter()
@@ -466,9 +467,7 @@ fn swap_gas(split_route: &SplitRoute) -> NearGas {
         .collect::<Vec<_>>();
     let pools = hops.iter().collect::<HashSet<_>>().len() as u64;
     let repeated_hops = hops.len() as u64 - pools;
-    NearGas::from_gas(
-        SWAP_GAS.as_gas() + HOP_GAS.as_gas() * pools + REPEATED_HOP_GAS.as_gas() * repeated_hops,
-    )
+    SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops + GAS_MARGIN
 }
 
 fn to_api_response(
@@ -662,7 +661,7 @@ pub fn find_path_in(
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            HOP_GAS,
+            HOP_GAS.estimated_burn,
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,
@@ -694,7 +693,7 @@ pub fn find_path_in(
         };
         *discount =
             U128(saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?);
-        *swap_gas = NearGas::from_gas(swap_gas.as_gas() + FEE_DISCOUNT_GAS.as_gas());
+        *swap_gas = *swap_gas + FEE_DISCOUNT_GAS;
     }
     match &response {
         SplitRouteApiResponse::ExactIn { amount_out, .. } => info!(
@@ -868,10 +867,10 @@ mod tests {
             },
         )
         .unwrap();
-        // 17 to load the DEX and 1.7 for the pool
+        // 17 to load the DEX, 1.7 for the pool, and 3 more to attach
         assert!(matches!(
             response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == NearGas::from_ggas(18_700)
+            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(18_700, 21_700)
         ));
     }
 }

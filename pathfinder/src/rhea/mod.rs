@@ -7,7 +7,7 @@ pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas};
+use near_min_api::types::{AccountId, Balance, BlockHeight};
 use near_min_api::utils::dec_format;
 use smallvec::SmallVec;
 use std::panic::AssertUnwindSafe;
@@ -19,7 +19,7 @@ use tokio::time::Instant;
 #[cfg(feature = "indexer")]
 use pool_indexer::PoolIndexer;
 use serde::Serialize;
-use swap_router_types::indexed::AccountState;
+use swap_router_types::{indexed::AccountState, types::Gas};
 use tracing::{info, warn};
 
 use crate::search::{
@@ -40,7 +40,7 @@ pub struct SplitRouteApiResponse {
     #[serde(with = "dec_format")]
     pub amount_out: Balance,
     /// What the route's pools burn in Rhea's call that swaps
-    pub swap_gas: NearGas,
+    pub swap_gas: Gas,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -502,28 +502,37 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-const HOP_GAS: NearGas = NearGas::from_ggas(2_600);
+const HOP_GAS: Gas = Gas::from_ggas(2_600, 2_600);
+const STABLE_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_000, 1_000);
+const RATED_POOL_GAS: Gas = Gas::from_ggas(200, 200);
+const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_600, 1_600);
+const DEGEN_POOL_GAS: Gas = Gas::from_ggas(3_500, 3_500);
+const DEGEN_POOL_TOKEN_GAS: Gas = Gas::from_ggas(250, 250);
 
 impl Pool {
-    fn hop_gas(&self) -> NearGas {
-        match self.detail {
+    fn hop_gas(&self) -> Gas {
+        match &self.detail {
             PoolDetailInfo::SimplePoolInfo(_) => HOP_GAS,
-            PoolDetailInfo::StablePoolInfo(_) => NearGas::from_ggas(2_900),
-            PoolDetailInfo::RatedPoolInfo(_) => NearGas::from_ggas(6_200),
-            PoolDetailInfo::DegenPoolInfo(_) => NearGas::from_ggas(4_100),
+            PoolDetailInfo::StablePoolInfo(info) => {
+                STABLE_POOL_TOKEN_GAS * info.c_amounts.len() as u64
+            }
+            PoolDetailInfo::RatedPoolInfo(info) => {
+                RATED_POOL_GAS + RATED_POOL_TOKEN_GAS * info.c_amounts.len() as u64
+            }
+            PoolDetailInfo::DegenPoolInfo(info) => {
+                DEGEN_POOL_GAS + DEGEN_POOL_TOKEN_GAS * info.c_amounts.len() as u64
+            }
         }
     }
 }
 
-fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> NearGas {
-    NearGas::from_gas(
-        split_route
-            .parts
-            .iter()
-            .flat_map(|part| &part.route.hops)
-            .map(|hop| graph.pools()[hop.pool].hop_gas().as_gas())
-            .sum(),
-    )
+fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> Gas {
+    split_route
+        .parts
+        .iter()
+        .flat_map(|part| &part.route.hops)
+        .map(|hop| graph.pools()[hop.pool].hop_gas())
+        .sum()
 }
 
 fn exact_in_response(
@@ -622,7 +631,7 @@ pub fn find_path_in(
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            HOP_GAS,
+            HOP_GAS.estimated_burn,
             &request.near_price_raw,
             &request.token_out_price_raw,
         )?,

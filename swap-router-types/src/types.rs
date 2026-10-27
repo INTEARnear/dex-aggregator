@@ -11,6 +11,59 @@ use serde::{Deserialize, Serialize};
 
 use intear_dex_types::{AssetId, FeeFraction, FULL_FEE_FRACTION};
 
+/// What a call, or a part of it, is expected to burn, and the gas it needs attached to not fail
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct Gas {
+    pub estimated_burn: NearGas,
+    pub needs_attached: NearGas,
+}
+
+impl Gas {
+    pub const fn from_ggas(estimated_burn: u64, needs_attached: u64) -> Self {
+        Self {
+            estimated_burn: NearGas::from_ggas(estimated_burn),
+            needs_attached: NearGas::from_ggas(needs_attached),
+        }
+    }
+
+    /// For a function call action
+    pub fn attached(self) -> near_min_api::types::Gas {
+        near_min_api::types::Gas(self.needs_attached)
+    }
+}
+
+impl std::ops::Add for Gas {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            estimated_burn: NearGas::from_gas(
+                self.estimated_burn.as_gas() + other.estimated_burn.as_gas(),
+            ),
+            needs_attached: NearGas::from_gas(
+                self.needs_attached.as_gas() + other.needs_attached.as_gas(),
+            ),
+        }
+    }
+}
+
+impl std::ops::Mul<u64> for Gas {
+    type Output = Self;
+
+    fn mul(self, times: u64) -> Self {
+        Self {
+            estimated_burn: NearGas::from_gas(self.estimated_burn.as_gas() * times),
+            needs_attached: NearGas::from_gas(self.needs_attached.as_gas() * times),
+        }
+    }
+}
+
+impl std::iter::Sum for Gas {
+    fn sum<I: Iterator<Item = Self>>(gas: I) -> Self {
+        gas.fold(Gas::from_ggas(0, 0), |total, gas| total + gas)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Amount {

@@ -1,7 +1,7 @@
 use intear_dex_types::AssetId;
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
-    AccountId, NearGas,
+    AccountId,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
 use otc_dex_types::{
@@ -9,10 +9,12 @@ use otc_dex_types::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{hook::IntearDexTrade, types::Amount};
+use crate::{
+    hook::IntearDexTrade,
+    types::{Amount, Gas},
+};
 
-pub const OTC_SWAP_GAS: NearGas = NearGas::from_ggas(23_500);
-pub const OTC_WORST_CASE_SWAP_GAS: NearGas = NearGas::from_tgas(45);
+pub const OTC_SWAP_GAS: Gas = Gas::from_ggas(22_000, 50_000);
 
 /// What a market maker's intent takes the other side of: the trader sends `asset_in` and gets
 /// `asset_out`

@@ -2,13 +2,13 @@ use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
 use intear_dex_types::AssetId;
-use near_min_api::types::{AccountId, BlockHeight, NearGas};
+use near_min_api::types::{AccountId, BlockHeight};
 use near_sdk::json_types::{Base64VecU8, U128};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
-use crate::types::{Amount, Quote, SwapRequest};
+use crate::types::{Amount, Gas, Quote, SwapRequest};
 
 pub const HOOK_ABI_VERSION: u32 = 5;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
@@ -62,10 +62,8 @@ pub struct HookQuote {
     pub estimated_amount: U128,
     /// The least the DEX gives, or the most it takes, which the swap is constrained to
     pub worst_case_amount: U128,
-    /// What the DEX is expected to burn on Intear DEX for the swap
-    pub swap_gas: NearGas,
-    /// The most the DEX can burn for the swap, which the engine is attached
-    pub worst_case_swap_gas: NearGas,
+    /// Of the DEX's swap on Intear DEX
+    pub gas: Gas,
     /// What a discount that the message carries saves, already in the estimated amount
     pub discount: Option<U128>,
 }
@@ -406,8 +404,7 @@ mod export_tests {
                 ]),
                 estimated_amount: U128(input.block_height.into()),
                 worst_case_amount: U128(1),
-                swap_gas: NearGas::from_tgas(20),
-                worst_case_swap_gas: NearGas::from_tgas(25),
+                gas: Gas::from_ggas(20_000, 25_000),
                 discount: None,
             }])
         }

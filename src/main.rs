@@ -413,7 +413,9 @@ async fn finish_route(request: &SwapRequest, mut route: Route) -> Option<Route> 
                 return None;
             };
             route.estimated_gas_paid = NearGas::from_gas(
-                route.estimated_gas_paid.as_gas() + estimated_gas_paid(&conversion, None).as_gas(),
+                route.estimated_gas_paid.as_gas()
+                    + estimated_gas_paid(&conversion, None, request.trader_account_id.as_ref())
+                        .as_gas(),
             );
             route.execution_instructions.extend(conversion);
             route.token_output = request.token_out.clone();

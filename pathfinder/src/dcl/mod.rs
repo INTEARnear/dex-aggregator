@@ -6,7 +6,7 @@ pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
+use near_min_api::types::{AccountId, Balance, BlockHeight, U128};
 use near_min_api::utils::dec_format;
 use ruint::aliases::U256;
 use std::collections::HashSet;
@@ -18,7 +18,7 @@ use tokio::time::Instant;
 #[cfg(feature = "indexer")]
 use pool_indexer::PoolIndexer;
 use serde::{Deserialize, Serialize};
-use swap_router_types::indexed::AccountState;
+use swap_router_types::{indexed::AccountState, types::Gas};
 use tracing::{error, info, warn};
 
 use self::math::{SwapResult, as_u128, mul_div_floor};
@@ -53,7 +53,7 @@ pub struct ExactInRoute {
     pub min_amount_out: U128,
     pub amount_out: U128,
     /// What `ft_on_transfer` burns for the route
-    pub swap_gas: NearGas,
+    pub swap_gas: Gas,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -64,7 +64,7 @@ pub struct ExactOutRoute {
     pub max_amount_in: U128,
     pub amount_out: U128,
     /// What `ft_on_transfer` burns for the route
-    pub swap_gas: NearGas,
+    pub swap_gas: Gas,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -317,13 +317,14 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     )?)
 }
 
-const SWAP_GAS: NearGas = NearGas::from_tgas(7);
-const RANGE_GAS: NearGas = NearGas::from_tgas(3);
-const CROSSING_GAS: NearGas = NearGas::from_ggas(500);
-const ORDER_GAS: NearGas = NearGas::from_tgas(4);
-const BITMAP_WORD_GAS: NearGas = NearGas::from_ggas(50);
+const SWAP_GAS: Gas = Gas::from_ggas(7_000, 7_000);
+const RANGE_GAS: Gas = Gas::from_ggas(3_000, 3_000);
+const CROSSING_GAS: Gas = Gas::from_ggas(500, 500);
+const ORDER_GAS: Gas = Gas::from_ggas(4_000, 4_000);
+const BITMAP_WORD_GAS: Gas = Gas::from_ggas(50, 50);
+const GAS_MARGIN: Gas = Gas::from_ggas(0, 6_000);
 
-fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> NearGas {
+fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> Gas {
     let work = route
         .hops
         .iter()
@@ -334,13 +335,12 @@ fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> NearGas {
             orders: total.orders + work.orders,
             words: total.words + work.words,
         });
-    NearGas::from_gas(
-        SWAP_GAS.as_gas()
-            + RANGE_GAS.as_gas() * work.ranges
-            + CROSSING_GAS.as_gas() * work.crossings
-            + ORDER_GAS.as_gas() * work.orders
-            + BITMAP_WORD_GAS.as_gas() * work.words,
-    )
+    SWAP_GAS
+        + RANGE_GAS * work.ranges
+        + CROSSING_GAS * work.crossings
+        + ORDER_GAS * work.orders
+        + BITMAP_WORD_GAS * work.words
+        + GAS_MARGIN
 }
 
 fn to_api_response(
@@ -446,7 +446,7 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            RANGE_GAS,
+            RANGE_GAS.estimated_burn,
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,

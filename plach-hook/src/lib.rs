@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use bigdecimal::Zero;
 use intear_dex_types::{AssetId, SwapRequestAmount};
-use near_min_api::types::{AccountId, BlockHeight, NearGas};
+use near_min_api::types::{AccountId, BlockHeight};
 use near_sdk::json_types::{Base64VecU8, U128};
 use pathfinder::{
     MaxHops, QuoteAmount,
@@ -26,7 +26,6 @@ use crate::{
 
 const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
-const SWAP_GAS_MARGIN: NearGas = NearGas::from_tgas(3);
 
 struct Plach {
     fee_discounter: FeeDiscounter,
@@ -202,8 +201,7 @@ impl Plach {
             ),
             estimated_amount: U128(estimated_amount),
             worst_case_amount: U128(worst_case_amount),
-            swap_gas,
-            worst_case_swap_gas: NearGas::from_gas(swap_gas.as_gas() + SWAP_GAS_MARGIN.as_gas()),
+            gas: swap_gas,
             discount: fee_discount.map(|_| U128(discount)),
         })
     }
@@ -211,11 +209,9 @@ impl Plach {
 
 #[cfg(test)]
 mod tests {
-    use near_min_api::types::{
-        NearGas,
-        near_crypto::{KeyType, SecretKey, Signature},
-    };
+    use near_min_api::types::near_crypto::{KeyType, SecretKey, Signature};
     use sha2::{Digest, Sha256};
+    use swap_router_types::types::Gas;
     use tokio::sync::mpsc::UnboundedReceiver;
     use xyk_dex_types::{FULL_SPLIT_FRACTION, SignedFeeDiscount};
 
@@ -281,7 +277,7 @@ mod tests {
             amount_in: near_min_api::types::U128(amount_in),
             amount_out: near_min_api::types::U128(80 + discount),
             discount: near_min_api::types::U128(discount),
-            swap_gas: NearGas::from_tgas(25),
+            swap_gas: Gas::from_ggas(25_000, 28_000),
         })
     }
 
@@ -292,8 +288,7 @@ mod tests {
         assert_eq!(quote.dex_id, PLACH_DEX_ID.parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(80));
         assert_eq!(quote.worst_case_amount, U128(79));
-        assert_eq!(quote.swap_gas, NearGas::from_tgas(25));
-        assert_eq!(quote.worst_case_swap_gas, NearGas::from_tgas(28));
+        assert_eq!(quote.gas, Gas::from_ggas(25_000, 28_000));
         assert_eq!(quote.discount, None);
         let swap_args: SwapArgs = borsh::from_slice(&quote.message.0).unwrap();
         assert_eq!(swap_args.routes[0].pool_ids, vec![1]);
