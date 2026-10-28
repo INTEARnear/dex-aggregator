@@ -2,7 +2,6 @@ pub mod inteardex;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
     ffi::{c_char, CStr, CString},
     fs::{File, OpenOptions},
     io::{ErrorKind, Write},
@@ -14,7 +13,6 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Uri};
-use bigdecimal::BigDecimal;
 use intear_dex_types::AssetId;
 use libloading::Library;
 use near_min_api::types::{AccountId, BlockHeight};
@@ -27,7 +25,7 @@ use swap_router_types::{
     indexed::{AccountState, Watch},
 };
 use tokio::sync::Semaphore;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     route::RouteBlueprint,
@@ -197,12 +195,13 @@ pub fn indexed() -> Vec<IndexedHook> {
         .collect()
 }
 
-/// Gives the hooks the prices that changed, after every refresh of the prices
+/// Gives each hook the prices that changed since it last took them, after every refresh of the
+/// prices. A hook that doesn't take them gets them again after the next refresh.
 pub async fn follow_prices(network: impl NetworkView) {
-    let mut sent = Prices::new();
+    let mut taken_by_hook = vec![Prices::new(); loaded().len()];
     loop {
         if let Ok(token_infos) = network.token_infos() {
-            let changed = token_infos
+            let prices = token_infos
                 .iter()
                 .map(|(token_id, info)| {
                     let asset_id = match token_id {
@@ -211,27 +210,34 @@ pub async fn follow_prices(network: impl NetworkView) {
                     };
                     (asset_id, info.price_usd_raw.clone())
                 })
-                .filter(|(asset_id, price)| sent.get(asset_id) != Some(price))
-                .collect::<HashMap<AssetId, BigDecimal>>();
-            if !changed.is_empty() {
-                let prices =
+                .collect::<Prices>();
+            for (hook, taken) in loaded().iter().zip(&mut taken_by_hook) {
+                let changed = prices
+                    .iter()
+                    .filter(|(asset_id, price)| taken.get(asset_id) != Some(price))
+                    .map(|(asset_id, price)| (asset_id.clone(), price.clone()))
+                    .collect::<Prices>();
+                if changed.is_empty() {
+                    continue;
+                }
+                let changed_json =
                     CString::new(serde_json::to_string(&PricesJson::from(&changed)).unwrap())
                         .expect("JSON has no NUL bytes");
-                let prices = Arc::new(prices);
-                for hook in loaded() {
-                    let plugin = hook.plugin.clone();
-                    let prices = prices.clone();
-                    tokio::task::spawn_blocking(move || {
-                        // SAFETY: the hook gets a NUL-terminated CString that outlives the call
-                        let output = unsafe { (plugin.on_prices)(prices.as_ptr()) };
-                        if let Err(err) = answer::<()>(&plugin, "on_prices", output) {
-                            panic!("{} didn't take prices: {err}", plugin.name);
-                        }
-                    })
-                    .await
-                    .expect("Hooks take prices");
+                let plugin = hook.plugin.clone();
+                let answer = tokio::task::spawn_blocking(move || {
+                    // SAFETY: the hook gets a NUL-terminated CString that outlives the call
+                    let output = unsafe { (plugin.on_prices)(changed_json.as_ptr()) };
+                    answer::<()>(&plugin, "on_prices", output)
+                })
+                .await
+                .expect("Hooks take prices");
+                match answer {
+                    Ok(()) => taken.extend(changed),
+                    Err(err) => warn!(
+                        "{} didn't take prices, retrying after the next refresh: {err}",
+                        hook.plugin.name
+                    ),
                 }
-                sent.extend(changed);
             }
         }
         tokio::time::sleep(TOKEN_INFOS_REFRESH_INTERVAL).await;

@@ -29,7 +29,7 @@ use crate::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
         RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
-    types::{BalanceChange, OutcomeRequest, OutcomeWaitUntil, SwapOutcome, TokenId},
+    types::{BalanceChange, IntearAssetId, OutcomeRequest, OutcomeWaitUntil, SwapOutcome, TokenId},
 };
 
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -252,7 +252,7 @@ impl ChainView for Mainnet {
                     "asset_balance_of",
                     serde_json::json!({
                         "of": { "Account": account_id },
-                        "asset_id": asset_id,
+                        "asset_id": AssetId::from(asset_id),
                     }),
                     at_block(),
                 )
@@ -481,30 +481,28 @@ fn locations(token_id: &TokenId) -> Vec<TokenId> {
             TokenId::Near,
             TokenId::Nep141(wrap_near.clone()),
             TokenId::Nep141OnRhea(wrap_near.clone()),
-            TokenId::TokenOnIntearDex(AssetId::Near),
-            TokenId::TokenOnIntearDex(AssetId::Nep141(wrap_near)),
+            TokenId::TokenOnIntearDex(IntearAssetId::Near),
+            TokenId::TokenOnIntearDex(IntearAssetId::Nep141(wrap_near)),
         ];
     }
     match base_token(token_id) {
-        Some(BaseTokenId::Nep141(contract_id)) => vec![
+        BaseTokenId::Nep141(contract_id) => vec![
             TokenId::Nep141(contract_id.clone()),
             TokenId::Nep141OnRhea(contract_id.clone()),
-            TokenId::TokenOnIntearDex(AssetId::Nep141(contract_id)),
+            TokenId::TokenOnIntearDex(IntearAssetId::Nep141(contract_id)),
         ],
-        Some(BaseTokenId::Near) => unreachable!("NEAR is handled above"),
-        // Only held on Intear DEX
-        None => vec![token_id.clone()],
+        BaseTokenId::Near => unreachable!("NEAR is handled above"),
     }
 }
 
 /// Where the fee transactions of a route pay from: the wallet NEP-141 of the input token, wNEAR
 /// for NEAR
-fn fee_location(token_in: &TokenId) -> Option<TokenId> {
+fn fee_location(token_in: &TokenId) -> TokenId {
     if is_near(token_in) {
-        return Some(TokenId::Nep141(WRAP_NEAR.parse().unwrap()));
+        return TokenId::Nep141(WRAP_NEAR.parse().unwrap());
     }
-    match base_token(token_in)? {
-        BaseTokenId::Nep141(contract_id) => Some(TokenId::Nep141(contract_id)),
+    match base_token(token_in) {
+        BaseTokenId::Nep141(contract_id) => TokenId::Nep141(contract_id),
         BaseTokenId::Near => unreachable!("NEAR is handled above"),
     }
 }
@@ -624,8 +622,22 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
             .filter(|swap| &swap.trader == trader)
             .and_then(|swap| {
                 Some(LoggedSwap {
-                    token_in: TokenId::TokenOnIntearDex(swap.request.asset_in.parse().ok()?),
-                    token_out: TokenId::TokenOnIntearDex(swap.request.asset_out.parse().ok()?),
+                    token_in: TokenId::TokenOnIntearDex(
+                        swap.request
+                            .asset_in
+                            .parse::<AssetId>()
+                            .ok()?
+                            .try_into()
+                            .ok()?,
+                    ),
+                    token_out: TokenId::TokenOnIntearDex(
+                        swap.request
+                            .asset_out
+                            .parse::<AssetId>()
+                            .ok()?
+                            .try_into()
+                            .ok()?,
+                    ),
                     amount_in: swap
                         .referral_fees_paid
                         .iter()
@@ -965,9 +977,7 @@ async fn outcome_of(
 
     // Whatever of a token ended up elsewhere is moved to where the trader asked for it, but for
     // what the fee transactions pay out of the wallet after a swap that went through
-    let fee_location = charge_fee
-        .then(|| fee_location(&request.token_in))
-        .flatten();
+    let fee_location = charge_fee.then(|| fee_location(&request.token_in));
     let targets = if same_token {
         vec![(&output_locations, &request.token_out)]
     } else {

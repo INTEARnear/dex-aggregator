@@ -52,7 +52,8 @@ impl FeeDiscounter {
         Ok(Self { secret_key })
     }
 
-    /// Signs sha256(borsh(`discount`)), which the DEX verifies
+    /// Signs sha256(borsh([`FeeDiscountSignaturePayload`])) of `discount` for Plach on mainnet
+    /// Intear DEX, which the DEX verifies
     pub fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
         let hash =
             Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap());

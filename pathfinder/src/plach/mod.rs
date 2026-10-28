@@ -456,7 +456,6 @@ const SWAP_GAS: Gas = Gas::from_ggas(17_000, 17_000);
 const HOP_GAS: Gas = Gas::from_ggas(1_700, 1_700);
 const REPEATED_HOP_GAS: Gas = Gas::from_ggas(900, 900);
 const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_800, 1_800);
-const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
 
 fn swap_gas(split_route: &SplitRoute) -> Gas {
     let hops = split_route
@@ -467,7 +466,7 @@ fn swap_gas(split_route: &SplitRoute) -> Gas {
         .collect::<Vec<_>>();
     let pools = hops.iter().collect::<HashSet<_>>().len() as u64;
     let repeated_hops = hops.len() as u64 - pools;
-    SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops + GAS_MARGIN
+    SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops
 }
 
 fn to_api_response(
@@ -867,10 +866,10 @@ mod tests {
             },
         )
         .unwrap();
-        // 17 to load the DEX, 1.7 for the pool, and 3 more to attach
+        // 17 to load the DEX and 1.7 for the pool, the engine call attaches the margin
         assert!(matches!(
             response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(18_700, 21_700)
+            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(18_700, 18_700)
         ));
     }
 }

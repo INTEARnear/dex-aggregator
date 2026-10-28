@@ -68,12 +68,12 @@ async fn route(
     let slippage = get_slippage(
         network,
         request.slippage,
-        &base_token(&request.token_in).unwrap(),
-        &base_token(&request.token_out).unwrap(),
+        &base_token(&request.token_in),
+        &base_token(&request.token_out),
     );
 
-    let (_, token_in) = convert_to_nep141(&request.token_in, None, 0)?;
-    let (_, token_out) = convert_to_nep141(&request.token_out, None, 0)?;
+    let (_, token_in) = convert_to_nep141(&request.token_in, None, 0);
+    let (_, token_out) = convert_to_nep141(&request.token_out, None, 0);
 
     if token_in == token_out {
         return None;
@@ -101,7 +101,7 @@ async fn route(
             max_hops: MaxHops::Four,
             slippage,
             near_price_raw: price_raw(network, &BaseTokenId::Near)?,
-            token_out_price_raw: price_raw(network, &base_token(&request.token_out).unwrap())?,
+            token_out_price_raw: price_raw(network, &base_token(&request.token_out))?,
         })
         .await?;
 
@@ -212,7 +212,7 @@ async fn route(
         exact_amount_in,
         &referrer_fees,
         &swap_referrer_id,
-    )?;
+    );
 
     Some(RouteBlueprint {
         dex_id: DexId::Rhea,
@@ -240,11 +240,9 @@ mod tests {
     use near_min_api::types::NearToken;
 
     use super::*;
-    use crate::calls::IntearAsset;
     use crate::route::resolve;
     use crate::shared_utils::{TestNetworkView, WRAP_NEAR};
-    use crate::types::{Gas, Slippage};
-    use intear_dex_types::AssetId;
+    use crate::types::{Gas, IntearAssetId, Slippage};
     use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
@@ -516,13 +514,17 @@ mod tests {
     #[tokio::test]
     async fn amount_in_intear_near_to_ft() {
         assert_eq!(
-            test_route(request(TokenId::TokenOnIntearDex(AssetId::Near), ft())).await,
+            test_route(request(
+                TokenId::TokenOnIntearDex(IntearAssetId::Near),
+                ft()
+            ))
+            .await,
             Some(rhea_route(
                 vec![
                     trader_storage("ft"),
                     trader_storage(WRAP_NEAR),
                     RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                        asset: IntearAsset::Near,
+                        asset: IntearAssetId::Near,
                         amount: 100,
                         trader_account_id: Some(trader()),
                     }),

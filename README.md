@@ -12,7 +12,7 @@ It's separated into 5 crates:
 
 - `swap-router`: the main aggregator crate, hosts the API and builds transactions. Example URL: https://router.intear.tech/route?token_in=rhea-nep141:wrap.near&token_out=juij.launch.intear.near&amount_in=1000000000000000000000000&slippage_type=Fixed&slippage=0.01&dexes=Rhea%2CWrap%2CRheaDcl%2CPlach&trader_account_id=intear.near&signing_public_key=ed25519%3A4WZAP6JoruNHR2W4mi9fM219viZKYskqLRDYkwBHCUY8&referrer_id=intear.near
 - `pathfinder`: library that finds the best route within the pools of Rhea, Intear Plach or Rhea DCL. Rhea DCL swap math in `pathfinder::dcl` is ported from iZiSwap (GPL-2.0-or-later). `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block, keeps Rhea's and Rhea DCL's pool snapshots up to date and gives hooks the storage they watch, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread. Without its `indexer` feature, it's only the search.
-- `pool-indexer`: keeps a copy of the contract storage that pools are built from=
+- `pool-indexer`: keeps a copy of the contract storage that pools are built from.
 - `swap-router-types`: the API's types, the app fee split, the indexed storage, and filling OTC DEX intents, shared by `swap-router` and its hooks. With the `hook` feature, `Hook` and `export_hook!` build a hook library without writing its C ABI.
 - `plach-hook`: Plach as a hook, built with `cargo build --release -p plach-hook` and installed as `hooks/Plach.so` from `target/release/libplach.so`. It signs TEAR fee discounts with `FEE_DISCOUNTER_ACCOUNT_ID` and `FEE_DISCOUNTER_PRIVATE_KEY`.
 
@@ -35,11 +35,7 @@ Tokens can be passed as input parameters in this format:
 - `nep141:wrap.near`
 - `wrap.near` (if does not equal to `near`, it's an alias to `nep141:<string>`)
 - `rhea-nep141:wrap.near`
-- `intear-dex:<asset id>`, where the asset id is the one Intear DEX itself uses: `intear-dex:near`, `intear-dex:nep141:wrap.near`, `intear-dex:nep245:token.near:token-id`, `intear-dex:nep171:token.near:token-id`
-
-Upcoming variants (if/when adopted, just to show the vision):
-- `nep245:token.near:token-id`
-- `nep171:token.near:token-id`
+- `intear-dex:<asset id>`, where the asset id is the one Intear DEX itself uses: `intear-dex:near`, `intear-dex:nep141:wrap.near`
 
 Certain steps can be omitted to optimize transaction count & speed. For example, [Bettear Bot](https://t.me/bettearbot) stores all user tokens in `rhea-nep141:` inner balances, so swaps could be just a single `swap` transaction and 1 receipt instead of `ft_transfer_call` the input token + `ft_on_transfer` on rhea + `ft_transfer` the output token.
 

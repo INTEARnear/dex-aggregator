@@ -1,4 +1,3 @@
-use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
 use intear_dex_types::{AssetId, ReferralFees};
 use near_min_api::types::{AccountId, NearToken};
 use near_sdk::json_types::U128;
@@ -6,15 +5,15 @@ use swap_router_types::hook::{HookQuote, IntearDexTrade};
 
 use crate::{
     calls::{
-        CallBlueprint, IntearAsset, IntearDexOperations, IntearDexSwapOperation,
-        IntearDexSwapOption, IntearDexWithdrawAmount, IntearDexWithdrawal,
+        CallBlueprint, IntearDexOperations, IntearDexSwapOperation, IntearDexSwapOption,
+        IntearDexWithdrawAmount, IntearDexWithdrawal,
     },
     route::{RouteBlueprint, RouteStep},
     shared_utils::{
         base_token, convert_to_native, convert_to_nep141, deposit_storage_if_needed, get_slippage,
         is_near, payable_referral_fees, register_input_in_wallet, NetworkView, DEFAULT_REFERRER_ID,
     },
-    types::TokenId,
+    types::{IntearAssetId, TokenId},
     Amount, DexId, SwapRequest,
 };
 
@@ -37,8 +36,8 @@ pub fn trade_of_request(
     let slippage = get_slippage(
         network,
         request.slippage.clone(),
-        &base_token(&request.token_in)?,
-        &base_token(&request.token_out)?,
+        &base_token(&request.token_in),
+        &base_token(&request.token_out),
     );
     // The engine takes them out of the input before the DEX gets it
     let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
@@ -61,12 +60,12 @@ pub fn trade_of_request(
 /// as the NEP-141 that the route converts it to
 fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
     match token_id {
-        TokenId::TokenOnIntearDex(asset_id) => Some(asset_id.clone()),
+        TokenId::TokenOnIntearDex(asset_id) => Some(asset_id.into()),
         token_id if is_near(token_id) => {
             convert_to_native(token_id, None, NearToken::from_yoctonear(amount_hint))?;
             Some(AssetId::Near)
         }
-        token_id => convert_to_nep141(token_id, None, 0).map(|(_, nep141)| AssetId::Nep141(nep141)),
+        token_id => Some(AssetId::Nep141(convert_to_nep141(token_id, None, 0).1)),
     }
 }
 
@@ -75,7 +74,7 @@ fn fees_total(fees: Vec<(AccountId, U128)>) -> u128 {
 }
 
 /// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, or on the first of several that
-/// fills it within the trade's slippage
+/// fills it
 pub struct IntearDexSwap {
     /// Best first
     options: Vec<IntearDexSwapOption>,
@@ -96,9 +95,10 @@ impl IntearDexSwap {
         }
     }
 
-    /// The quotes, best first, as options that the engine falls back through when one fails or
-    /// doesn't meet the trade's slippage from the best one. None without quotes, one quote is
-    /// swapped on alone.
+    /// The quotes, best first, as options that the engine falls back through when one fails. The
+    /// swap is constrained to the loosest of their worst cases, which hooks keep within the trade's
+    /// slippage, so when a quote without slippage fails, one that gives a bit less still fills it.
+    /// None without quotes, one quote is swapped on alone.
     pub fn fallback_queue(trade: &IntearDexTrade, mut quotes: Vec<HookQuote>) -> Option<Self> {
         match trade.amount {
             Amount::AmountIn(_) => {
@@ -110,14 +110,12 @@ impl IntearDexSwap {
             return quotes.into_iter().next().map(Self::of_quote);
         }
         let best = &quotes[0];
-        let estimated_amount = BigDecimal::from(best.estimated_amount.0);
+        let worst_case_amounts = quotes.iter().map(|quote| quote.worst_case_amount.0);
         let worst_case_amount = match trade.amount {
-            Amount::AmountIn(_) => (estimated_amount * (BigDecimal::from(1) - &trade.slippage))
-                .with_scale_round(0, RoundingMode::Down),
-            Amount::AmountOut(_) => (estimated_amount * (BigDecimal::from(1) + &trade.slippage))
-                .with_scale_round(0, RoundingMode::Up),
+            Amount::AmountIn(_) => worst_case_amounts.min(),
+            Amount::AmountOut(_) => worst_case_amounts.max(),
         }
-        .to_u128()?;
+        .expect("There are several quotes");
         Some(Self {
             estimated_amount: best.estimated_amount.0,
             worst_case_amount,
@@ -142,10 +140,10 @@ pub fn route(
     trade: &IntearDexTrade,
     swap: IntearDexSwap,
 ) -> Option<RouteBlueprint> {
-    let token_in = IntearAsset::try_from(&trade.asset_in)
-        .expect("Trades are only of NEAR and NEP-141s, which have a base token");
-    let token_out = IntearAsset::try_from(&trade.asset_out)
-        .expect("Trades are only of NEAR and NEP-141s, which have a base token");
+    let token_in = IntearAssetId::try_from(trade.asset_in.clone())
+        .expect("Trades are only of NEAR and NEP-141s");
+    let token_out = IntearAssetId::try_from(trade.asset_out.clone())
+        .expect("Trades are only of NEAR and NEP-141s");
     let referral_fees = payable_referral_fees(&request.fees);
     let engine_referral_fees = ReferralFees::from(&referral_fees);
     let discount = swap.discount.map(|discount| match request.amount {
@@ -256,8 +254,8 @@ pub fn route(
         trader_account_id: request.trader_account_id.clone(),
     };
     let output_in_wallet = match &token_out {
-        IntearAsset::Near => TokenId::Near,
-        IntearAsset::Nep141(token_id) => TokenId::Nep141(token_id.clone()),
+        IntearAssetId::Near => TokenId::Near,
+        IntearAssetId::Nep141(token_id) => TokenId::Nep141(token_id.clone()),
     };
     let output_storage =
         deposit_storage_if_needed(&output_in_wallet, request.trader_account_id.as_ref());
@@ -272,7 +270,7 @@ pub fn route(
         }
     } else {
         match &token_in {
-            IntearAsset::Near => {
+            IntearAssetId::Near => {
                 let input_to_native = convert_to_native(
                     &request.token_in,
                     request.trader_account_id.as_ref(),
@@ -284,12 +282,12 @@ pub fn route(
                 });
                 [output_storage, input_to_native, vec![deposit_near]].concat()
             }
-            IntearAsset::Nep141(token_in_id) => {
+            IntearAssetId::Nep141(token_in_id) => {
                 let (input_to_nep141, input_nep141) = convert_to_nep141(
                     &request.token_in,
                     request.trader_account_id.as_ref(),
                     input_amount,
-                )?;
+                );
                 assert_eq!(token_in_id, &input_nep141);
                 let swap = RouteStep::Call(CallBlueprint::InputNep141TransferCallIntearDex {
                     token_id: token_in_id.clone(),
@@ -318,7 +316,7 @@ pub fn route(
         token_output: if output_withdrawn {
             output_in_wallet
         } else {
-            TokenId::TokenOnIntearDex(trade.asset_out.clone())
+            TokenId::TokenOnIntearDex(token_out.clone())
         },
         discount,
         steps: [registration, steps].concat(),
@@ -533,8 +531,8 @@ mod tests {
         account("trader.near")
     }
 
-    fn ft() -> IntearAsset {
-        IntearAsset::Nep141(account("ft"))
+    fn ft() -> IntearAssetId {
+        IntearAssetId::Nep141(account("ft"))
     }
 
     fn request(token_in: TokenId, token_out: TokenId, amount: Amount) -> SwapRequest {
@@ -554,8 +552,8 @@ mod tests {
     }
 
     fn plach_operations(
-        asset_in: IntearAsset,
-        asset_out: IntearAsset,
+        asset_in: IntearAssetId,
+        asset_out: IntearAssetId,
         amount: Amount,
         constraint: u128,
         withdrawals: Vec<IntearDexWithdrawal>,
@@ -579,12 +577,15 @@ mod tests {
         }
     }
 
-    fn withdrawal(asset: IntearAsset, amount: IntearDexWithdrawAmount) -> IntearDexWithdrawal {
+    fn withdrawal(asset: IntearAssetId, amount: IntearDexWithdrawAmount) -> IntearDexWithdrawal {
         IntearDexWithdrawal { asset, amount }
     }
 
     /// Exact-in of 100 that withdraws at least 79 of the output
-    fn exact_in_operations(asset_in: IntearAsset, asset_out: IntearAsset) -> IntearDexOperations {
+    fn exact_in_operations(
+        asset_in: IntearAssetId,
+        asset_out: IntearAssetId,
+    ) -> IntearDexOperations {
         plach_operations(
             asset_in,
             asset_out.clone(),
@@ -597,7 +598,7 @@ mod tests {
         )
     }
 
-    fn registration(asset_ids: Vec<IntearAsset>) -> RouteStep {
+    fn registration(asset_ids: Vec<IntearAssetId>) -> RouteStep {
         RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader(),
             asset_ids,
@@ -674,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_in_falls_back_from_the_best_quote_within_slippage_of_it() {
+    fn exact_in_falls_back_from_the_best_quote_within_the_loosest_worst_case() {
         let (operations, gas) = swap_operations(
             Amount::AmountIn(100),
             vec![
@@ -689,8 +690,8 @@ mod tests {
                     "asset_in": "near",
                     "asset_out": "nep141:ft",
                     "amount": { "Amount": { "ExactIn": "100" } },
-                    // 1% under the best quote's 82, so the fallback's 80 still fills it
-                    "constraint": "81",
+                    // The least of the worst cases, so the fallback fills it when the best fails
+                    "constraint": "79",
                     "options": [
                         { "dex_id": "slimedragon.near/otc", "message": "c2xpbWVkcmFnb24ubmVhci9vdGM=" },
                         { "dex_id": "slimedragon.near/xyk", "message": "c2xpbWVkcmFnb24ubmVhci94eWs=" },
@@ -701,14 +702,14 @@ mod tests {
         );
         assert_eq!(
             operations[1]["Withdraw"]["amount"]["Full"]["at_least"],
-            "81"
+            "79"
         );
         // Enough to try both
         assert_eq!(gas, attached_gas(NearGas::from_tgas(44 + 37)));
     }
 
     #[test]
-    fn exact_out_falls_back_from_the_cheapest_quote_within_slippage_of_it() {
+    fn exact_out_falls_back_from_the_cheapest_quote_within_the_loosest_worst_case() {
         let (operations, _) = swap_operations(
             Amount::AmountOut(80),
             vec![
@@ -717,8 +718,8 @@ mod tests {
             ],
         );
         let swap = &operations[0]["SwapAdvanced"];
-        // 1% over the cheapest quote's 100
-        assert_eq!(swap["constraint"], "101");
+        // The most of the worst cases
+        assert_eq!(swap["constraint"], "102");
         assert_eq!(swap["options"][0]["dex_id"], "slimedragon.near/xyk");
         assert_eq!(swap["options"][1]["dex_id"], "slimedragon.near/otc");
     }
@@ -787,7 +788,7 @@ mod tests {
                 vec![
                     registration(vec![ft()]),
                     trader_storage("ft"),
-                    deposit_near(100, exact_in_operations(IntearAsset::Near, ft())),
+                    deposit_near(100, exact_in_operations(IntearAssetId::Near, ft())),
                 ],
             ))
         );
@@ -812,7 +813,7 @@ mod tests {
                         amount: NearToken::from_yoctonear(100),
                         trader_account_id: Some(trader()),
                     }),
-                    deposit_near(100, exact_in_operations(IntearAsset::Near, ft())),
+                    deposit_near(100, exact_in_operations(IntearAssetId::Near, ft())),
                 ],
             ))
         );
@@ -840,7 +841,7 @@ mod tests {
                             trader_account_id: Some(trader()),
                         },
                     }),
-                    deposit_near(100, exact_in_operations(IntearAsset::Near, ft())),
+                    deposit_near(100, exact_in_operations(IntearAssetId::Near, ft())),
                 ],
             ))
         );
@@ -850,19 +851,19 @@ mod tests {
     fn amount_in_intear_near_to_ft_fast_path() {
         assert_eq!(
             test_route(request(
-                TokenId::TokenOnIntearDex(AssetId::Near),
+                TokenId::TokenOnIntearDex(IntearAssetId::Near),
                 ft_output(),
                 Amount::AmountIn(100)
             )),
             Some(plach_route_of(
                 Amount::AmountOut(80),
                 Amount::AmountOut(79),
-                TokenId::TokenOnIntearDex(AssetId::Nep141(account("ft"))),
+                TokenId::TokenOnIntearDex(IntearAssetId::Nep141(account("ft"))),
                 vec![
-                    registration(vec![IntearAsset::Near, ft()]),
+                    registration(vec![IntearAssetId::Near, ft()]),
                     RouteStep::Call(CallBlueprint::IntearDexExecuteOperations {
                         operations: plach_operations(
-                            IntearAsset::Near,
+                            IntearAssetId::Near,
                             ft(),
                             Amount::AmountIn(100),
                             79,
@@ -883,11 +884,11 @@ mod tests {
                 Amount::AmountOut(79),
                 TokenId::Near,
                 vec![
-                    registration(vec![IntearAsset::Near]),
+                    registration(vec![IntearAssetId::Near]),
                     RouteStep::Call(CallBlueprint::InputNep141TransferCallIntearDex {
                         token_id: account("ft"),
                         amount: 100,
-                        operations: exact_in_operations(ft(), IntearAsset::Near),
+                        operations: exact_in_operations(ft(), IntearAssetId::Near),
                     }),
                 ],
             ))
@@ -907,7 +908,7 @@ mod tests {
                 Amount::AmountOut(79),
                 TokenId::Near,
                 vec![
-                    registration(vec![IntearAsset::Near]),
+                    registration(vec![IntearAssetId::Near]),
                     trader_storage("ft"),
                     RouteStep::Call(CallBlueprint::RheaWithdraw {
                         token_id: account("ft"),
@@ -917,7 +918,7 @@ mod tests {
                     RouteStep::Call(CallBlueprint::InputNep141TransferCallIntearDex {
                         token_id: account("ft"),
                         amount: 100,
-                        operations: exact_in_operations(ft(), IntearAsset::Near),
+                        operations: exact_in_operations(ft(), IntearAssetId::Near),
                     }),
                 ],
             ))
@@ -933,12 +934,12 @@ mod tests {
                 Amount::AmountIn(101),
                 ft_output(),
                 vec![
-                    registration(vec![IntearAsset::Near, ft()]),
+                    registration(vec![IntearAssetId::Near, ft()]),
                     trader_storage("ft"),
                     deposit_near(
                         101,
                         plach_operations(
-                            IntearAsset::Near,
+                            IntearAssetId::Near,
                             ft(),
                             Amount::AmountOut(80),
                             101,
@@ -949,7 +950,7 @@ mod tests {
                                 ),
                                 // What's left of the input
                                 withdrawal(
-                                    IntearAsset::Near,
+                                    IntearAssetId::Near,
                                     IntearDexWithdrawAmount::Full { at_least: None }
                                 ),
                             ]
@@ -964,7 +965,7 @@ mod tests {
     fn amount_out_intear_near_to_ft_withdraws_exact() {
         assert_eq!(
             test_route(request(
-                TokenId::TokenOnIntearDex(AssetId::Near),
+                TokenId::TokenOnIntearDex(IntearAssetId::Near),
                 ft_output(),
                 Amount::AmountOut(80)
             )),
@@ -973,11 +974,11 @@ mod tests {
                 Amount::AmountIn(101),
                 ft_output(),
                 vec![
-                    registration(vec![IntearAsset::Near, ft()]),
+                    registration(vec![IntearAssetId::Near, ft()]),
                     trader_storage("ft"),
                     RouteStep::Call(CallBlueprint::IntearDexExecuteOperations {
                         operations: plach_operations(
-                            IntearAsset::Near,
+                            IntearAssetId::Near,
                             ft(),
                             Amount::AmountOut(80),
                             101,
@@ -991,10 +992,10 @@ mod tests {
 
     #[test]
     fn amount_out_intear_to_intear_leaves_output_on_dex() {
-        let intear_ft = TokenId::TokenOnIntearDex(AssetId::Nep141(account("ft")));
+        let intear_ft = TokenId::TokenOnIntearDex(IntearAssetId::Nep141(account("ft")));
         assert_eq!(
             test_route(request(
-                TokenId::TokenOnIntearDex(AssetId::Near),
+                TokenId::TokenOnIntearDex(IntearAssetId::Near),
                 intear_ft.clone(),
                 Amount::AmountOut(80)
             )),
@@ -1003,10 +1004,10 @@ mod tests {
                 Amount::AmountIn(101),
                 intear_ft,
                 vec![
-                    registration(vec![IntearAsset::Near, ft()]),
+                    registration(vec![IntearAssetId::Near, ft()]),
                     RouteStep::Call(CallBlueprint::IntearDexExecuteOperations {
                         operations: plach_operations(
-                            IntearAsset::Near,
+                            IntearAssetId::Near,
                             ft(),
                             Amount::AmountOut(80),
                             101,
@@ -1069,7 +1070,7 @@ mod tests {
                     100,
                     IntearDexOperations {
                         trader_account_id: None,
-                        ..exact_in_operations(IntearAsset::Near, ft())
+                        ..exact_in_operations(IntearAssetId::Near, ft())
                     }
                 )],
             ))
@@ -1101,9 +1102,9 @@ mod tests {
                 trader_account_id: trader(),
                 asset_ids: vec![ft()],
                 fee_receivers: vec![
-                    (account("ref.near"), IntearAsset::Near),
-                    (account("ref2.near"), IntearAsset::Near),
-                    (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), IntearAsset::Near),
+                    (account("ref.near"), IntearAssetId::Near),
+                    (account("ref2.near"), IntearAssetId::Near),
+                    (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), IntearAssetId::Near),
                 ],
             }
         );
@@ -1129,11 +1130,11 @@ mod tests {
             resolved.calls[..2],
             [
                 CallBlueprint::IntearDexRegisterAssets {
-                    asset_ids: vec![IntearAsset::Near],
+                    asset_ids: vec![IntearAssetId::Near],
                     for_account: Some(account("ref.near")),
                 },
                 CallBlueprint::IntearDexRegisterAssets {
-                    asset_ids: vec![IntearAsset::Near],
+                    asset_ids: vec![IntearAssetId::Near],
                     for_account: Some(AGGREGATOR_FEE_RECEIVER_ID.to_owned()),
                 },
             ]

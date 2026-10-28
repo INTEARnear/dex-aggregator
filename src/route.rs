@@ -4,14 +4,14 @@ use near_min_api::types::{AccountId, Action, Balance, NearToken};
 use tracing::info;
 
 use crate::{
-    calls::{CallBlueprint, IntearAsset},
+    calls::CallBlueprint,
     providers::rhea_dcl::RHEA_DCL_CONTRACT_ID,
     shared_utils::{
         needs_storage_deposit_for_contract, register_assets_on_intear,
         rhea_fee_receivers_registration, rhea_registration, token_storage_deposit_amount,
         NetworkView,
     },
-    types::{Amount, DexId, ExecutionInstruction, Gas, TokenId},
+    types::{Amount, DexId, ExecutionInstruction, Gas, IntearAssetId, TokenId},
 };
 
 /// What a provider found: the swap, and what has to happen around it. What the trader and the
@@ -63,8 +63,8 @@ pub enum RouteStep {
     /// receiver that it lacks, with the storage they lack
     RegisterOnIntearDexIfNeeded {
         trader_account_id: AccountId,
-        asset_ids: Vec<IntearAsset>,
-        fee_receivers: Vec<(AccountId, IntearAsset)>,
+        asset_ids: Vec<IntearAssetId>,
+        fee_receivers: Vec<(AccountId, IntearAssetId)>,
     },
 }
 

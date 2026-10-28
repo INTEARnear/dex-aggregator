@@ -7,12 +7,13 @@ use near_min_api::types::{
     NearToken,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
+use tracing::warn;
 
 use crate::{
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
     providers::{rhea::RHEA_CONTRACT_ID, rhea_dcl::RHEA_DCL_CONTRACT_ID},
     shared_utils::WRAP_NEAR,
-    types::{Amount, Gas, QuoteFees},
+    types::{Amount, Gas, IntearAssetId, QuoteFees},
 };
 
 /// A function call of a route, with everything it needs known. Each call has a fixed receiver,
@@ -115,7 +116,7 @@ pub enum CallBlueprint {
     },
     /// Registers balances of the assets for `for_account`, for the signer without it
     IntearDexRegisterAssets {
-        asset_ids: Vec<IntearAsset>,
+        asset_ids: Vec<IntearAssetId>,
         for_account: Option<AccountId>,
     },
     /// Into the signer's balance on Intear DEX, then runs the operations with it
@@ -129,7 +130,7 @@ pub enum CallBlueprint {
     },
     /// Sends the asset to the signer, `trader_account_id`
     IntearDexWithdraw {
-        asset: IntearAsset,
+        asset: IntearAssetId,
         amount: Balance,
         trader_account_id: Option<AccountId>,
     },
@@ -163,34 +164,6 @@ pub enum RheaDclSwap {
     ExactOut { amount_out: Balance },
 }
 
-/// What routes swap on Intear DEX
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntearAsset {
-    Near,
-    Nep141(AccountId),
-}
-
-impl From<&IntearAsset> for AssetId {
-    fn from(asset: &IntearAsset) -> Self {
-        match asset {
-            IntearAsset::Near => AssetId::Near,
-            IntearAsset::Nep141(token_id) => AssetId::Nep141(token_id.clone()),
-        }
-    }
-}
-
-impl TryFrom<&AssetId> for IntearAsset {
-    type Error = ();
-
-    fn try_from(asset_id: &AssetId) -> Result<Self, ()> {
-        match asset_id {
-            AssetId::Near => Ok(IntearAsset::Near),
-            AssetId::Nep141(token_id) => Ok(IntearAsset::Nep141(token_id.clone())),
-            AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => Err(()),
-        }
-    }
-}
-
 /// A swap on Intear DEX's engine, and the withdrawals to the signer after it
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntearDexOperations {
@@ -205,8 +178,8 @@ pub struct IntearDexOperations {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntearDexSwapOperation {
-    pub asset_in: IntearAsset,
-    pub asset_out: IntearAsset,
+    pub asset_in: IntearAssetId,
+    pub asset_out: IntearAssetId,
     /// `AmountIn` swaps an exact input, `AmountOut` gets an exact output
     pub amount: Amount,
     /// The least output of an exact-in swap, or the most input of an exact-out one
@@ -227,7 +200,7 @@ pub struct IntearDexSwapOption {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntearDexWithdrawal {
-    pub asset: IntearAsset,
+    pub asset: IntearAssetId,
     pub amount: IntearDexWithdrawAmount,
 }
 
@@ -245,6 +218,8 @@ pub enum IntearDexWithdrawAmount {
 const FT_TRANSFER_CALL_GAS: Gas = Gas::from_ggas(5_400, 31_000);
 /// Not burnt, attached so a call doesn't run out of gas when it burns more than estimated
 const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
+/// Under what a transaction can attach, with room for the other calls in it
+const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 
 /// https://github.com/near/nearcore/blob/44f7ae6cd7ef08bab604e20a473bf77e35d4c993/core/parameters/res/runtime_configs/parameters.yaml#L43-L47
 const ACTION_RECEIPT_EXECUTION_GAS: NearGas = NearGas::from_gas(108_059_500_000);
@@ -282,9 +257,9 @@ impl CallBlueprint {
         }
     }
 
-    /// Source: sandbox on mainnet state
+    /// Source: sandbox on mainnet state. What's attached is capped at [`MAX_CALL_GAS`].
     pub fn gas(&self) -> Gas {
-        match self {
+        let gas = match self {
             CallBlueprint::Nep141StorageDeposit { .. } => Gas::from_ggas(2_300, 11_000),
             CallBlueprint::Nep141DepositOnRhea { .. } => {
                 FT_TRANSFER_CALL_GAS + Gas::from_ggas(2_890, 2_500)
@@ -363,7 +338,19 @@ impl CallBlueprint {
                 Gas::from_ggas(4_400, 4_400)
                     + intear_dex_sending_out_gas(asset, trader_account_id.as_ref())
             }
+        };
+        if gas.needs_attached > MAX_CALL_GAS {
+            warn!(
+                "A call to {} needs {}, attaching {MAX_CALL_GAS}",
+                self.receiver_id(),
+                gas.needs_attached
+            );
+            return Gas {
+                needs_attached: MAX_CALL_GAS,
+                ..gas
+            };
         }
+        gas
     }
 
     /// NEAR the call attaches to a storage deposit
@@ -806,10 +793,10 @@ fn rhea_output_gas(output: &RheaOutput) -> Gas {
 }
 
 /// Of Intear DEX sending an asset out of the signer's balance
-fn intear_dex_sending_out_gas(asset: &IntearAsset, trader_account_id: Option<&AccountId>) -> Gas {
+fn intear_dex_sending_out_gas(asset: &IntearAssetId, trader_account_id: Option<&AccountId>) -> Gas {
     match asset {
-        IntearAsset::Near => Gas::from_ggas(2_900, 5_900) + near_receive_gas(trader_account_id),
-        IntearAsset::Nep141(_) => Gas::from_ggas(4_900, 16_800),
+        IntearAssetId::Near => Gas::from_ggas(2_900, 5_900) + near_receive_gas(trader_account_id),
+        IntearAssetId::Nep141(_) => Gas::from_ggas(4_900, 16_800),
     }
 }
 
@@ -867,8 +854,8 @@ mod tests {
     fn intear_operations(withdrawals: Vec<IntearDexWithdrawal>) -> IntearDexOperations {
         IntearDexOperations {
             swap: IntearDexSwapOperation {
-                asset_in: IntearAsset::Near,
-                asset_out: IntearAsset::Nep141(account("ft")),
+                asset_in: IntearAssetId::Near,
+                asset_out: IntearAssetId::Nep141(account("ft")),
                 amount: Amount::AmountIn(100),
                 constraint: 79,
                 options: vec![IntearDexSwapOption {
@@ -886,14 +873,14 @@ mod tests {
 
     fn withdraw_ft() -> IntearDexWithdrawal {
         IntearDexWithdrawal {
-            asset: IntearAsset::Nep141(account("ft")),
+            asset: IntearAssetId::Nep141(account("ft")),
             amount: IntearDexWithdrawAmount::Full { at_least: Some(79) },
         }
     }
 
     fn withdraw_near() -> IntearDexWithdrawal {
         IntearDexWithdrawal {
-            asset: IntearAsset::Near,
+            asset: IntearAssetId::Near,
             amount: IntearDexWithdrawAmount::Full { at_least: None },
         }
     }
@@ -1044,7 +1031,7 @@ mod tests {
         );
         assert_eq!(
             CallBlueprint::IntearDexRegisterAssets {
-                asset_ids: vec![IntearAsset::Nep141(account("ft"))],
+                asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
                 for_account: None,
             }
             .gas(),
@@ -1052,7 +1039,7 @@ mod tests {
         );
         assert_eq!(
             CallBlueprint::IntearDexRegisterAssets {
-                asset_ids: vec![IntearAsset::Near, IntearAsset::Nep141(account("ft"))],
+                asset_ids: vec![IntearAssetId::Near, IntearAssetId::Nep141(account("ft"))],
                 for_account: None,
             }
             .gas(),
@@ -1115,7 +1102,7 @@ mod tests {
     fn intear_dex_withdraw_is_of_an_exact_amount() {
         assert_eq!(
             encoded(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Nep141(account("wrap.near")),
+                asset: IntearAssetId::Nep141(account("wrap.near")),
                 amount: 42,
                 trader_account_id: None,
             }),
@@ -1201,7 +1188,7 @@ mod tests {
         );
         assert_eq!(
             encoded(CallBlueprint::IntearDexRegisterAssets {
-                asset_ids: vec![IntearAsset::Near],
+                asset_ids: vec![IntearAssetId::Near],
                 for_account: Some(account("bob.near")),
             })
             .1,

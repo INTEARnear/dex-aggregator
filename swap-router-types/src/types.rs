@@ -76,7 +76,44 @@ pub enum TokenId {
     Near,
     Nep141(AccountId),
     Nep141OnRhea(AccountId),
-    TokenOnIntearDex(AssetId),
+    TokenOnIntearDex(IntearAssetId),
+}
+
+/// An asset on Intear DEX that routes can swap: NEAR or a NEP-141
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IntearAssetId {
+    Near,
+    Nep141(AccountId),
+}
+
+#[derive(Debug)]
+pub struct AssetIdNotSupported;
+
+impl TryFrom<AssetId> for IntearAssetId {
+    type Error = AssetIdNotSupported;
+
+    fn try_from(asset_id: AssetId) -> Result<Self, Self::Error> {
+        match asset_id {
+            AssetId::Near => Ok(IntearAssetId::Near),
+            AssetId::Nep141(contract_id) => Ok(IntearAssetId::Nep141(contract_id)),
+            AssetId::Nep171(_, _) | AssetId::Nep245(_, _) => Err(AssetIdNotSupported),
+        }
+    }
+}
+
+impl From<&IntearAssetId> for AssetId {
+    fn from(asset_id: &IntearAssetId) -> Self {
+        match asset_id {
+            IntearAssetId::Near => AssetId::Near,
+            IntearAssetId::Nep141(contract_id) => AssetId::Nep141(contract_id.clone()),
+        }
+    }
+}
+
+impl Display for IntearAssetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        AssetId::from(self).fmt(f)
+    }
 }
 
 impl Display for TokenId {
@@ -120,8 +157,11 @@ impl FromStr for TokenId {
                 account_id.parse().map_err(|_| "Invalid token ID")?,
             ))
         } else if let Some(asset_id) = s.strip_prefix("intear-dex:") {
-            Ok(TokenId::TokenOnIntearDex(asset_id.parse().map_err(
-                |e| format!("Failed to parse intear-dex asset: {e}"),
+            let asset_id: AssetId = asset_id
+                .parse()
+                .map_err(|e| format!("Failed to parse intear-dex asset: {e}"))?;
+            Ok(TokenId::TokenOnIntearDex(asset_id.try_into().map_err(
+                |AssetIdNotSupported| "Only NEAR and NEP-141s on Intear DEX are supported",
             )?))
         } else if let Some(account_id) = s.strip_prefix("nep141:") {
             Ok(TokenId::Nep141(
@@ -374,8 +414,7 @@ pub struct Route {
 pub struct Quote {
     #[serde(flatten)]
     pub route: Route,
-    /// What the execution instructions cost in gas at most, if all gas attached to them is burnt,
-    /// with the fees of their transactions.
+    /// What the execution instructions cost in gas at most, if all gas attached to them is burnt
     pub estimated_max_gas_cost: NearToken,
     /// What the execution instructions are expected to cost in gas, the gas fee to show
     pub estimated_gas_usage: NearToken,

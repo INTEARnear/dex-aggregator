@@ -64,12 +64,12 @@ async fn route(
     let slippage = get_slippage(
         network,
         request.slippage,
-        &base_token(&request.token_in).unwrap(),
-        &base_token(&request.token_out).unwrap(),
+        &base_token(&request.token_in),
+        &base_token(&request.token_out),
     );
 
-    let (_, token_in) = convert_to_nep141(&request.token_in, None, 0)?;
-    let (_, token_out) = convert_to_nep141(&request.token_out, None, 0)?;
+    let (_, token_in) = convert_to_nep141(&request.token_in, None, 0);
+    let (_, token_out) = convert_to_nep141(&request.token_out, None, 0);
 
     if token_in == token_out {
         return None;
@@ -103,8 +103,8 @@ async fn route(
             quoted_token_price_raw: price_raw(
                 network,
                 &match request.amount {
-                    Amount::AmountIn(_) => base_token(&request.token_out).unwrap(),
-                    Amount::AmountOut(_) => base_token(&request.token_in).unwrap(),
+                    Amount::AmountIn(_) => base_token(&request.token_out),
+                    Amount::AmountOut(_) => base_token(&request.token_in),
                 },
             )?,
         })
@@ -182,7 +182,7 @@ async fn route(
         amount_in + total_fee_amount(&fees),
         &fees,
         &swap_referrer_id,
-    )?;
+    );
     let token_output = if unwrapping_near {
         TokenId::Near
     } else {

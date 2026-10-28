@@ -6,8 +6,9 @@ use near_min_api::types::{AccountId, NearToken};
 use num_traits::FromPrimitive;
 
 use super::*;
-use crate::calls::{CallBlueprint, IntearAsset, RheaOutput};
+use crate::calls::{CallBlueprint, RheaOutput};
 use crate::route::{resolve_steps, RouteStep};
+use crate::types::IntearAssetId;
 use crate::types::{Slippage, TokenId};
 use intear_dex_types::AssetId;
 
@@ -32,23 +33,15 @@ fn rhea_ft() -> TokenId {
 }
 
 fn intear_near() -> TokenId {
-    TokenId::TokenOnIntearDex(AssetId::Near)
+    TokenId::TokenOnIntearDex(IntearAssetId::Near)
 }
 
 fn intear_wnear() -> TokenId {
-    TokenId::TokenOnIntearDex(AssetId::Nep141(account(WRAP_NEAR)))
+    TokenId::TokenOnIntearDex(IntearAssetId::Nep141(account(WRAP_NEAR)))
 }
 
 fn intear_ft() -> TokenId {
-    TokenId::TokenOnIntearDex(AssetId::Nep141(account("ft")))
-}
-
-fn intear_nep171() -> TokenId {
-    TokenId::TokenOnIntearDex(AssetId::Nep171(account("nft.near"), "1".to_string()))
-}
-
-fn intear_nep245() -> TokenId {
-    TokenId::TokenOnIntearDex(AssetId::Nep245(account("mft.near"), "1".to_string()))
+    TokenId::TokenOnIntearDex(IntearAssetId::Nep141(account("ft")))
 }
 
 fn trader() -> AccountId {
@@ -131,7 +124,7 @@ fn deposit_storage_if_needed_registers_where_the_token_is() {
         deposit_storage_if_needed(&intear_ft(), Some(&trader())),
         vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader(),
-            asset_ids: vec![IntearAsset::Nep141(account("ft"))],
+            asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
             fee_receivers: vec![],
         }]
     );
@@ -243,7 +236,7 @@ async fn rhea_registration_pays_what_the_contract_counts() {
 /// from scratch, and as storage_deposit takes it
 #[tokio::test]
 async fn intear_registration_pays_what_the_contract_charges() {
-    let deposit = |network: TestNetworkView, account_id: &str, assets: Vec<IntearAsset>| {
+    let deposit = |network: TestNetworkView, account_id: &str, assets: Vec<IntearAssetId>| {
         let account_id = account(account_id);
         async move {
             registration_deposit(
@@ -253,14 +246,14 @@ async fn intear_registration_pays_what_the_contract_charges() {
             )
         }
     };
-    let tear = IntearAsset::Nep141(account("token.intear.near"));
+    let tear = IntearAssetId::Nep141(account("token.intear.near"));
 
     // tx 6CziqdMLqww3akUuAQiXfainuBM46KAr1NNhgFJLnpE2 paid exactly this
     assert_eq!(
         deposit(
             TestNetworkView::default(),
             "starship9.near",
-            vec![IntearAsset::Near, tear.clone()]
+            vec![IntearAssetId::Near, tear.clone()]
         )
         .await,
         Some(storage_bytes(537))
@@ -270,7 +263,7 @@ async fn intear_registration_pays_what_the_contract_charges() {
         deposit(
             TestNetworkView::default(),
             "01b94be2d588a799498f89cb4eb5e54c965e7f6115b6768d4e154bf210a69139",
-            vec![IntearAsset::Near, tear.clone()]
+            vec![IntearAssetId::Near, tear.clone()]
         )
         .await,
         Some(storage_bytes(837))
@@ -280,8 +273,8 @@ async fn intear_registration_pays_what_the_contract_charges() {
             TestNetworkView::default(),
             "criptomem.near",
             vec![
-                IntearAsset::Nep141(account("usdt.tether-token.near")),
-                IntearAsset::Nep141(account("qtc.omft.near"))
+                IntearAssetId::Nep141(account("usdt.tether-token.near")),
+                IntearAssetId::Nep141(account("qtc.omft.near"))
             ]
         )
         .await,
@@ -292,8 +285,8 @@ async fn intear_registration_pays_what_the_contract_charges() {
             TestNetworkView::default(),
             "decentgui.tg",
             vec![
-                IntearAsset::Near,
-                IntearAsset::Nep141(account(
+                IntearAssetId::Near,
+                IntearAssetId::Nep141(account(
                     "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
                 ))
             ]
@@ -314,7 +307,7 @@ async fn intear_registration_pays_what_the_contract_charges() {
     );
     // The first registration of an asset also stores its total in custody: 89 for the
     // account, 105 for its balances, 194 for the balance and 178 for the total
-    let raen = IntearAsset::Nep141(account("raen-e1328c.launchpad.justhoot.near"));
+    let raen = IntearAssetId::Nep141(account("raen-e1328c.launchpad.justhoot.near"));
     assert_eq!(
         deposit(
             TestNetworkView::default().with_intear_asset_untracked(&AssetId::from(&raen)),
@@ -327,7 +320,7 @@ async fn intear_registration_pays_what_the_contract_charges() {
 
     // slimedragon.near's registration of a 64 character token took 227 bytes, its balances
     // existing already
-    let long_asset = IntearAsset::Nep141(account(
+    let long_asset = IntearAssetId::Nep141(account(
         "88888.0000000000000000000000000000000000000000000000000000000000",
     ));
     let with_balances = |available: NearToken| {
@@ -369,7 +362,7 @@ async fn intear_registration_pays_what_the_contract_charges() {
                 storage_bytes(171 + 177),
             ),
             "9ce82f7c55c2f649.trade.unrlzd.near",
-            vec![IntearAsset::Near]
+            vec![IntearAssetId::Near]
         )
         .await,
         None
@@ -478,36 +471,34 @@ fn is_near_for_all_token_variants() {
     assert!(!is_near(&ft()));
     assert!(!is_near(&rhea_ft()));
     assert!(!is_near(&intear_ft()));
-    assert!(!is_near(&intear_nep245()));
-    assert!(!is_near(&intear_nep171()));
 }
 
 #[test]
 fn base_token_for_all_token_variants() {
-    assert_eq!(base_token(&TokenId::Near), Some(BaseTokenId::Near));
+    assert_eq!(base_token(&TokenId::Near), BaseTokenId::Near);
     assert_eq!(
         base_token(&wnear()),
-        Some(BaseTokenId::Nep141(account(WRAP_NEAR)))
+        BaseTokenId::Nep141(account(WRAP_NEAR))
     );
     assert_eq!(
         base_token(&rhea_wnear()),
-        Some(BaseTokenId::Nep141(account(WRAP_NEAR)))
+        BaseTokenId::Nep141(account(WRAP_NEAR))
     );
-    assert_eq!(
-        base_token(&rhea_ft()),
-        Some(BaseTokenId::Nep141(account("ft")))
-    );
-    assert_eq!(base_token(&intear_near()), Some(BaseTokenId::Near));
+    assert_eq!(base_token(&rhea_ft()), BaseTokenId::Nep141(account("ft")));
+    assert_eq!(base_token(&intear_near()), BaseTokenId::Near);
     assert_eq!(
         base_token(&intear_wnear()),
-        Some(BaseTokenId::Nep141(account(WRAP_NEAR)))
+        BaseTokenId::Nep141(account(WRAP_NEAR))
     );
-    assert_eq!(
-        base_token(&intear_ft()),
-        Some(BaseTokenId::Nep141(account("ft")))
-    );
-    assert_eq!(base_token(&intear_nep245()), None);
-    assert_eq!(base_token(&intear_nep171()), None);
+    assert_eq!(base_token(&intear_ft()), BaseTokenId::Nep141(account("ft")));
+}
+
+#[test]
+fn intear_dex_tokens_are_only_near_and_nep141s() {
+    assert_eq!("intear-dex:near".parse::<TokenId>(), Ok(intear_near()));
+    assert_eq!("intear-dex:nep141:ft".parse::<TokenId>(), Ok(intear_ft()));
+    assert!("intear-dex:nep245:mft.near:1".parse::<TokenId>().is_err());
+    assert!("intear-dex:nep171:nft.near:1".parse::<TokenId>().is_err());
 }
 
 #[test]
@@ -547,7 +538,7 @@ fn token_info_rejects_invalid_bigdecimal_type() {
 fn convert_to_nep141_near_wraps_when_amount_positive() {
     assert_eq!(
         convert_to_nep141(&TokenId::Near, None, 5),
-        Some((vec![wrap(5)], account(WRAP_NEAR)))
+        (vec![wrap(5)], account(WRAP_NEAR))
     );
 }
 
@@ -555,30 +546,27 @@ fn convert_to_nep141_near_wraps_when_amount_positive() {
 fn convert_to_nep141_near_skips_wrap_when_amount_zero() {
     assert_eq!(
         convert_to_nep141(&TokenId::Near, None, 0),
-        Some((vec![], account(WRAP_NEAR)))
+        (vec![], account(WRAP_NEAR))
     );
 }
 
 #[test]
 fn convert_to_nep141_nep141_is_identity() {
-    assert_eq!(
-        convert_to_nep141(&ft(), None, 9),
-        Some((vec![], account("ft")))
-    );
+    assert_eq!(convert_to_nep141(&ft(), None, 9), (vec![], account("ft")));
 }
 
 #[test]
 fn convert_to_nep141_rhea_withdraws_without_unwrap() {
     assert_eq!(
         convert_to_nep141(&rhea_ft(), None, 9),
-        Some((
+        (
             vec![call(CallBlueprint::RheaWithdraw {
                 token_id: account("ft"),
                 amount: 9,
                 output: RheaOutput::Nep141,
             })],
             account("ft")
-        ))
+        )
     );
 }
 
@@ -587,7 +575,7 @@ fn convert_to_nep141_rhea_amount_zero_has_no_steps() {
     // Rhea would withdraw the whole balance for 0
     assert_eq!(
         convert_to_nep141(&rhea_ft(), None, 0),
-        Some((vec![], account("ft")))
+        (vec![], account("ft"))
     );
 }
 
@@ -595,17 +583,17 @@ fn convert_to_nep141_rhea_amount_zero_has_no_steps() {
 fn convert_to_nep141_intear_near_withdraws_and_wraps() {
     assert_eq!(
         convert_to_nep141(&intear_near(), None, 4),
-        Some((
+        (
             vec![
                 call(CallBlueprint::IntearDexWithdraw {
-                    asset: IntearAsset::Near,
+                    asset: IntearAssetId::Near,
                     amount: 4,
                     trader_account_id: None,
                 }),
                 wrap(4),
             ],
             account(WRAP_NEAR)
-        ))
+        )
     );
 }
 
@@ -613,7 +601,7 @@ fn convert_to_nep141_intear_near_withdraws_and_wraps() {
 fn convert_to_nep141_intear_near_amount_zero_has_no_steps() {
     assert_eq!(
         convert_to_nep141(&intear_near(), None, 0),
-        Some((vec![], account(WRAP_NEAR)))
+        (vec![], account(WRAP_NEAR))
     );
 }
 
@@ -621,21 +609,15 @@ fn convert_to_nep141_intear_near_amount_zero_has_no_steps() {
 fn convert_to_nep141_intear_nep141_withdraws_only() {
     assert_eq!(
         convert_to_nep141(&intear_ft(), Some(&trader()), 8),
-        Some((
+        (
             vec![call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Nep141(account("ft")),
+                asset: IntearAssetId::Nep141(account("ft")),
                 amount: 8,
                 trader_account_id: Some(trader()),
             })],
             account("ft")
-        ))
+        )
     );
-}
-
-#[test]
-fn convert_to_nep141_unsupported_assets_return_none() {
-    assert!(convert_to_nep141(&intear_nep245(), None, 1).is_none());
-    assert!(convert_to_nep141(&intear_nep171(), None, 1).is_none());
 }
 
 #[test]
@@ -699,7 +681,7 @@ fn convert_to_native_intear_near_withdraws_only() {
     assert_eq!(
         convert_to_native(&intear_near(), None, amount),
         Some(vec![call(CallBlueprint::IntearDexWithdraw {
-            asset: IntearAsset::Near,
+            asset: IntearAssetId::Near,
             amount: amount.as_yoctonear(),
             trader_account_id: None,
         })])
@@ -713,7 +695,7 @@ fn convert_to_native_intear_wrap_withdraws_and_unwraps() {
         convert_to_native(&intear_wnear(), None, amount),
         Some(vec![
             call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Nep141(account(WRAP_NEAR)),
+                asset: IntearAssetId::Nep141(account(WRAP_NEAR)),
                 amount: amount.as_yoctonear(),
                 trader_account_id: None,
             }),
@@ -729,8 +711,6 @@ fn convert_to_native_intear_wrap_withdraws_and_unwraps() {
 fn convert_to_native_intear_unsupported_or_zero_returns_none() {
     let amount = NearToken::from_near(1);
     assert!(convert_to_native(&intear_ft(), None, amount).is_none());
-    assert!(convert_to_native(&intear_nep245(), None, amount).is_none());
-    assert!(convert_to_native(&intear_nep171(), None, amount).is_none());
     assert!(convert_to_native(&intear_near(), None, NearToken::ZERO).is_none());
 }
 
@@ -876,12 +856,6 @@ fn convert_to_same_token_is_empty() {
 }
 
 #[test]
-fn convert_to_unsupported_assets_is_empty() {
-    assert!(convert_to(&intear_nep245(), &TokenId::Near, 1, None).is_empty());
-    assert!(convert_to(&TokenId::Near, &intear_nep171(), 1, None).is_empty());
-}
-
-#[test]
 fn convert_to_near_and_wrap_near() {
     assert_eq!(convert_to(&TokenId::Near, &wnear(), 5, None), vec![wrap(5)]);
     assert_eq!(
@@ -927,7 +901,7 @@ fn convert_to_intear_near_to_wrap_near_withdraws_and_wraps() {
         convert_to(&intear_near(), &wnear(), 5, None),
         vec![
             call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Near,
+                asset: IntearAssetId::Near,
                 amount: 5,
                 trader_account_id: None,
             }),
@@ -1021,7 +995,7 @@ async fn convert_to_intear_near_destination_uses_deposit_near() {
         vec![
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![IntearAsset::Near],
+                asset_ids: vec![IntearAssetId::Near],
                 fee_receivers: vec![],
             },
             deposit_near,
@@ -1050,7 +1024,7 @@ fn convert_to_step_order_is_register_withdraw_convert_deposit() {
         vec![
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![IntearAsset::Nep141(account(WRAP_NEAR))],
+                asset_ids: vec![IntearAssetId::Nep141(account(WRAP_NEAR))],
                 fee_receivers: vec![],
             },
             RouteStep::TraderStorageDepositOnNep141IfNeeded {
@@ -1085,7 +1059,7 @@ fn convert_to_registers_the_trader_on_a_withdrawn_token() {
                 trader_account_id: trader(),
             },
             call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Nep141(account(WRAP_NEAR)),
+                asset: IntearAssetId::Nep141(account(WRAP_NEAR)),
                 amount: 5,
                 trader_account_id: Some(trader()),
             }),
@@ -1120,7 +1094,7 @@ fn convert_to_doesnt_register_the_trader_on_their_wallet_token() {
         vec![
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![IntearAsset::Nep141(account("ft"))],
+                asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
                 fee_receivers: vec![],
             },
             RouteStep::StorageDepositOnNep141IfNeeded {
@@ -1153,8 +1127,7 @@ fn fees_are_paid_after_the_swap_to_referrers_registered_first() {
         110,
         &fees,
         &account("app.near"),
-    )
-    .unwrap();
+    );
     assert_eq!(nep141, account(WRAP_NEAR));
     // NEAR is wrapped whole, with the fees
     assert_eq!(to_nep141, vec![wrap(110)]);
@@ -1190,7 +1163,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
             slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&wnear()).unwrap(),
+        &base_token(&wnear()),
     );
     assert_eq!(passthrough, bd("0.01"));
 
@@ -1198,7 +1171,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         &network,
         Slippage::Fixed { slippage: bd("0") },
         &BaseTokenId::Near,
-        &base_token(&wnear()).unwrap(),
+        &base_token(&wnear()),
     );
     assert_eq!(too_small, BigDecimal::from_f64(0.0001).unwrap());
 
@@ -1206,7 +1179,7 @@ async fn get_slippage_fixed_passthrough_and_clamp() {
         &network,
         Slippage::Fixed { slippage: bd("2") },
         &BaseTokenId::Near,
-        &base_token(&wnear()).unwrap(),
+        &base_token(&wnear()),
     );
     assert_eq!(too_large, BigDecimal::from_f64(0.9999).unwrap());
 }
@@ -1221,7 +1194,7 @@ async fn get_slippage_auto_missing_token_uses_scale_0_8() {
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(
         slippage,
@@ -1239,7 +1212,7 @@ async fn get_slippage_auto_token_fetch_error_uses_scale_0_005() {
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(
         slippage,
@@ -1282,7 +1255,7 @@ async fn get_slippage_auto_block_height_error_uses_scale_0_005_for_known_token()
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(
         slippage,
@@ -1325,7 +1298,7 @@ async fn get_slippage_auto_new_token_uses_max_slippage() {
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(slippage, bd("0.51"));
 }
@@ -1365,7 +1338,7 @@ async fn get_slippage_auto_somewhat_new_token_uses_scale_0_6() {
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(
         slippage,
@@ -1589,7 +1562,7 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
         },
     );
     tokens.insert(
-        base_token(&ft()).unwrap(),
+        base_token(&ft()),
         TokenInfo {
             price_usd_raw: bd("1"),
             price_usd_raw_24h_ago: bd("1.3"),
@@ -1607,7 +1580,7 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
             min_slippage: bd("0.01"),
         },
         &BaseTokenId::Near,
-        &base_token(&ft()).unwrap(),
+        &base_token(&ft()),
     );
     assert_eq!(
         slippage,

@@ -27,11 +27,11 @@ pub use swap_router_types::fees::payable_referral_fees;
 use tracing::{error, info};
 
 use crate::{
-    calls::{CallBlueprint, IntearAsset, RheaOutput},
+    calls::{CallBlueprint, RheaOutput},
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
     providers::rhea::RHEA_CONTRACT_ID,
     route::RouteStep,
-    types::{QuoteFees, Slippage, TokenId},
+    types::{IntearAssetId, QuoteFees, Slippage, TokenId},
 };
 
 pub const WRAP_NEAR: &str = "wrap.near";
@@ -149,8 +149,8 @@ pub fn convert_to_nep141_with_fees(
     total: Balance,
     fees: &[ReferrerFee],
     swap_referrer_id: &AccountId,
-) -> Option<(Vec<RouteStep>, Vec<RouteStep>, AccountId)> {
-    let (to_nep141, nep141) = convert_to_nep141(token_id, trader_account_id, total)?;
+) -> (Vec<RouteStep>, Vec<RouteStep>, AccountId) {
+    let (to_nep141, nep141) = convert_to_nep141(token_id, trader_account_id, total);
     let fee_receivers_storage = fees
         .iter()
         .map(|fee| RouteStep::StorageDepositOnNep141IfNeeded {
@@ -166,7 +166,7 @@ pub fn convert_to_nep141_with_fees(
         })
     });
     let fee_steps = fee_receivers_storage.chain(fee_transfers).collect();
-    Some((to_nep141, fee_steps, nep141))
+    (to_nep141, fee_steps, nep141)
 }
 
 pub struct Mainnet;
@@ -649,7 +649,7 @@ const ACCOUNT_ID_LENGTH_BYTES: u128 = 4;
 /// balances when it has none yet
 fn intear_balances_bytes(
     account_id: &AccountId,
-    assets: &[&IntearAsset],
+    assets: &[&IntearAssetId],
     balances_exist: bool,
 ) -> u128 {
     let id = account_id.len() as u128;
@@ -679,8 +679,8 @@ fn intear_balances_bytes(
 pub async fn register_assets_on_intear(
     network: &impl NetworkView,
     account_id: &AccountId,
-    assets: &[IntearAsset],
-    fee_receivers: &[(AccountId, IntearAsset)],
+    assets: &[IntearAssetId],
+    fee_receivers: &[(AccountId, IntearAssetId)],
 ) -> Option<Vec<CallBlueprint>> {
     let contract_id: AccountId = INTEAR_DEX_CONTRACT_ID.parse().unwrap();
     let mut unregistered = Vec::new();
@@ -1077,13 +1077,12 @@ async fn fetch_final_block_hash() -> Result<CryptoHash, String> {
         .map_err(|err| format!("Failed to get the final block: {err:?}"))
 }
 
-/// Steps that move `amount` of the token to its NEP-141 in the trader's wallet, and the NEP-141.
-/// None for tokens without one.
+/// Steps that move `amount` of the token to its NEP-141 in the trader's wallet, and the NEP-141
 pub fn convert_to_nep141(
     token_id: &TokenId,
     trader_account_id: Option<&AccountId>,
     amount: Balance,
-) -> Option<(Vec<RouteStep>, AccountId)> {
+) -> (Vec<RouteStep>, AccountId) {
     let wrap_near = || {
         RouteStep::Call(CallBlueprint::WrapNear {
             amount: NearToken::from_yoctonear(amount),
@@ -1096,9 +1095,9 @@ pub fn convert_to_nep141(
             } else {
                 vec![]
             };
-            Some((wrap, WRAP_NEAR.parse().unwrap()))
+            (wrap, WRAP_NEAR.parse().unwrap())
         }
-        TokenId::Nep141(token_id) => Some((vec![], token_id.clone())),
+        TokenId::Nep141(token_id) => (vec![], token_id.clone()),
         TokenId::Nep141OnRhea(token_id) => {
             // Rhea withdraws the whole balance for 0, so nothing is withdrawn instead
             let withdraw = if amount > 0 {
@@ -1110,14 +1109,13 @@ pub fn convert_to_nep141(
             } else {
                 vec![]
             };
-            Some((withdraw, token_id.clone()))
+            (withdraw, token_id.clone())
         }
-        TokenId::TokenOnIntearDex(AssetId::Nep245(_, _) | AssetId::Nep171(_, _)) => None,
-        TokenId::TokenOnIntearDex(AssetId::Near) => {
+        TokenId::TokenOnIntearDex(IntearAssetId::Near) => {
             let withdraw_and_wrap = if amount > 0 {
                 vec![
                     RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                        asset: IntearAsset::Near,
+                        asset: IntearAssetId::Near,
                         amount,
                         trader_account_id: trader_account_id.cloned(),
                     }),
@@ -1126,19 +1124,19 @@ pub fn convert_to_nep141(
             } else {
                 vec![]
             };
-            Some((withdraw_and_wrap, WRAP_NEAR.parse().unwrap()))
+            (withdraw_and_wrap, WRAP_NEAR.parse().unwrap())
         }
-        TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) => {
+        TokenId::TokenOnIntearDex(IntearAssetId::Nep141(token_id)) => {
             let withdraw = if amount > 0 {
                 vec![RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                    asset: IntearAsset::Nep141(token_id.clone()),
+                    asset: IntearAssetId::Nep141(token_id.clone()),
                     amount,
                     trader_account_id: trader_account_id.cloned(),
                 })]
             } else {
                 vec![]
             };
-            Some((withdraw, token_id.clone()))
+            (withdraw, token_id.clone())
         }
     }
 }
@@ -1171,17 +1169,17 @@ pub fn convert_to_native(
                 },
             })])
         }
-        TokenId::TokenOnIntearDex(AssetId::Near) => {
+        TokenId::TokenOnIntearDex(IntearAssetId::Near) => {
             Some(vec![RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::Near,
+                asset: IntearAssetId::Near,
                 amount: amount.as_yoctonear(),
                 trader_account_id: trader_account_id.cloned(),
             })])
         }
-        TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) if token_id == WRAP_NEAR => {
+        TokenId::TokenOnIntearDex(IntearAssetId::Nep141(token_id)) if token_id == WRAP_NEAR => {
             Some(vec![
                 RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                    asset: IntearAsset::Nep141(token_id.clone()),
+                    asset: IntearAssetId::Nep141(token_id.clone()),
                     amount: amount.as_yoctonear(),
                     trader_account_id: trader_account_id.cloned(),
                 }),
@@ -1190,9 +1188,7 @@ pub fn convert_to_native(
         }
         TokenId::Nep141(_)
         | TokenId::Nep141OnRhea(_)
-        | TokenId::TokenOnIntearDex(
-            AssetId::Nep141(_) | AssetId::Nep245(_, _) | AssetId::Nep171(_, _),
-        ) => None,
+        | TokenId::TokenOnIntearDex(IntearAssetId::Nep141(_)) => None,
     }
 }
 
@@ -1216,8 +1212,7 @@ pub fn deposit_storage_if_needed(
         }],
         TokenId::TokenOnIntearDex(asset_id) => vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id,
-            asset_ids: vec![IntearAsset::try_from(asset_id)
-                .expect("Routes go only through NEAR and NEP-141s on Intear DEX")],
+            asset_ids: vec![asset_id.clone()],
             fee_receivers: vec![],
         }],
     }
@@ -1244,9 +1239,8 @@ pub fn is_near(token_id: &TokenId) -> bool {
         TokenId::Nep141(token_id) => token_id == WRAP_NEAR,
         TokenId::Nep141OnRhea(token_id) => token_id == WRAP_NEAR,
         TokenId::TokenOnIntearDex(asset_id) => match asset_id {
-            AssetId::Near => true,
-            AssetId::Nep141(token_id) => token_id == WRAP_NEAR,
-            AssetId::Nep245(_, _) | AssetId::Nep171(_, _) => false,
+            IntearAssetId::Near => true,
+            IntearAssetId::Nep141(token_id) => token_id == WRAP_NEAR,
         },
     }
 }
@@ -1263,20 +1257,18 @@ impl<'de> Deserialize<'de> for BaseTokenId {
         D: serde::Deserializer<'de>,
     {
         let token_id: TokenId = serde::Deserialize::deserialize(deserializer)?;
-        base_token(&token_id).ok_or_else(|| serde::de::Error::custom("invalid token id"))
+        Ok(base_token(&token_id))
     }
 }
 
-pub fn base_token(token_id: &TokenId) -> Option<BaseTokenId> {
+pub fn base_token(token_id: &TokenId) -> BaseTokenId {
     match token_id {
-        TokenId::Near => Some(BaseTokenId::Near),
-        TokenId::Nep141(account_id) => Some(BaseTokenId::Nep141(account_id.clone())),
-        TokenId::Nep141OnRhea(account_id)
-        | TokenId::TokenOnIntearDex(AssetId::Nep141(account_id)) => {
-            Some(BaseTokenId::Nep141(account_id.clone()))
+        TokenId::Near | TokenId::TokenOnIntearDex(IntearAssetId::Near) => BaseTokenId::Near,
+        TokenId::Nep141(account_id)
+        | TokenId::Nep141OnRhea(account_id)
+        | TokenId::TokenOnIntearDex(IntearAssetId::Nep141(account_id)) => {
+            BaseTokenId::Nep141(account_id.clone())
         }
-        TokenId::TokenOnIntearDex(AssetId::Near) => Some(BaseTokenId::Near),
-        TokenId::TokenOnIntearDex(AssetId::Nep245(_, _) | AssetId::Nep171(_, _)) => None,
     }
 }
 
@@ -1289,9 +1281,8 @@ pub fn convert_to(
     if from == to {
         return vec![];
     }
-    let (Some(from_base_token), Some(to_base_token)) = (base_token(from), base_token(to)) else {
-        return vec![];
-    };
+    let from_base_token = base_token(from);
+    let to_base_token = base_token(to);
 
     // Inner balances are withdrawn to their wallet-level token before anything
     // else happens, and deposited from it at the very end, so the conversion in
@@ -1320,8 +1311,7 @@ pub fn convert_to(
         }
         TokenId::TokenOnIntearDex(asset_id) => (
             vec![RouteStep::Call(CallBlueprint::IntearDexWithdraw {
-                asset: IntearAsset::try_from(asset_id)
-                    .expect("Assets without a base token have no conversion"),
+                asset: asset_id.clone(),
                 amount,
                 trader_account_id: trader_account_id.cloned(),
             })],
@@ -1332,7 +1322,8 @@ pub fn convert_to(
 
     let received_in_wallet = match (from, &from_base_token, &to_base_token) {
         (
-            TokenId::Nep141OnRhea(token_id) | TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)),
+            TokenId::Nep141OnRhea(token_id)
+            | TokenId::TokenOnIntearDex(IntearAssetId::Nep141(token_id)),
             BaseTokenId::Nep141(_),
             _,
         ) => Some(token_id.clone()),
@@ -1360,7 +1351,7 @@ pub fn convert_to(
                 amount,
             })],
         ),
-        TokenId::TokenOnIntearDex(AssetId::Nep141(token_id)) => (
+        TokenId::TokenOnIntearDex(IntearAssetId::Nep141(token_id)) => (
             [
                 deposit_storage_if_needed(to, trader_account_id),
                 register_in_wallet,
@@ -1375,7 +1366,7 @@ pub fn convert_to(
                 amount,
             })],
         ),
-        TokenId::TokenOnIntearDex(AssetId::Near) => (
+        TokenId::TokenOnIntearDex(IntearAssetId::Near) => (
             [
                 deposit_storage_if_needed(to, trader_account_id),
                 register_in_wallet,
@@ -1387,9 +1378,6 @@ pub fn convert_to(
             })],
         ),
         TokenId::Near | TokenId::Nep141(_) => (register_in_wallet, vec![]),
-        TokenId::TokenOnIntearDex(AssetId::Nep245(_, _) | AssetId::Nep171(_, _)) => {
-            (vec![], vec![])
-        }
     };
 
     let convert = match (&from_base_token, &to_base_token) {

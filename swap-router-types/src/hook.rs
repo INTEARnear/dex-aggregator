@@ -46,7 +46,7 @@ pub struct HookInput<'a> {
     pub swap_request: Cow<'a, SwapRequest>,
     pub trade: Cow<'a, IntearDexTrade>,
     pub block_height: BlockHeight,
-    /// The quotes of the other DEXes and earlier hooks, best first
+    /// The quotes of the other DEXes, best first
     pub quotes: Cow<'a, [Quote]>,
 }
 

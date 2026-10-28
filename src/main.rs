@@ -179,6 +179,14 @@ fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
         ));
     }
 
+    let unknown_hook = request.dexes.iter().flatten().find(|dex_id| {
+        matches!(dex_id, DexId::Hook(_))
+            && !hooks::loaded().iter().any(|hook| hook.dex_id() == **dex_id)
+    });
+    if let Some(dex_id) = unknown_hook {
+        return Err((StatusCode::BAD_REQUEST, format!("Invalid dex id: {dex_id}")));
+    }
+
     Ok(())
 }
 
@@ -453,8 +461,8 @@ fn sort_quotes(request: &SwapRequest, quotes: &mut [Quote]) {
         Amount::AmountIn(_) => &request.token_out,
         Amount::AmountOut(_) => &request.token_in,
     };
-    let prices_raw = price_raw(&Mainnet, &BaseTokenId::Near)
-        .zip(price_raw(&Mainnet, &base_token(quoted_token).unwrap()));
+    let prices_raw =
+        price_raw(&Mainnet, &BaseTokenId::Near).zip(price_raw(&Mainnet, &base_token(quoted_token)));
     if prices_raw.is_none() {
         info!(
             "No price to weigh the costs of routes against their amounts, comparing amounts only"

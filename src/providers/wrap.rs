@@ -16,8 +16,8 @@ impl Provider for WrapProvider {
         request: SwapRequest,
     ) -> Pin<Box<dyn Future<Output = Option<RouteBlueprint>> + Send>> {
         Box::pin(async move {
-            let (_, nep141_in) = convert_to_nep141(&request.token_in, None, 0)?;
-            let (_, nep141_out) = convert_to_nep141(&request.token_out, None, 0)?;
+            let (_, nep141_in) = convert_to_nep141(&request.token_in, None, 0);
+            let (_, nep141_out) = convert_to_nep141(&request.token_out, None, 0);
 
             if nep141_in == nep141_out {
                 // Identity: fee-free conversion is handled in main.rs
