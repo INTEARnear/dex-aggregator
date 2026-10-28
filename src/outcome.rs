@@ -24,7 +24,7 @@ use intear_dex_types::AssetId;
 use crate::{
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
     providers::{rhea::RHEA_CONTRACT_ID, rhea_dcl::RHEA_DCL_CONTRACT_ID},
-    route::merge_transactions,
+    route::{into_transactions, resolve_steps},
     shared_utils::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
         RPC_CLIENT, RPC_URLS, WRAP_NEAR,
@@ -986,12 +986,14 @@ async fn outcome_of(
             if location == target || change <= 0 {
                 continue;
             }
-            let conversion = convert_to(
+            let conversion = resolve_steps(
                 network,
-                location,
-                target,
-                change.unsigned_abs(),
-                Some(trader_account_id.clone()),
+                convert_to(
+                    location,
+                    target,
+                    change.unsigned_abs(),
+                    Some(trader_account_id),
+                ),
             )
             .await
             .ok_or_else(|| {
@@ -1022,10 +1024,7 @@ async fn outcome_of(
             .filter(|(_, change)| *change != 0)
             .map(|(token, change)| BalanceChange { token, change })
             .collect(),
-        next_steps: merge_transactions(next_steps)
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        next_steps: into_transactions(next_steps, false),
         error,
         settled: true,
     })

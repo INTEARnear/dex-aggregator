@@ -33,14 +33,14 @@ use swap_router_types::{
 use crate::{
     hooks::inteardex::IntearDexSwap,
     rate_limit::{ClientIp, RateLimiter},
-    route::{fee_transactions_amount, merge_transactions, storage_deposits, ProviderRoute},
+    route::{resolve, ResolvedRoute, RouteBlueprint},
     shared_utils::{
         base_token, convert_to, final_block_hash, price_raw, BaseTokenId, Mainnet, NetworkView,
         RPC_CLIENT,
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
-        Amount, DexId, Gas, OutcomeRequest, Quote, Route, SigningContext, Slippage, SwapOutcome,
+        Amount, DexId, OutcomeRequest, Quote, Route, SigningContext, Slippage, SwapOutcome,
         SwapRequest,
     },
 };
@@ -48,6 +48,7 @@ use crate::{
 static ACCESS_KEY_RPC_CLIENT: LazyLock<RpcClient> =
     LazyLock::new(|| RPC_CLIENT.clone().with_max_retries(3));
 
+mod calls;
 mod hooks;
 mod outcome;
 mod providers;
@@ -61,7 +62,7 @@ pub trait Provider: Sync {
     fn route(
         &self,
         request: SwapRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<ProviderRoute>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Option<RouteBlueprint>> + Send>>;
 
     fn dex_id(&self) -> DexId;
 }
@@ -247,17 +248,22 @@ async fn find_routes(
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
         .unzip();
+    let resolved_routes = futures_util::future::join_all(routes.into_iter().map(|route| async {
+        match route {
+            Some(route) => Some(resolve_route(request, route).await),
+            None => None,
+        }
+    }))
+    .await;
     let mut quotes = Vec::new();
-    for (stats, route) in route_stats.iter_mut().zip(routes) {
-        let Some(route) = route else {
-            continue;
-        };
-        match finish_route(request, route).await {
-            Some(route) => quotes.push(quote_of_route(route, signing.clone())),
-            None => {
+    for (stats, resolved_route) in route_stats.iter_mut().zip(resolved_routes) {
+        match resolved_route {
+            Some(Some(route)) => quotes.push(quote_of_route(route, signing.clone())),
+            Some(None) => {
                 stats.outcome = RouteOutcome::NotFound;
                 stats.estimated_amount = None;
             }
+            None => {}
         }
     }
     sort_quotes(request, &mut quotes);
@@ -274,7 +280,7 @@ async fn find_routes(
             .current_block_height()
             .inspect_err(|err| tracing::warn!("No block height for hooks: {err}"))
             .ok();
-        let trade = hooks::inteardex::trade_of_request(&Mainnet, request).await;
+        let trade = hooks::inteardex::trade_of_request(&Mainnet, request);
         if let (Some(block_height), Some(trade)) = (block_height, trade) {
             Some((trade, block_height))
         } else {
@@ -354,13 +360,18 @@ async fn intear_dex_quotes(
     swaps: Vec<IntearDexSwap>,
     signing: &Option<SigningContext>,
 ) -> (RouteOutcome, Vec<Quote>) {
-    let (mut outcome, routes) = hooks::routes(dex_id, request, trade, swaps).await;
-    let mut quotes = Vec::new();
-    for route in routes {
-        if let Some(route) = finish_route(request, route).await {
-            quotes.push(quote_of_route(route, signing.clone()));
-        }
-    }
+    let (mut outcome, routes) = hooks::routes(dex_id, request, trade, swaps);
+    let resolved_routes = futures_util::future::join_all(
+        routes
+            .into_iter()
+            .map(|route| resolve_route(request, route)),
+    )
+    .await;
+    let mut quotes = resolved_routes
+        .into_iter()
+        .flatten()
+        .map(|route| quote_of_route(route, signing.clone()))
+        .collect::<Vec<_>>();
     if matches!(outcome, RouteOutcome::Found) && quotes.is_empty() {
         outcome = RouteOutcome::NotFound;
     }
@@ -374,9 +385,9 @@ fn estimated_amount_of(quote: &Quote) -> u128 {
     }
 }
 
-/// The route with its output converted to the requested token location, and its fee transactions
-/// last. None if there's no conversion for the output.
-async fn finish_route(request: &SwapRequest, mut route: ProviderRoute) -> Option<ProviderRoute> {
+/// The route with its output converted to the requested token location, and what its steps need
+/// found out. None if that can't be found out.
+async fn resolve_route(request: &SwapRequest, mut route: RouteBlueprint) -> Option<ResolvedRoute> {
     let amount_out = match (
         request.amount,
         route.estimated_amount,
@@ -397,57 +408,40 @@ async fn finish_route(request: &SwapRequest, mut route: ProviderRoute) -> Option
             "Converting from {:?} to {:?} with amount {}",
             route.token_output, request.token_out, amount_out
         );
-        let conversion = convert_to(
-            &Mainnet,
+        route.steps.extend(convert_to(
             &route.token_output,
             &request.token_out,
             amount_out,
-            request.trader_account_id.clone(),
-        )
-        .await;
-        let Some(conversion) = conversion else {
-            error!(
-                "No conversion of the {} route from {} to {}, leaving it out",
-                route.dex_id, route.token_output, request.token_out
-            );
-            return None;
-        };
-        route.transactions.extend(conversion);
+            request.trader_account_id.as_ref(),
+        ));
         route.token_output = request.token_out.clone();
     }
-    // Fee transactions go last, after the output conversion too, so the swap doesn't wait
-    // for fees.
-    let (fee_transactions, swap_transactions): (Vec<_>, Vec<_>) = route
-        .transactions
-        .drain(..)
-        .partition(|transaction| transaction.is_fee_transaction);
-    route.transactions = merge_transactions([swap_transactions, fee_transactions].concat());
-    Some(route)
+    let dex_id = route.dex_id.clone();
+    let resolved_route = resolve(&Mainnet, route).await;
+    if resolved_route.is_none() {
+        info!("What the steps of the {dex_id} route need couldn't be found out, leaving it out");
+    }
+    resolved_route
 }
 
-fn quote_of_route(route: ProviderRoute, signing: Option<SigningContext>) -> Quote {
-    let gas = route
-        .transactions
-        .iter()
-        .flat_map(|transaction| &transaction.calls)
-        .map(|call| call.gas)
-        .sum::<Gas>();
+fn quote_of_route(route: ResolvedRoute, signing: Option<SigningContext>) -> Quote {
+    let gas = route.gas();
     Quote {
         estimated_max_gas_cost: pathfinder::MIN_GAS_PRICE
             .saturating_mul(gas.needs_attached.as_gas().into()),
         estimated_gas_usage: pathfinder::MIN_GAS_PRICE
             .saturating_mul(gas.estimated_burn.as_gas().into()),
-        storage_deposits: storage_deposits(&route.transactions),
-        fee_amount: fee_transactions_amount(&route.transactions),
+        storage_deposits: route.storage_deposits(),
+        fee_amount: route.fee_amount(),
         signing,
         route: Route {
             estimated_amount: route.estimated_amount,
             worst_case_amount: route.worst_case_amount,
-            dex_id: route.dex_id,
-            execution_instructions: route.transactions.into_iter().map(Into::into).collect(),
-            deprecated_needs_unwrap_always_false: false,
-            token_output: route.token_output,
+            dex_id: route.dex_id.clone(),
+            token_output: route.token_output.clone(),
             discount: route.discount,
+            deprecated_needs_unwrap_always_false: false,
+            execution_instructions: route.into_execution_instructions(),
         },
     }
 }

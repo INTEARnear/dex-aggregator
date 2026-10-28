@@ -7,7 +7,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{ErrorKind, Write},
     net::IpAddr,
-    panic::AssertUnwindSafe,
+    panic::{catch_unwind, AssertUnwindSafe},
     path::Path,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,7 +15,6 @@ use std::{
 
 use axum::http::{HeaderMap, Uri};
 use bigdecimal::BigDecimal;
-use futures_util::FutureExt;
 use intear_dex_types::AssetId;
 use libloading::Library;
 use near_min_api::types::{AccountId, BlockHeight};
@@ -31,8 +30,8 @@ use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::{
-    route::ProviderRoute,
-    shared_utils::{BaseTokenId, Mainnet, NetworkView, TOKEN_INFOS_REFRESH_INTERVAL},
+    route::RouteBlueprint,
+    shared_utils::{BaseTokenId, NetworkView, TOKEN_INFOS_REFRESH_INTERVAL},
     stats::RouteOutcome,
     types::Quote,
     Amount, DexId, SwapRequest,
@@ -40,7 +39,6 @@ use crate::{
 
 const HOOK_DIRECTORY: &str = "hooks";
 const HOOK_TIMES_FILE: &str = "hook-times.txt";
-const ROUTE_TIMEOUT: Duration = Duration::from_millis(60_000);
 const MAX_CALLS_RUNNING: usize = 64;
 
 type InitFunction = unsafe extern "C" fn() -> *mut c_char;
@@ -286,27 +284,22 @@ impl Hook {
 }
 
 /// The routes of the swaps for the Intear DEX trade of the request, and how building them went
-pub async fn routes(
+pub fn routes(
     dex_id: DexId,
     request: &SwapRequest,
     trade: &IntearDexTrade,
     swaps: Vec<inteardex::IntearDexSwap>,
-) -> (RouteOutcome, Vec<ProviderRoute>) {
-    let routes = AssertUnwindSafe(async {
-        let mut routes = Vec::new();
-        for swap in swaps {
-            routes.extend(inteardex::route(&Mainnet, dex_id.clone(), request, trade, swap).await);
-        }
-        routes
-    })
-    .catch_unwind();
-    tokio::select! {
-        routes = routes => match routes {
-            Ok(routes) if routes.is_empty() => (RouteOutcome::NotFound, routes),
-            Ok(routes) => (RouteOutcome::Found, routes),
-            Err(_) => (RouteOutcome::Panicked, vec![]),
-        },
-        _ = tokio::time::sleep(ROUTE_TIMEOUT) => (RouteOutcome::TimedOut, vec![]),
+) -> (RouteOutcome, Vec<RouteBlueprint>) {
+    let routes = catch_unwind(AssertUnwindSafe(|| {
+        swaps
+            .into_iter()
+            .filter_map(|swap| inteardex::route(dex_id.clone(), request, trade, swap))
+            .collect::<Vec<_>>()
+    }));
+    match routes {
+        Ok(routes) if routes.is_empty() => (RouteOutcome::NotFound, routes),
+        Ok(routes) => (RouteOutcome::Found, routes),
+        Err(_) => (RouteOutcome::Panicked, vec![]),
     }
 }
 
