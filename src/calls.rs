@@ -214,10 +214,43 @@ pub enum IntearDexWithdrawAmount {
 }
 
 /// Burns `ft_transfer_call` and `ft_resolve_transfer` with the fees of `ft_on_transfer`, and needs
-/// attached what the token keeps, `ft_on_transfer` gets the rest
-const FT_TRANSFER_CALL_GAS: Gas = Gas::from_ggas(5_400, 31_000);
+/// attached what the token keeps, `ft_on_transfer` gets the rest. Simulated on mainnet state for a
+/// token of each contract code, tokens keep 9 to 47 (linear-protocol.near) Tgas.
+fn ft_transfer_call_gas(token_id: &AccountId) -> Gas {
+    let estimated_burn = match token_id.as_str() {
+        "meta-pool.near" => 20_600,
+        "linear-protocol.near" => 6_800,
+        _ => 5_400,
+    };
+    Gas::from_ggas(estimated_burn, 50_000)
+}
+
+/// Registering an account, simulated on mainnet state for a token of each contract code, burns 1.4
+/// to 9.4 (meta-pool.near) Tgas
+fn storage_deposit_gas(token_id: &AccountId) -> Gas {
+    let estimated_burn = match token_id.as_str() {
+        "meta-pool.near" => 9_900,
+        _ => 2_300,
+    };
+    Gas::from_ggas(estimated_burn, 20_000)
+}
+
+/// `ft_transfer`, simulated on mainnet state for a token of each contract code, burns 1.5 to 9.4
+/// (meta-pool.near) Tgas
+fn ft_transfer_gas(token_id: &AccountId) -> Gas {
+    let estimated_burn = match token_id.as_str() {
+        "meta-pool.near" => 9_700,
+        _ => 2_000,
+    };
+    Gas::from_ggas(estimated_burn, 20_000)
+}
+
 /// Not burnt, attached so a call doesn't run out of gas when it burns more than estimated
 const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
+/// Intear DEX runs DEXes in an interpreter, simulated Plach swaps burnt up to 2.6 Tgas more than
+/// estimated
+const INTEAR_DEX_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
+const INTEAR_DEX_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Under what a transaction can attach, with room for the other calls in it
 const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 
@@ -260,50 +293,56 @@ impl CallBlueprint {
     /// Source: sandbox on mainnet state. What's attached is capped at [`MAX_CALL_GAS`].
     pub fn gas(&self) -> Gas {
         let gas = match self {
-            CallBlueprint::Nep141StorageDeposit { .. } => Gas::from_ggas(2_300, 11_000),
-            CallBlueprint::Nep141DepositOnRhea { .. } => {
-                FT_TRANSFER_CALL_GAS + Gas::from_ggas(2_890, 2_500)
+            CallBlueprint::Nep141StorageDeposit { token_id, .. } => storage_deposit_gas(token_id),
+            CallBlueprint::Nep141DepositOnRhea { token_id, .. } => {
+                ft_transfer_call_gas(token_id) + Gas::from_ggas(2_890, 2_500)
             }
-            CallBlueprint::Nep141DepositOnIntearDex { .. } => {
-                FT_TRANSFER_CALL_GAS + Gas::from_ggas(3_670, 3_300)
+            CallBlueprint::Nep141DepositOnIntearDex { token_id, .. } => {
+                ft_transfer_call_gas(token_id) + Gas::from_ggas(3_670, 3_300)
             }
             CallBlueprint::WrapNear { .. } => Gas::from_ggas(1_700, 2_500),
             CallBlueprint::UnwrapNear {
                 trader_account_id, ..
             } => Gas::from_ggas(1_900, 2_500) + near_receive_gas(trader_account_id.as_ref()),
             CallBlueprint::InputNep141TransferCallRheaSwap {
-                swap_gas, output, ..
+                token_id,
+                actions,
+                swap_gas,
+                output,
+                ..
             } => {
-                FT_TRANSFER_CALL_GAS
+                let token_out = &actions.last().expect("Swaps have actions").token_out;
+                ft_transfer_call_gas(token_id)
                     + Gas::from_ggas(3_600, 3_600)
                     + *swap_gas
-                    + rhea_output_gas(output)
+                    + rhea_output_gas(output, token_out)
                     + GAS_MARGIN
             }
             CallBlueprint::InputNep141TransferCallRheaDclSwap {
-                swap_gas, output, ..
+                token_id,
+                token_out,
+                swap_gas,
+                output,
+                ..
             } => {
                 // DCL reserves the same gas for sending either output
-                let output_burn = match output {
-                    RheaOutput::Nep141 => NearGas::from_ggas(4_360),
-                    RheaOutput::Near { trader_account_id } => NearGas::from_gas(
-                        NearGas::from_ggas(5_160).as_gas()
-                            + near_receive_gas(trader_account_id.as_ref())
-                                .estimated_burn
-                                .as_gas(),
-                    ),
-                };
-                FT_TRANSFER_CALL_GAS
-                    + *swap_gas
-                    + Gas {
-                        estimated_burn: output_burn,
-                        needs_attached: NearGas::from_ggas(31_800),
+                let output_gas = match output {
+                    RheaOutput::Nep141 => {
+                        Gas::from_ggas(2_360, 31_800) + burn_only(ft_transfer_gas(token_out))
                     }
+                    RheaOutput::Near { trader_account_id } => {
+                        Gas::from_ggas(5_160, 31_800)
+                            + burn_only(near_receive_gas(trader_account_id.as_ref()))
+                    }
+                };
+                ft_transfer_call_gas(token_id) + *swap_gas + output_gas
             }
-            CallBlueprint::InputNep141TransferCallIntearDex { operations, .. } => {
-                FT_TRANSFER_CALL_GAS + Gas::from_ggas(2_600, 2_600) + operations.gas()
-            }
-            CallBlueprint::InputNep141FeeTransfer { .. } => Gas::from_ggas(2_000, 10_000),
+            CallBlueprint::InputNep141TransferCallIntearDex {
+                token_id,
+                operations,
+                ..
+            } => ft_transfer_call_gas(token_id) + Gas::from_ggas(2_600, 2_600) + operations.gas(),
+            CallBlueprint::InputNep141FeeTransfer { token_id, .. } => ft_transfer_gas(token_id),
             CallBlueprint::RheaStorageDeposit { .. } => Gas::from_ggas(2_610, 3_000),
             CallBlueprint::RheaRegisterTokens { token_ids } => {
                 Gas::from_ggas(2_500, 3_000) + Gas::from_ggas(500, 500) * token_ids.len() as u64
@@ -312,9 +351,9 @@ impl CallBlueprint {
                 Gas::from_ggas(2_800, 2_800) + *swap_gas + GAS_MARGIN
             }
             CallBlueprint::InputRheaFeeMftTransfer { .. } => Gas::from_ggas(3_590, 4_000),
-            CallBlueprint::RheaWithdraw { output, .. } => {
-                Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output)
-            }
+            CallBlueprint::RheaWithdraw {
+                token_id, output, ..
+            } => Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output, token_id),
             CallBlueprint::RheaDclStorageDeposit { .. } => Gas::from_ggas(3_000, 4_000),
             CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(3_080, 3_500),
             CallBlueprint::IntearDexRegisterAssets { asset_ids, .. } => {
@@ -674,14 +713,14 @@ impl IntearDexOperations {
     fn gas(&self) -> Gas {
         let swap_options = &self.swap.options;
         // The first option usually fills the swap, the engine tries the others until one does
+        let all_options_gas = swap_options
+            .iter()
+            .map(|option| option.gas)
+            .sum::<Gas>()
+            .with_margin(INTEAR_DEX_SWAP_MARGIN, INTEAR_DEX_SWAP_MARGIN_PERCENT);
         let swap_gas = Gas {
             estimated_burn: swap_options[0].gas.estimated_burn,
-            needs_attached: NearGas::from_gas(
-                swap_options
-                    .iter()
-                    .map(|option| option.gas.needs_attached.as_gas())
-                    .sum(),
-            ),
+            needs_attached: all_options_gas.needs_attached,
         };
         let withdrawals_gas = self
             .withdrawals
@@ -777,17 +816,21 @@ fn rhea_actions_json(actions: &[RheaSwapAction]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Of Rhea sending a token out of the signer's balance
-fn rhea_output_gas(output: &RheaOutput) -> Gas {
+/// Of a call that a contract attaches its own gas to, so only what it burns counts
+fn burn_only(gas: Gas) -> Gas {
+    Gas {
+        estimated_burn: gas.estimated_burn,
+        needs_attached: NearGas::from_gas(0),
+    }
+}
+
+/// Of Rhea sending `token_id` out of the signer's balance
+fn rhea_output_gas(output: &RheaOutput, token_id: &AccountId) -> Gas {
     match output {
-        RheaOutput::Nep141 => Gas::from_ggas(4_200, 26_800),
+        RheaOutput::Nep141 => Gas::from_ggas(2_200, 26_800) + burn_only(ft_transfer_gas(token_id)),
         // Rhea attaches no gas to the transfer of NEAR
         RheaOutput::Near { trader_account_id } => {
-            Gas::from_ggas(4_600, 31_800)
-                + Gas {
-                    estimated_burn: near_receive_gas(trader_account_id.as_ref()).estimated_burn,
-                    needs_attached: NearGas::from_gas(0),
-                }
+            Gas::from_ggas(4_600, 31_800) + burn_only(near_receive_gas(trader_account_id.as_ref()))
         }
     }
 }
@@ -796,7 +839,10 @@ fn rhea_output_gas(output: &RheaOutput) -> Gas {
 fn intear_dex_sending_out_gas(asset: &IntearAssetId, trader_account_id: Option<&AccountId>) -> Gas {
     match asset {
         IntearAssetId::Near => Gas::from_ggas(2_900, 5_900) + near_receive_gas(trader_account_id),
-        IntearAssetId::Nep141(_) => Gas::from_ggas(4_900, 16_800),
+        // The DEX attaches 10 Tgas to ft_transfer
+        IntearAssetId::Nep141(token_id) => {
+            Gas::from_ggas(2_900, 16_800) + burn_only(ft_transfer_gas(token_id))
+        }
     }
 }
 
@@ -945,14 +991,14 @@ mod tests {
         };
         assert_eq!(
             rhea_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(18_700, 69_900)
+            Gas::from_ggas(18_700, 88_900)
         );
         assert_eq!(
             rhea_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
             .gas(),
-            gas(19_323_182_562_500, 74_900_000_000_000)
+            gas(19_323_182_562_500, 93_900_000_000_000)
         );
         assert_eq!(
             CallBlueprint::RheaSwap {
@@ -976,14 +1022,14 @@ mod tests {
         };
         assert_eq!(
             rhea_dcl_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(29_760, 82_800)
+            Gas::from_ggas(29_760, 101_800)
         );
         assert_eq!(
             rhea_dcl_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
             .gas(),
-            gas(30_783_182_562_500, 82_800_000_000_000)
+            gas(30_783_182_562_500, 101_800_000_000_000)
         );
 
         assert_eq!(
@@ -992,7 +1038,7 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft()])),
             }
             .gas(),
-            Gas::from_ggas(43_000, 57_900)
+            Gas::from_ggas(43_000, 67_000)
         );
         assert_eq!(
             CallBlueprint::IntearDexDepositNear {
@@ -1000,14 +1046,14 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft(), withdraw_near()])),
             }
             .gas(),
-            gas(46_623_182_562_500, 64_523_182_562_500)
+            gas(46_623_182_562_500, 73_623_182_562_500)
         );
         assert_eq!(
             CallBlueprint::IntearDexExecuteOperations {
                 operations: intear_operations(vec![]),
             }
             .gas(),
-            Gas::from_ggas(37_600, 40_600)
+            Gas::from_ggas(37_600, 49_700)
         );
         assert_eq!(
             CallBlueprint::InputNep141TransferCallIntearDex {
@@ -1016,7 +1062,7 @@ mod tests {
                 operations: intear_operations(vec![withdraw_near()]),
             }
             .gas(),
-            gas(45_623_182_562_500, 77_223_182_562_500)
+            gas(45_623_182_562_500, 105_323_182_562_500)
         );
     }
 

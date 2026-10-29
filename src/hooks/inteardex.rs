@@ -653,11 +653,12 @@ mod tests {
         (serde_json::from_slice(&function_call.args).unwrap(), gas)
     }
 
-    /// Gas attached to swap on DEXes that need `swap_attached` with `deposit_near`, and withdraw a
-    /// NEP-141
-    fn attached_gas(swap_attached: NearGas) -> NearGas {
+    /// Gas attached to swap on DEXes that need `swap_attached` with `deposit_near`, which burn
+    /// `swaps_burn` together, and withdraw a NEP-141
+    fn attached_gas(swap_attached: NearGas, swaps_burn: NearGas) -> NearGas {
         let engine_and_withdrawal = NearGas::from_ggas(3_600 + 500 + 16_800 + 3_000);
-        NearGas::from_gas(engine_and_withdrawal.as_gas() + swap_attached.as_gas())
+        let swap_margin = NearGas::from_tgas(4).as_gas() + swaps_burn.as_gas() * 15 / 100;
+        NearGas::from_gas(engine_and_withdrawal.as_gas() + swap_attached.as_gas() + swap_margin)
     }
 
     /// The operations of the route's swap from NEAR, and the gas attached to them
@@ -705,7 +706,10 @@ mod tests {
             "79"
         );
         // Enough to try both
-        assert_eq!(gas, attached_gas(NearGas::from_tgas(44 + 37)));
+        assert_eq!(
+            gas,
+            attached_gas(NearGas::from_tgas(44 + 37), NearGas::from_tgas(34 + 27))
+        );
     }
 
     #[test]
@@ -735,7 +739,10 @@ mod tests {
             "slimedragon.near/otc"
         );
         assert_eq!(operations[0]["SwapSimple"]["constraint"], "82");
-        assert_eq!(gas, attached_gas(NearGas::from_tgas(37)));
+        assert_eq!(
+            gas,
+            attached_gas(NearGas::from_tgas(37), NearGas::from_tgas(27))
+        );
     }
 
     /// Pins the JSON the engine reads

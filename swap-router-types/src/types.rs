@@ -30,6 +30,19 @@ impl Gas {
     pub fn attached(self) -> near_min_api::types::Gas {
         near_min_api::types::Gas(self.needs_attached)
     }
+
+    /// Attaches `fixed` and `percent_of_burn` of the estimated burn more, for a DEX that can burn
+    /// more than estimated
+    pub fn with_margin(self, fixed: NearGas, percent_of_burn: u64) -> Self {
+        Self {
+            estimated_burn: self.estimated_burn,
+            needs_attached: NearGas::from_gas(
+                self.needs_attached.as_gas()
+                    + fixed.as_gas()
+                    + self.estimated_burn.as_gas() * percent_of_burn / 100,
+            ),
+        }
+    }
 }
 
 impl std::ops::Add for Gas {

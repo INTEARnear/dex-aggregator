@@ -7,7 +7,7 @@ pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight};
+use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas};
 use near_min_api::utils::dec_format;
 use smallvec::SmallVec;
 use std::panic::AssertUnwindSafe;
@@ -502,12 +502,15 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-const HOP_GAS: Gas = Gas::from_ggas(2_600, 2_600);
+// Source: routes simulated on mainnet state with INTEAR_simulate_transactions
+const HOP_GAS: Gas = Gas::from_ggas(2_900, 2_900);
 const STABLE_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_000, 1_000);
-const RATED_POOL_GAS: Gas = Gas::from_ggas(200, 200);
-const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_600, 1_600);
-const DEGEN_POOL_GAS: Gas = Gas::from_ggas(3_500, 3_500);
-const DEGEN_POOL_TOKEN_GAS: Gas = Gas::from_ggas(250, 250);
+const RATED_POOL_GAS: Gas = Gas::from_ggas(2_400, 2_400);
+const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_000, 1_000);
+const DEGEN_POOL_GAS: Gas = Gas::from_ggas(3_600, 3_600);
+/// Simulated swaps burnt up to 3.5 Tgas more than estimated
+const GAS_MARGIN: NearGas = NearGas::from_tgas(4);
+const GAS_MARGIN_PERCENT: u64 = 15;
 
 impl Pool {
     fn hop_gas(&self) -> Gas {
@@ -519,9 +522,7 @@ impl Pool {
             PoolDetailInfo::RatedPoolInfo(info) => {
                 RATED_POOL_GAS + RATED_POOL_TOKEN_GAS * info.c_amounts.len() as u64
             }
-            PoolDetailInfo::DegenPoolInfo(info) => {
-                DEGEN_POOL_GAS + DEGEN_POOL_TOKEN_GAS * info.c_amounts.len() as u64
-            }
+            PoolDetailInfo::DegenPoolInfo(_) => DEGEN_POOL_GAS,
         }
     }
 }
@@ -532,7 +533,8 @@ fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> Gas {
         .iter()
         .flat_map(|part| &part.route.hops)
         .map(|hop| graph.pools()[hop.pool].hop_gas())
-        .sum()
+        .sum::<Gas>()
+        .with_margin(GAS_MARGIN, GAS_MARGIN_PERCENT)
 }
 
 fn exact_in_response(

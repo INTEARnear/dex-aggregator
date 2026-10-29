@@ -6,7 +6,7 @@ pub use self::storage::watch;
 
 use bigdecimal::BigDecimal;
 use lazy_static::lazy_static;
-use near_min_api::types::{AccountId, Balance, BlockHeight, U128};
+use near_min_api::types::{AccountId, Balance, BlockHeight, NearGas, U128};
 use near_min_api::utils::dec_format;
 use ruint::aliases::U256;
 use std::collections::HashSet;
@@ -317,12 +317,17 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     )?)
 }
 
-const SWAP_GAS: Gas = Gas::from_ggas(7_000, 7_000);
+// Source of SWAP_GAS and HOP_GAS: routes simulated on mainnet state with INTEAR_simulate_transactions
+const SWAP_GAS: Gas = Gas::from_ggas(3_000, 3_000);
+const HOP_GAS: Gas = Gas::from_ggas(7_000, 7_000);
 const RANGE_GAS: Gas = Gas::from_ggas(3_000, 3_000);
 const CROSSING_GAS: Gas = Gas::from_ggas(500, 500);
 const ORDER_GAS: Gas = Gas::from_ggas(4_000, 4_000);
 const BITMAP_WORD_GAS: Gas = Gas::from_ggas(50, 50);
-const GAS_MARGIN: Gas = Gas::from_ggas(0, 6_000);
+/// Simulated swaps burnt up to 3.9 Tgas more than estimated, and the estimate can't see what
+/// the amount changes, small ones burn up to half of it
+const GAS_MARGIN: NearGas = NearGas::from_tgas(8);
+const GAS_MARGIN_PERCENT: u64 = 30;
 
 fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> Gas {
     let work = route
@@ -335,12 +340,13 @@ fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> Gas {
             orders: total.orders + work.orders,
             words: total.words + work.words,
         });
-    SWAP_GAS
+    (SWAP_GAS
+        + HOP_GAS * route.hops.len() as u64
         + RANGE_GAS * work.ranges
         + CROSSING_GAS * work.crossings
         + ORDER_GAS * work.orders
-        + BITMAP_WORD_GAS * work.words
-        + GAS_MARGIN
+        + BITMAP_WORD_GAS * work.words)
+        .with_margin(GAS_MARGIN, GAS_MARGIN_PERCENT)
 }
 
 fn to_api_response(
@@ -446,7 +452,7 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            RANGE_GAS.estimated_burn,
+            (HOP_GAS + RANGE_GAS).estimated_burn,
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,
