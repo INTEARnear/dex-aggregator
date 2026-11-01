@@ -17,7 +17,7 @@ use swap_router_types::{
     indexed::{AccountState, Watch},
     types::Amount,
 };
-use xyk_dex_types::{FeeDiscount, SwapArgs, SwapRoute};
+use xyk_dex_types::{FeeDiscount, PoolId, RouteFraction, SwapArgs, SwapRoute};
 
 use crate::{
     fee_discount::{FEE_DISCOUNT_VALIDITY_BLOCKS, FeeDiscounter, tear_fee_discount},
@@ -117,12 +117,12 @@ impl Plach {
             slippage: trade.slippage.clone(),
             near_price_raw,
             quoted_token_price_raw,
-            fee_discount: fee_discount.unwrap_or(0),
+            fee_discount,
         })
         .ok()?;
 
         let swap_route = |split_fraction, pool_ids| SwapRoute {
-            fraction: split_fraction,
+            fraction: RouteFraction::new(split_fraction),
             pool_ids,
         };
         // `dex_amount` is what the DEX swaps
@@ -141,7 +141,11 @@ impl Plach {
                         .map(|route| {
                             swap_route(
                                 route.split_fraction,
-                                route.pools.iter().map(|step| step.pool_id).collect(),
+                                route
+                                    .pools
+                                    .iter()
+                                    .map(|step| PoolId::new(step.pool_id))
+                                    .collect(),
                             )
                         })
                         .collect::<Vec<_>>(),
@@ -165,7 +169,11 @@ impl Plach {
                         .map(|route| {
                             swap_route(
                                 route.split_fraction,
-                                route.pools.iter().map(|step| step.pool_id).collect(),
+                                route
+                                    .pools
+                                    .iter()
+                                    .map(|step| PoolId::new(step.pool_id))
+                                    .collect(),
                             )
                         })
                         .collect(),
@@ -213,7 +221,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use swap_router_types::types::Gas;
     use tokio::sync::mpsc::UnboundedReceiver;
-    use xyk_dex_types::{FULL_SPLIT_FRACTION, SignedFeeDiscount};
+    use xyk_dex_types::{FULL_ROUTE_FRACTION, SignedFeeDiscount};
 
     use super::*;
     use crate::fee_discount::fee_discount_signature_payload;
@@ -257,10 +265,10 @@ mod tests {
         let QuoteAmount::ExactIn(amount_in) = request.amount else {
             panic!("Exact in");
         };
-        let discount = if request.fee_discount == 0 { 0 } else { 5 };
+        let discount = if request.fee_discount.is_some() { 5 } else { 0 };
         Ok(SplitRouteApiResponse::ExactIn {
             routes: vec![plach::ExactInRoute {
-                split_fraction: FULL_SPLIT_FRACTION,
+                split_fraction: FULL_ROUTE_FRACTION.get(),
                 pools: vec![plach::ExactInPoolStep {
                     pool_id: 1,
                     token_in: request.token_in.clone(),
@@ -291,7 +299,7 @@ mod tests {
         assert_eq!(quote.gas, Gas::from_ggas(25_000, 28_000));
         assert_eq!(quote.discount, None);
         let swap_args: SwapArgs = borsh::from_slice(&quote.message.0).unwrap();
-        assert_eq!(swap_args.routes[0].pool_ids, vec![1]);
+        assert_eq!(swap_args.routes[0].pool_ids, vec![PoolId::new(1)]);
         assert!(swap_args.fee_discount.is_none());
     }
 
@@ -331,7 +339,7 @@ mod tests {
         assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
         assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
         assert_eq!(discount.amount, SwapRequestAmount::ExactIn(U128(100)));
-        assert_eq!(discount.fee_discount, 250_000);
+        assert_eq!(discount.fee_discount.get(), 250_000);
         assert_eq!(discount.expiration_block_height, 1_001_000);
         assert!(
             Signature::from_parts(KeyType::ED25519, &signature)

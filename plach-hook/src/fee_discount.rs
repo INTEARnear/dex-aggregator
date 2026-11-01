@@ -4,7 +4,7 @@ use near_min_api::types::{
 };
 use sha2::{Digest, Sha256};
 use xyk_dex_types::{
-    FULL_FEE_FRACTION_FRACTION, FeeDiscount, FeeDiscountSignaturePayload, FeeFractionFraction,
+    FULL_FEE_DISCOUNT, FeeDiscount, FeeDiscountFraction, FeeDiscountSignaturePayload,
     SignedFeeDiscount,
 };
 
@@ -14,17 +14,29 @@ pub const TEAR_TOKEN_ID: &str = "token.intear.near";
 pub const TEAR_STAKING_CONTRACT_ID: &str = "stakeyourtears.intear.near";
 const ONE_TEAR: Balance = 10u128.pow(24);
 
-const TEAR_FEE_DISCOUNTS: [(Balance, FeeFractionFraction); 3] = [
-    (100_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION * 3 / 4), // 100,000 = 75% discount
-    (1_000 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 4),       // 1,000 = 25% discount
-    (10 * ONE_TEAR, FULL_FEE_FRACTION_FRACTION / 10),         // 10 = 10% discount
+const TEAR_FEE_DISCOUNTS: [(Balance, FeeDiscountFraction); 3] = [
+    // 100,000 = 75% discount
+    (
+        100_000 * ONE_TEAR,
+        FeeDiscountFraction::new(FULL_FEE_DISCOUNT.get() / 4 * 3),
+    ),
+    // 1,000 = 25% discount
+    (
+        1_000 * ONE_TEAR,
+        FeeDiscountFraction::new(FULL_FEE_DISCOUNT.get() / 4),
+    ),
+    // 10 = 10% discount
+    (
+        10 * ONE_TEAR,
+        FeeDiscountFraction::new(FULL_FEE_DISCOUNT.get() / 10),
+    ),
 ];
 
 /// How long a quote's fee discount can be used, ~10 minutes
 pub const FEE_DISCOUNT_VALIDITY_BLOCKS: BlockHeight = 1000;
 
 /// The discount of a trader who holds and stakes `tear_balance` TEAR
-pub fn tear_fee_discount(tear_balance: Balance) -> Option<FeeFractionFraction> {
+pub fn tear_fee_discount(tear_balance: Balance) -> Option<FeeDiscountFraction> {
     TEAR_FEE_DISCOUNTS
         .into_iter()
         .find(|(min_balance, _)| tear_balance >= *min_balance)
@@ -85,12 +97,14 @@ mod tests {
 
     #[test]
     fn fee_discount_grows_with_tear_holdings() {
-        assert_eq!(tear_fee_discount(0), None);
-        assert_eq!(tear_fee_discount(10 * ONE_TEAR - 1), None);
-        assert_eq!(tear_fee_discount(10 * ONE_TEAR), Some(100_000));
-        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR - 1), Some(100_000));
-        assert_eq!(tear_fee_discount(1_000 * ONE_TEAR), Some(250_000));
-        assert_eq!(tear_fee_discount(100_000 * ONE_TEAR), Some(750_000));
-        assert_eq!(tear_fee_discount(u128::MAX), Some(750_000));
+        let fee_discount_of =
+            |tear_balance| tear_fee_discount(tear_balance).map(FeeDiscountFraction::get);
+        assert_eq!(fee_discount_of(0), None);
+        assert_eq!(fee_discount_of(10 * ONE_TEAR - 1), None);
+        assert_eq!(fee_discount_of(10 * ONE_TEAR), Some(100_000));
+        assert_eq!(fee_discount_of(1_000 * ONE_TEAR - 1), Some(100_000));
+        assert_eq!(fee_discount_of(1_000 * ONE_TEAR), Some(250_000));
+        assert_eq!(fee_discount_of(100_000 * ONE_TEAR), Some(750_000));
+        assert_eq!(fee_discount_of(u128::MAX), Some(750_000));
     }
 }

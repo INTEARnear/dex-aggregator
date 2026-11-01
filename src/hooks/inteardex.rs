@@ -330,7 +330,7 @@ mod tests {
     use near_sdk::json_types::Base64VecU8;
     use pathfinder::plach::{self, SplitRouteApiResponse};
     use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
-    use xyk_dex_types::{SwapArgs, SwapRoute};
+    use xyk_dex_types::{PoolId, SwapArgs, SwapRoute, FULL_ROUTE_FRACTION};
 
     use super::*;
     use crate::calls::RheaOutput;
@@ -391,7 +391,7 @@ mod tests {
             match trade.amount {
                 Amount::AmountIn(amount_in) => Some(SplitRouteApiResponse::ExactIn {
                     routes: vec![plach::ExactInRoute {
-                        split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
+                        split_fraction: FULL_ROUTE_FRACTION.get(),
                         pools: vec![plach::ExactInPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
@@ -412,7 +412,7 @@ mod tests {
                 }),
                 Amount::AmountOut(_) => Some(SplitRouteApiResponse::ExactOut {
                     routes: vec![plach::ExactOutRoute {
-                        split_fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
+                        split_fraction: FULL_ROUTE_FRACTION.get(),
                         pools: vec![plach::ExactOutPoolStep {
                             pool_id: 1,
                             token_in: token_in.clone(),
@@ -442,8 +442,8 @@ mod tests {
         Base64VecU8(
             borsh::to_vec(&SwapArgs {
                 routes: vec![SwapRoute {
-                    fraction: xyk_dex_types::FULL_SPLIT_FRACTION,
-                    pool_ids: vec![1],
+                    fraction: FULL_ROUTE_FRACTION,
+                    pool_ids: vec![PoolId::new(1)],
                 }],
                 fee_discount: None,
             })

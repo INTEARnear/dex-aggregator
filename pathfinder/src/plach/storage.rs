@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use borsh::BorshDeserialize;
 use near_min_api::types::AccountId;
-use near_sdk::json_types::U128;
 use swap_router_types::indexed::{AccountState, Watch};
-use xyk_dex_types::{AssetWithBalance, CurrentFees, FeeConfiguration, SharesBalance};
+use xyk_dex_types::{AssetWithBalance, FeeConfigurationV2, PayoutGroups, TokenAmount, TotalShares};
 
 use super::{INTEAR_DEX_CONTRACT_ID, PLACH_DEX_ID, PoolsSource};
 
@@ -21,46 +20,31 @@ fn storage_prefix() -> Vec<u8> {
     prefix
 }
 
-/// The xyk DEX's `Pool`, with each `LookupMap` of public pool shares read as its prefix: the map
-/// can't be dropped outside of a contract
+/// The xyk DEX's `Pool`, with the `LookupMap` of public pool providers read as its prefix: the
+/// map can't be dropped outside of a contract
 #[derive(BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+#[repr(u8)]
 pub enum StoredPool {
-    PrivateV1 {
-        assets: (AssetWithBalance, AssetWithBalance),
-        _owner_id: AccountId,
-        fees: CurrentFees,
-    },
-    PublicV1 {
-        assets: (AssetWithBalance, AssetWithBalance),
-        fees: CurrentFees,
-        _user_shares_prefix: Vec<u8>,
-        _total_shares: Option<SharesBalance>,
-    },
-    LaunchV1 {
-        near_amount: U128,
-        launched_asset: AssetWithBalance,
-        fees: FeeConfiguration,
-        phantom_liquidity_near: U128,
-    },
     PrivateV2 {
         assets: (AssetWithBalance, AssetWithBalance),
         _owner_id: AccountId,
-        fees: FeeConfiguration,
+        fees: FeeConfigurationV2,
         _locked: bool,
-    },
-    PublicV2 {
-        assets: (AssetWithBalance, AssetWithBalance),
-        fees: FeeConfiguration,
-        _user_shares_prefix: Vec<u8>,
-        _total_shares: Option<SharesBalance>,
-    },
-    /// The first asset is the quote asset, which the phantom liquidity is in
+    } = 3,
     LaunchV2 {
         quote_asset: AssetWithBalance,
         launched_asset: AssetWithBalance,
-        fees: FeeConfiguration,
-        phantom_liquidity: U128,
-    },
+        fees: FeeConfigurationV2,
+        phantom_liquidity: TokenAmount,
+    } = 5,
+    PublicV3 {
+        assets: (AssetWithBalance, AssetWithBalance),
+        fees: FeeConfigurationV2,
+        _providers_prefix: Vec<u8>,
+        total_shares: TotalShares,
+        payout_groups: Box<PayoutGroups>,
+    } = 6,
 }
 
 pub fn watch() -> Watch {

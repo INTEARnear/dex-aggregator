@@ -1,14 +1,13 @@
 use intear_dex_types::{FeeFraction, FULL_FEE_FRACTION};
 use near_min_api::types::AccountIdRef;
-use xyk_dex_types::{FeeFractionFraction, FULL_FEE_FRACTION_FRACTION};
 
 use crate::types::QuoteFees;
 
 pub const AGGREGATOR_FEE_RECEIVER_ID: &AccountIdRef =
     AccountIdRef::new_or_panic("dex-aggregator.intear.near");
 /// The part of each referral fee that goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the
-/// referrer
-const AGGREGATOR_FEE_SHARE: FeeFractionFraction = FULL_FEE_FRACTION_FRACTION / 5; // 20%
+/// referrer, of [`FULL_FEE_FRACTION`]
+const AGGREGATOR_FEE_SHARE: u32 = FULL_FEE_FRACTION / 5; // 20%
 
 /// The referral fees of the request, without the ones of 0. [`AGGREGATOR_FEE_SHARE`] of each fee
 /// goes to [`AGGREGATOR_FEE_RECEIVER_ID`] instead of the referrer.
