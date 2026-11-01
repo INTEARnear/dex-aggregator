@@ -461,11 +461,10 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-// Source of SWAP_GAS and HOP_GAS: routes simulated on mainnet state with INTEAR_simulate_transactions
-const SWAP_GAS: Gas = Gas::from_ggas(18_200, 18_200);
-const HOP_GAS: Gas = Gas::from_ggas(1_900, 1_900);
-const REPEATED_HOP_GAS: Gas = Gas::from_ggas(900, 900);
-const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_800, 1_800);
+const SWAP_GAS: Gas = Gas::from_ggas(17_900, 17_900);
+const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
+const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
+const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_500, 1_500);
 
 fn swap_gas(split_route: &SplitRoute) -> Gas {
     let hops = split_route
@@ -971,10 +970,10 @@ mod tests {
             },
         )
         .unwrap();
-        // 18.2 to load the DEX and 1.9 for the pool, the engine call attaches the margin
+        // 17.9 to load the DEX and 2 for the pool, the engine call attaches the margin
         assert!(matches!(
             response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(20_100, 20_100)
+            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(19_900, 19_900)
         ));
     }
 }
