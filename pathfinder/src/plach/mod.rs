@@ -299,14 +299,18 @@ impl Pool {
                 if let (FeeReceiver::Pool, Some(payouts)) =
                     (receiver, &info.liquidity_provider_payouts)
                 {
-                    // Cloned to only get what rounding leaves in the pool of the providers' part
-                    let fee_left_in_pool = payouts
-                        .groups
-                        .group(payout_type)
-                        .clone()
-                        .share_fee(payout_asset_index, payout_amount);
+                    let fee_added_to_liquidity = match payout_type {
+                        FeePayoutType::Reinvest => payout_amount,
+                        FeePayoutType::KeepBoth
+                        | FeePayoutType::ConvertToFirstAsset
+                        | FeePayoutType::ConvertToSecondAsset => payouts
+                            .groups
+                            .group(payout_type)
+                            .clone()
+                            .share_fee(payout_asset_index, payout_amount),
+                    };
                     balances[payout_asset_index] = balances[payout_asset_index]
-                        .checked_add(fee_left_in_pool)
+                        .checked_add(fee_added_to_liquidity)
                         .expect("Overflow");
                 }
             }
@@ -724,8 +728,8 @@ mod tests {
     use crate::search::Pool as _;
 
     use xyk_dex_types::{
-        AssetWithBalance, FeeAmount, FeeConfigurationV2, FeeFraction, PayoutGroup,
-        PayoutGroupShares, ProviderShares,
+        AssetWithBalance, FeeAmount, FeeConfigurationV2, FeeFraction, PayoutGroupShares,
+        ProviderShares,
     };
 
     const POOL_FEE: FeeFraction = FeeFraction::new(3_000); // 0.3%
@@ -779,9 +783,12 @@ mod tests {
         Pool::new(0, stored_pool(token0, token1), 0).unwrap()
     }
 
-    /// All liquidity providers keep their fees in both tokens
-    fn public_pool(token0: AssetId, token1: AssetId) -> Pool {
+    /// All liquidity providers take their fees with `payout_type`
+    fn public_pool(token0: AssetId, token1: AssetId, payout_type: FeePayoutType) -> Pool {
         let shares = ProviderShares::new(10u128.pow(18));
+        let mut payout_groups = PayoutGroups::default();
+        payout_groups.group_mut(payout_type).shares =
+            PayoutGroupShares::NONE.joined_by(shares).unwrap();
         Pool::new(
             0,
             StoredPool::PublicV3 {
@@ -792,13 +799,7 @@ mod tests {
                 fees: fees(),
                 _providers_prefix: vec![],
                 total_shares: TotalShares::NONE.minted(shares).unwrap(),
-                payout_groups: Box::new(PayoutGroups {
-                    keep_both: PayoutGroup {
-                        shares: PayoutGroupShares::NONE.joined_by(shares).unwrap(),
-                        fee_growth: Default::default(),
-                    },
-                    ..Default::default()
-                }),
+                payout_groups: Box::new(payout_groups),
             },
             0,
         )
@@ -850,7 +851,7 @@ mod tests {
 
     #[test]
     fn public_pool_pays_its_fee_to_liquidity_providers() {
-        let mut pool = public_pool(nep141("a.near"), nep141("b.near"));
+        let mut pool = public_pool(nep141("a.near"), nep141("b.near"), FeePayoutType::KeepBoth);
         let [in_before, out_before] = reserves(&pool);
         let amount_in = 10u128.pow(22);
         let amount_out = pool.swap_exact_in(0, 1, amount_in).unwrap();
@@ -860,6 +861,21 @@ mod tests {
                 in_before + amount_in
                     - fee(amount_in, PROTOCOL_FEE)
                     - fee(amount_in, POOL_FEE_AFTER_PROTOCOL),
+                out_before - amount_out
+            ]
+        );
+    }
+
+    #[test]
+    fn public_pool_keeps_the_fee_its_liquidity_providers_reinvest() {
+        let mut pool = public_pool(nep141("a.near"), nep141("b.near"), FeePayoutType::Reinvest);
+        let [in_before, out_before] = reserves(&pool);
+        let amount_in = 10u128.pow(22);
+        let amount_out = pool.swap_exact_in(0, 1, amount_in).unwrap();
+        assert_eq!(
+            reserves(&pool),
+            [
+                in_before + amount_in - fee(amount_in, PROTOCOL_FEE),
                 out_before - amount_out
             ]
         );
