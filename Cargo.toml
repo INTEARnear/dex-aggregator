@@ -29,12 +29,13 @@ ipnet = { version = "2.12.2", features = ["serde"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "macros", "migrate", "chrono"] }
 pathfinder = { path = "pathfinder" }
 swap-router-types = { path = "swap-router-types" }
-intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "2e6139170fb1f649ed1cb11f23a54c92cfe33847" }
-xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "2e6139170fb1f649ed1cb11f23a54c92cfe33847" }
-otc-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "2e6139170fb1f649ed1cb11f23a54c92cfe33847" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
+intear-dex-common = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
+otc-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
 libloading = "0.9.0"
 # Native builds of the dex's types crates need this feature
-near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
+near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
 
 [profile.release]
 overflow-checks = true

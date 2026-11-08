@@ -1,4 +1,4 @@
-use intear_dex_types::AssetId;
+use intear_dex_common::{AssetId, TokenAmount};
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
     AccountId,
@@ -54,9 +54,9 @@ impl OtcTrade {
         TradeIntent {
             user_id: maker_account_id,
             asset_in: self.asset_out.clone(),
-            amount_in: U128(maker_gives),
+            amount_in: TokenAmount::new(maker_gives),
             asset_out: self.asset_in.clone(),
-            amount_out: U128(maker_gets),
+            amount_out: TokenAmount::new(maker_gets),
             validity,
         }
     }
@@ -67,7 +67,7 @@ impl OtcTrade {
 /// can sign for the OTC DEX.
 pub fn sign_intent(
     secret_key: &SecretKey,
-    otc_dex_id: &intear_dex_types::DexId,
+    otc_dex_id: &intear_dex_common::DexId,
     trade_intent: TradeIntent,
     nonce: u128,
 ) -> AuthorizedTradeIntent {
@@ -124,9 +124,9 @@ mod tests {
         let maker_trade =
             otc_trade.maker_trade_intent("maker.near".parse().unwrap(), 42, Validity::default());
         assert_eq!(maker_trade.asset_in, usdc());
-        assert_eq!(maker_trade.amount_in, U128(42));
+        assert_eq!(maker_trade.amount_in, TokenAmount::new(42));
         assert_eq!(maker_trade.asset_out, AssetId::Near);
-        assert_eq!(maker_trade.amount_out, U128(990_000));
+        assert_eq!(maker_trade.amount_out, TokenAmount::new(990_000));
     }
 
     #[test]
@@ -135,8 +135,8 @@ mod tests {
             OtcTrade::of_trade(&trade(Amount::AmountOut(7), Some("trader.near"))).unwrap();
         let maker_trade =
             otc_trade.maker_trade_intent("maker.near".parse().unwrap(), 30, Validity::default());
-        assert_eq!(maker_trade.amount_in, U128(7));
-        assert_eq!(maker_trade.amount_out, U128(30));
+        assert_eq!(maker_trade.amount_in, TokenAmount::new(7));
+        assert_eq!(maker_trade.amount_out, TokenAmount::new(30));
     }
 
     #[test]
@@ -145,13 +145,13 @@ mod tests {
     }
     #[test]
     fn signs_the_payload_the_otc_dex_verifies_with_both_key_types() {
-        let otc_dex_id: intear_dex_types::DexId = "owner.near/otc".parse().unwrap();
+        let otc_dex_id: intear_dex_common::DexId = "owner.near/otc".parse().unwrap();
         let trade_intent = TradeIntent {
             user_id: "maker.near".parse().unwrap(),
             asset_in: usdc(),
             asset_out: AssetId::Near,
-            amount_in: U128(1),
-            amount_out: U128(2),
+            amount_in: TokenAmount::new(1),
+            amount_out: TokenAmount::new(2),
             validity: Validity {
                 expiry: Some(ExpiryCondition::BlockHeight(100)),
                 only_for_whitelisted_parties: Some(vec!["trader.near".parse().unwrap()]),

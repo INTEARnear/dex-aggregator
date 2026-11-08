@@ -13,7 +13,7 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Uri};
-use intear_dex_types::AssetId;
+use intear_dex_common::AssetId;
 use libloading::Library;
 use near_min_api::types::{AccountId, BlockHeight};
 use pathfinder::IndexedHook;

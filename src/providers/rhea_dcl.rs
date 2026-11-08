@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use intear_dex_types::FULL_FEE_FRACTION;
+use intear_dex_common::FULL_FEE_FRACTION;
 use near_min_api::types::AccountId;
 use pathfinder::{
     dcl::{self, RouteApiResponse},
@@ -126,11 +126,11 @@ async fn route(
             RouteApiResponse::ExactOut { route, .. } => {
                 // Each referrer's share of the estimated input with all fees, not the worst case,
                 // so high slippage doesn't raise the fees
-                let rest = (FULL_FEE_FRACTION
+                let rest = (FULL_FEE_FRACTION.get()
                     - referral_fees
                         .0
                         .iter()
-                        .map(|(_, fee_fraction)| fee_fraction)
+                        .map(|(_, fee_fraction)| fee_fraction.get())
                         .sum::<u32>()) as u128;
                 let amount = route.amount_in.0;
                 let fees = referral_fees
@@ -138,8 +138,8 @@ async fn route(
                     .iter()
                     .map(|(referrer_id, fee_fraction)| ReferrerFee {
                         referrer_id: referrer_id.clone(),
-                        amount: amount / rest * *fee_fraction as u128
-                            + amount % rest * *fee_fraction as u128 / rest,
+                        amount: amount / rest * fee_fraction.get() as u128
+                            + amount % rest * fee_fraction.get() as u128 / rest,
                     })
                     .filter(|fee| fee.amount > 0)
                     .collect::<Vec<_>>();

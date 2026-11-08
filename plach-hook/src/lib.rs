@@ -4,7 +4,7 @@ mod tear_holdings;
 use std::sync::{Arc, RwLock};
 
 use bigdecimal::Zero;
-use intear_dex_types::{AssetId, SwapRequestAmount};
+use intear_dex_common::{AssetId, SwapRequestAmount, TokenAmount};
 use near_min_api::types::{AccountId, BlockHeight};
 use near_sdk::json_types::{Base64VecU8, U128};
 use pathfinder::{
@@ -149,7 +149,7 @@ impl Plach {
                             )
                         })
                         .collect::<Vec<_>>(),
-                    SwapRequestAmount::ExactIn(U128(amount_in.0)),
+                    SwapRequestAmount::ExactIn(TokenAmount::new(amount_in.0)),
                     amount_out.0,
                     routes.iter().map(|route| route.min_amount_out.0).sum(),
                     discount.0,
@@ -177,7 +177,7 @@ impl Plach {
                             )
                         })
                         .collect(),
-                    SwapRequestAmount::ExactOut(U128(amount_out.0)),
+                    SwapRequestAmount::ExactOut(TokenAmount::new(amount_out.0)),
                     amount_in.0,
                     max_amount_in.0,
                     discount.0,
@@ -189,7 +189,7 @@ impl Plach {
         }
         let signed_fee_discount = fee_discount.map(|fee_discount| {
             self.fee_discounter.sign(FeeDiscount {
-                routes: swap_routes.clone(),
+                route: swap_routes.clone(),
                 asset_in: trade.asset_in.clone(),
                 asset_out: trade.asset_out.clone(),
                 trader_id: trade.trader_account_id.clone(),
@@ -334,11 +334,14 @@ mod tests {
         else {
             panic!("No fee discount");
         };
-        assert_eq!(discount.routes, routes);
+        assert_eq!(discount.route, routes);
         assert_eq!(discount.asset_in, AssetId::Near);
         assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
         assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
-        assert_eq!(discount.amount, SwapRequestAmount::ExactIn(U128(100)));
+        assert_eq!(
+            discount.amount,
+            SwapRequestAmount::ExactIn(TokenAmount::new(100))
+        );
         assert_eq!(discount.fee_discount.get(), 250_000);
         assert_eq!(discount.expiration_block_height, 1_001_000);
         assert!(

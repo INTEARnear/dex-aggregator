@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
-pub use intear_dex_types::AssetId;
+pub use intear_dex_common::AssetId;
 use near_sdk::Timestamp;
 use ruint::aliases::U256;
 use swap_router_types::{indexed::AccountState, types::Gas};

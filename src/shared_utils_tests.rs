@@ -10,7 +10,7 @@ use crate::calls::{CallBlueprint, RheaOutput};
 use crate::route::{resolve_steps, RouteStep};
 use crate::types::IntearAssetId;
 use crate::types::{Slippage, TokenId};
-use intear_dex_types::AssetId;
+use intear_dex_common::AssetId;
 
 fn account(id: &str) -> AccountId {
     id.parse().unwrap()

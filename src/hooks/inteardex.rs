@@ -1,4 +1,5 @@
-use intear_dex_types::{AssetId, ReferralFees};
+use intear_dex_common::{AssetId, TokenAmount};
+use intear_dex_types::ReferralFees;
 use near_min_api::types::{AccountId, NearToken};
 use near_sdk::json_types::U128;
 use swap_router_types::hook::{HookQuote, IntearDexTrade};
@@ -42,9 +43,9 @@ pub fn trade_of_request(
     // The engine takes them out of the input before the DEX gets it
     let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
     let amount = match request.amount {
-        Amount::AmountIn(amount_in) => {
-            Amount::AmountIn(amount_in - fees_total(referral_fees.amounts_out_of(U128(amount_in))))
-        }
+        Amount::AmountIn(amount_in) => Amount::AmountIn(
+            amount_in - fees_total(referral_fees.amounts_out_of(TokenAmount::new(amount_in))),
+        ),
         Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
     };
     Some(IntearDexTrade {
@@ -69,8 +70,8 @@ fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
     }
 }
 
-fn fees_total(fees: Vec<(AccountId, U128)>) -> u128 {
-    fees.iter().map(|(_, fee)| fee.0).sum()
+fn fees_total(fees: Vec<(AccountId, TokenAmount)>) -> u128 {
+    fees.iter().map(|(_, fee)| fee.get()).sum()
 }
 
 /// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, or on the first of several that
@@ -161,7 +162,10 @@ pub fn route(
             // Fees on top of the input the DEX takes, so the most it can take with them is the
             // constraint
             let with_fees = |amount_in: u128| {
-                amount_in + fees_total(engine_referral_fees.amounts_on_top_of(U128(amount_in)))
+                amount_in
+                    + fees_total(
+                        engine_referral_fees.amounts_on_top_of(TokenAmount::new(amount_in)),
+                    )
             };
             (
                 with_fees(swap.worst_case_amount),

@@ -1,12 +1,13 @@
+use intear_dex_common::{AssetId, SwapRequestAmount, TokenAmount};
 use intear_dex_types::{
-    AssetId, DirectWithdrawAmount, Operation, SwapAdvancedMode, SwapOperationAmount, SwapOption,
-    SwapRequestAmount, WithdrawAmount,
+    DirectWithdrawAmount, Operation, SwapAdvancedMode, SwapOperationAmount, SwapOption,
+    WithdrawAmount,
 };
 use near_min_api::types::{
     near_account_id::AccountType, AccountId, Action, Balance, FunctionCallAction, NearGas,
     NearToken,
 };
-use near_sdk::json_types::{Base64VecU8, U128};
+use near_sdk::json_types::Base64VecU8;
 use tracing::warn;
 
 use crate::{
@@ -191,7 +192,7 @@ pub struct IntearDexSwapOperation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntearDexSwapOption {
-    pub dex_id: intear_dex_types::DexId,
+    pub dex_id: intear_dex_common::DexId,
     /// The swap's message to the DEX
     pub message: Base64VecU8,
     /// Of the DEX's swap, as its quote has it
@@ -695,7 +696,7 @@ impl CallBlueprint {
                 "withdraw",
                 serde_json::json!({
                     "asset_id": AssetId::from(&asset),
-                    "amount": DirectWithdrawAmount::Exact(U128(amount)),
+                    "amount": DirectWithdrawAmount::Exact(TokenAmount::new(amount)),
                 }),
                 one_yocto,
             ),
@@ -741,10 +742,10 @@ impl IntearDexOperations {
         let asset_in = AssetId::from(&swap.asset_in);
         let asset_out = AssetId::from(&swap.asset_out);
         let amount = SwapOperationAmount::Amount(match swap.amount {
-            Amount::AmountIn(amount) => SwapRequestAmount::ExactIn(U128(amount)),
-            Amount::AmountOut(amount) => SwapRequestAmount::ExactOut(U128(amount)),
+            Amount::AmountIn(amount) => SwapRequestAmount::ExactIn(TokenAmount::new(amount)),
+            Amount::AmountOut(amount) => SwapRequestAmount::ExactOut(TokenAmount::new(amount)),
         });
-        let constraint = Some(U128(swap.constraint));
+        let constraint = Some(TokenAmount::new(swap.constraint));
         let swap_operation = match swap.options.as_slice() {
             [option] => Operation::SwapSimple {
                 dex_id: option.dex_id.clone(),
@@ -775,9 +776,11 @@ impl IntearDexOperations {
             .map(|withdrawal| Operation::Withdraw {
                 asset_id: AssetId::from(&withdrawal.asset),
                 amount: match withdrawal.amount {
-                    IntearDexWithdrawAmount::Exact(amount) => WithdrawAmount::Exact(U128(amount)),
+                    IntearDexWithdrawAmount::Exact(amount) => {
+                        WithdrawAmount::Exact(TokenAmount::new(amount))
+                    }
                     IntearDexWithdrawAmount::Full { at_least } => WithdrawAmount::Full {
-                        at_least: at_least.map(U128),
+                        at_least: at_least.map(TokenAmount::new),
                     },
                 },
                 to: None,
@@ -853,9 +856,11 @@ pub fn near_receive_gas(trader_account_id: Option<&AccountId>) -> Gas {
             Some(AccountType::NearImplicitAccount) => {
                 CREATE_ACCOUNT_EXECUTION_GAS.as_gas() + ADD_FULL_ACCESS_KEY_EXECUTION_GAS.as_gas()
             }
-            Some(AccountType::EthImplicitAccount | AccountType::NearDeterministicAccount) => {
-                CREATE_ACCOUNT_EXECUTION_GAS.as_gas()
-            }
+            Some(
+                AccountType::EthImplicitAccount
+                | AccountType::NearDeterministicAccount
+                | AccountType::UniversalAccount,
+            ) => CREATE_ACCOUNT_EXECUTION_GAS.as_gas(),
             Some(AccountType::NamedAccount) | None => 0,
         };
     let gas = NearGas::from_gas(

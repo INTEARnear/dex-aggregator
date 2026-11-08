@@ -10,7 +10,7 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
-use intear_dex_types::{AssetId, FULL_FEE_FRACTION};
+use intear_dex_common::{AssetId, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
     types::{
@@ -128,9 +128,9 @@ pub fn referrer_fees_of_total(referral_fees: &QuoteFees, total: Balance) -> Vec<
         .map(|(referrer_id, fee_fraction)| ReferrerFee {
             referrer_id: referrer_id.clone(),
             // Split so it doesn't overflow for large amounts, rounded down
-            amount: total / FULL_FEE_FRACTION as u128 * *fee_fraction as u128
-                + total % FULL_FEE_FRACTION as u128 * *fee_fraction as u128
-                    / FULL_FEE_FRACTION as u128,
+            amount: total / FULL_FEE_FRACTION.get() as u128 * fee_fraction.get() as u128
+                + total % FULL_FEE_FRACTION.get() as u128 * fee_fraction.get() as u128
+                    / FULL_FEE_FRACTION.get() as u128,
         })
         .filter(|fee| fee.amount > 0)
         .collect()

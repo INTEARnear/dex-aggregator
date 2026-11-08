@@ -9,7 +9,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
-use intear_dex_types::{AssetId, FeeFraction, FULL_FEE_FRACTION};
+use intear_dex_common::{AssetId, FeeFraction, FULL_FEE_FRACTION};
 
 /// What a call, or a part of it, is expected to burn, and the gas it needs attached to not fail
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +219,7 @@ pub struct SwapRequest {
     pub fees: QuoteFees,
 }
 
-const MAX_REFERRAL_FEE_FRACTION: FeeFraction = FULL_FEE_FRACTION / 20; // 5%
+const MAX_REFERRAL_FEE_FRACTION: FeeFraction = FeeFraction::new(FULL_FEE_FRACTION.get() / 20); // 5%
 const MAX_REFERRERS: usize = 4;
 
 /// Referrers and the fee each charges, in fractions of [`FULL_FEE_FRACTION`]. With
@@ -247,40 +247,43 @@ impl FromStr for QuoteFees {
                 // the binary f64 closest to it
                 let fee_fraction = BigDecimal::from_str(&fee.to_string())
                     .map_err(|error| format!("Invalid referral fee of {referrer_id}: {error}"))?
-                    * BigDecimal::from(FULL_FEE_FRACTION);
+                    * BigDecimal::from(FULL_FEE_FRACTION.get());
                 if !fee_fraction.is_integer() {
                     return Err(format!(
                         "Referral fee of {referrer_id} must be a whole number of millionths"
                     ));
                 }
-                if fee_fraction < BigDecimal::zero() || fee_fraction > MAX_REFERRAL_FEE_FRACTION {
+                if fee_fraction < BigDecimal::zero()
+                    || fee_fraction > MAX_REFERRAL_FEE_FRACTION.get()
+                {
                     return Err(format!(
                         "Referral fee of {referrer_id} must be between 0 and {}",
-                        (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION)
-                            / BigDecimal::from(FULL_FEE_FRACTION))
+                        (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION.get())
+                            / BigDecimal::from(FULL_FEE_FRACTION.get()))
                         .normalized()
                     ));
                 }
                 let fee_fraction = fee_fraction
                     .to_u32()
                     .expect("Checked to be a whole number between 0 and the maximum fee");
-                Ok((referrer_id, fee_fraction))
+                Ok((referrer_id, FeeFraction::new(fee_fraction)))
             })
             .collect::<Result<Vec<_>, _>>()?;
         if fees.len() > MAX_REFERRERS {
             return Err(format!("At most {MAX_REFERRERS} accounts can be paid"));
         }
         let referral_fees = QuoteFees(fees);
-        let total_fee_fraction: FeeFraction = referral_fees
+        let total_fee_fraction: u32 = referral_fees
             .0
             .iter()
-            .map(|(_, fee_fraction)| fee_fraction)
+            .map(|(_, fee_fraction)| fee_fraction.get())
             .sum();
-        if total_fee_fraction > MAX_REFERRAL_FEE_FRACTION {
+        if total_fee_fraction > MAX_REFERRAL_FEE_FRACTION.get() {
             return Err(format!(
                 "Referral fees must add up to at most {}",
-                (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION) / BigDecimal::from(FULL_FEE_FRACTION))
-                    .normalized()
+                (BigDecimal::from(MAX_REFERRAL_FEE_FRACTION.get())
+                    / BigDecimal::from(FULL_FEE_FRACTION.get()))
+                .normalized()
             ));
         }
         Ok(referral_fees)
@@ -295,9 +298,10 @@ impl Serialize for QuoteFees {
             .map(|(account_id, fee_fraction)| {
                 (
                     account_id.clone(),
-                    (BigDecimal::from(*fee_fraction) / BigDecimal::from(FULL_FEE_FRACTION))
-                        .to_f64()
-                        .unwrap(),
+                    (BigDecimal::from(fee_fraction.get())
+                        / BigDecimal::from(FULL_FEE_FRACTION.get()))
+                    .to_f64()
+                    .unwrap(),
                 )
             })
             .collect::<BTreeMap<AccountId, f64>>();

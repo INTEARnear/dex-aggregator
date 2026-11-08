@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
-use intear_dex_types::AssetId;
+use intear_dex_common::AssetId;
 use near_min_api::types::{AccountId, BlockHeight};
 use near_sdk::json_types::{Base64VecU8, U128};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ pub struct HookInput<'a> {
 /// route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookQuote {
-    pub dex_id: intear_dex_types::DexId,
+    pub dex_id: intear_dex_common::DexId,
     /// The swap's message to the DEX
     pub message: Base64VecU8,
     /// What the DEX gives for an exact-in trade, or takes for an exact-out one, without the app
@@ -295,6 +295,8 @@ pub mod __private {
 
 #[cfg(test)]
 mod tests {
+    use intear_dex_common::FeeFraction;
+
     use super::*;
 
     const SWAP_REQUEST: &str = r#"{"token_in":"near","token_out":"nep141:usdc.near","amount_in":"1000","slippage_type":"Fixed","slippage":"0.01","dexes":"Rhea,Plach","trader_account_id":"trader.near","referrer_id":"app.near","fees":"{\"app.near\":0.005}"}"#;
@@ -337,7 +339,7 @@ mod tests {
                 crate::types::DexId::Hook("Plach".into())
             ])
         );
-        assert_eq!(read.swap_request.fees.0[0].1, 5_000);
+        assert_eq!(read.swap_request.fees.0[0].1, FeeFraction::new(5_000));
         assert_eq!(read.trade.amount, Amount::AmountIn(995));
         assert_eq!(read.trade.slippage, "0.01".parse::<BigDecimal>().unwrap());
         assert_eq!(read.quotes.len(), 1);

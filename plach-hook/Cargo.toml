@@ -13,10 +13,10 @@ crate-type = ["cdylib"]
 swap-router-types = { path = "../swap-router-types", features = ["hook"] }
 pathfinder = { path = "../pathfinder", default-features = false }
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
-intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "2e6139170fb1f649ed1cb11f23a54c92cfe33847" }
-xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "2e6139170fb1f649ed1cb11f23a54c92cfe33847" }
+intear-dex-common = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
+xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "d598675001f6e794ba9d29a4a8bb936aecf151e0" }
 # Native builds of the dex's types crates need this feature
-near-sdk = { version = "5.29", default-features = false, features = ["non-contract-usage"] }
+near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
 borsh = "1.6.0"
 sha2 = "0.10.9"
 bigdecimal = "0.4.8"

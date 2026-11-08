@@ -19,7 +19,7 @@ use near_sdk::{json_types::U128, NearToken};
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use intear_dex_types::AssetId;
+use intear_dex_common::AssetId;
 
 use crate::{
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
