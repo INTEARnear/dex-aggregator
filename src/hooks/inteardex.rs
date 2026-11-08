@@ -6,8 +6,8 @@ use swap_router_types::hook::{HookQuote, IntearDexTrade};
 
 use crate::{
     calls::{
-        CallBlueprint, IntearDexOperations, IntearDexSwapOperation, IntearDexSwapOption,
-        IntearDexWithdrawAmount, IntearDexWithdrawal,
+        CallBlueprint, IntearDexOperations, IntearDexOracleRequest, IntearDexSwapOperation,
+        IntearDexSwapOption, IntearDexWithdrawAmount, IntearDexWithdrawal,
     },
     route::{RouteBlueprint, RouteStep},
     shared_utils::{
@@ -84,6 +84,8 @@ pub struct IntearDexSwap {
     /// The least the swap gives, or the most it takes, as in [`HookQuote`]
     worst_case_amount: u128,
     discount: Option<U128>,
+    /// Of the options that read an oracle's response
+    oracle_request: Option<IntearDexOracleRequest>,
 }
 
 impl IntearDexSwap {
@@ -92,6 +94,7 @@ impl IntearDexSwap {
             estimated_amount: quote.estimated_amount.0,
             worst_case_amount: quote.worst_case_amount.0,
             discount: quote.discount,
+            oracle_request: oracle_request_of(&quote),
             options: vec![swap_option(quote)],
         }
     }
@@ -99,7 +102,9 @@ impl IntearDexSwap {
     /// The quotes, best first, as options that the engine falls back through when one fails. The
     /// swap is constrained to the loosest of their worst cases, which hooks keep within the trade's
     /// slippage, so when a quote without slippage fails, one that gives a bit less still fills it.
-    /// None without quotes, one quote is swapped on alone.
+    /// One oracle request starts the operations, so the quotes that ask an oracle for something
+    /// else than the best quote does are left out. None without quotes, one quote is swapped on
+    /// alone.
     pub fn fallback_queue(trade: &IntearDexTrade, mut quotes: Vec<HookQuote>) -> Option<Self> {
         match trade.amount {
             Amount::AmountIn(_) => {
@@ -107,6 +112,11 @@ impl IntearDexSwap {
             }
             Amount::AmountOut(_) => quotes.sort_by_key(|quote| quote.estimated_amount.0),
         }
+        let best_oracle_request = oracle_request_of(quotes.first()?);
+        quotes.retain(|quote| {
+            let oracle_request = oracle_request_of(quote);
+            oracle_request.is_none() || oracle_request == best_oracle_request
+        });
         if quotes.len() < 2 {
             return quotes.into_iter().next().map(Self::of_quote);
         }
@@ -121,6 +131,7 @@ impl IntearDexSwap {
             estimated_amount: best.estimated_amount.0,
             worst_case_amount,
             discount: best.discount,
+            oracle_request: best_oracle_request,
             options: quotes.into_iter().map(swap_option).collect(),
         })
     }
@@ -132,6 +143,16 @@ fn swap_option(quote: HookQuote) -> IntearDexSwapOption {
         message: quote.message,
         gas: quote.gas,
     }
+}
+
+fn oracle_request_of(quote: &HookQuote) -> Option<IntearDexOracleRequest> {
+    quote
+        .oracle_request
+        .clone()
+        .map(|request| IntearDexOracleRequest {
+            dex_id: quote.dex_id.clone(),
+            request,
+        })
 }
 
 /// The route of a swap for `trade`, which [`trade_of_request`] made of `request`
@@ -248,6 +269,7 @@ pub fn route(
             amount: request.amount,
             constraint,
             options: swap.options,
+            oracle_request: swap.oracle_request.map(Box::new),
         },
         withdrawals,
         referrer: request
@@ -333,7 +355,7 @@ mod tests {
     use near_min_api::types::{Action, NearGas};
     use near_sdk::json_types::Base64VecU8;
     use pathfinder::plach::{self, SplitRouteApiResponse};
-    use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
+    use swap_router_types::{fees::AGGREGATOR_FEE_RECEIVER_ID, hook::OracleRequest};
     use xyk_dex_types::{PoolId, SwapArgs, SwapRoute, FULL_ROUTE_FRACTION};
 
     use super::*;
@@ -344,6 +366,7 @@ mod tests {
 
     const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
     const PLACH_SWAP_GAS: Gas = Gas::from_ggas(34_000, 34_000);
+    const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
 
     #[derive(Clone)]
     struct TestPlachQuotes {
@@ -493,6 +516,7 @@ mod tests {
             worst_case_amount: U128(worst_case_amount),
             gas: swap_gas,
             discount: None,
+            oracle_request: None,
         };
         route(
             DexId::Hook("Plach".into()),
@@ -524,6 +548,24 @@ mod tests {
             worst_case_amount: U128(worst_case_amount),
             gas: Gas::from_ggas(tgas * 1_000, (tgas + 10) * 1_000),
             discount: None,
+            oracle_request: None,
+        }
+    }
+
+    /// A [`quote`] of a swap that reads the oracle's response to `request`
+    fn oracle_quote(
+        dex_id: &str,
+        estimated_amount: u128,
+        worst_case_amount: u128,
+        tgas: u64,
+        request: &[u8],
+    ) -> HookQuote {
+        HookQuote {
+            oracle_request: Some(OracleRequest {
+                oracle_key: ORACLE_KEY.parse().unwrap(),
+                request: Base64VecU8(request.to_vec()),
+            }),
+            ..quote(dex_id, estimated_amount, worst_case_amount, tgas)
         }
     }
 
@@ -573,6 +615,7 @@ mod tests {
                     message: plach_message(),
                     gas: PLACH_SWAP_GAS,
                 }],
+                oracle_request: None,
             },
             withdrawals,
             referrer: account(DEFAULT_REFERRER_ID),
@@ -730,6 +773,61 @@ mod tests {
         assert_eq!(swap["constraint"], "102");
         assert_eq!(swap["options"][0]["dex_id"], "slimedragon.near/xyk");
         assert_eq!(swap["options"][1]["dex_id"], "slimedragon.near/otc");
+    }
+
+    #[test]
+    fn the_best_quote_starts_the_operations_with_its_oracle_request() {
+        let (operations, gas) = swap_operations(
+            Amount::AmountIn(100),
+            vec![
+                quote("slimedragon.near/xyk", 80, 79, 34),
+                oracle_quote("slimedragon.near/amp", 82, 82, 25, b"near,usdc"),
+                // Can't be a fallback, since it asks for something else
+                oracle_quote("slimedragon.near/amp", 81, 81, 25, b"near,usdt"),
+            ],
+        );
+        assert_eq!(
+            operations[0],
+            serde_json::json!({
+                "OracleRequest": {
+                    "oracle_key": ORACLE_KEY,
+                    "dex_id": "slimedragon.near/amp",
+                    "request": "bmVhcix1c2Rj",
+                },
+            })
+        );
+        let options = &operations[1]["SwapAdvanced"]["options"];
+        assert_eq!(options.as_array().unwrap().len(), 2);
+        assert_eq!(options[0]["dex_id"], "slimedragon.near/amp");
+        assert_eq!(options[1]["dex_id"], "slimedragon.near/xyk");
+        // The deposit is held while the operations wait for the oracle
+        let oracle_request_and_held_deposit = NearGas::from_tgas(4 + 5);
+        assert_eq!(
+            gas,
+            attached_gas(NearGas::from_tgas(44 + 35), NearGas::from_tgas(34 + 25))
+                .checked_add(oracle_request_and_held_deposit)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn quotes_with_oracle_requests_are_left_out_when_another_quote_is_best() {
+        let (operations, gas) = swap_operations(
+            Amount::AmountIn(100),
+            vec![
+                oracle_quote("slimedragon.near/amp", 81, 81, 25, b"near,usdc"),
+                quote("slimedragon.near/otc", 82, 82, 27),
+            ],
+        );
+        assert_eq!(operations.as_array().unwrap().len(), 2);
+        assert_eq!(
+            operations[0]["SwapSimple"]["dex_id"],
+            "slimedragon.near/otc"
+        );
+        assert_eq!(
+            gas,
+            attached_gas(NearGas::from_tgas(37), NearGas::from_tgas(27))
+        );
     }
 
     #[test]

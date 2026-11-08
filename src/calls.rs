@@ -8,6 +8,7 @@ use near_min_api::types::{
     NearToken,
 };
 use near_sdk::json_types::Base64VecU8;
+use swap_router_types::hook::OracleRequest;
 use tracing::warn;
 
 use crate::{
@@ -188,6 +189,16 @@ pub struct IntearDexSwapOperation {
     /// Best first. One is swapped on alone, the engine falls back through more of them when one
     /// fails or doesn't meet the constraint.
     pub options: Vec<IntearDexSwapOption>,
+    /// What the operations ask before the swap, for the options that read the response. Boxed, as
+    /// it's most of the size of a call that has one.
+    pub oracle_request: Option<Box<IntearDexOracleRequest>>,
+}
+
+/// An oracle request that `dex_id` reads the response to
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntearDexOracleRequest {
+    pub dex_id: intear_dex_common::DexId,
+    pub request: OracleRequest,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -252,6 +263,12 @@ const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
 /// estimated
 const INTEAR_DEX_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
 const INTEAR_DEX_SWAP_MARGIN_PERCENT: u64 = 15;
+/// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
+/// them in a receipt of their own. Holding them burnt 4 Tgas in sandbox.
+const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(4_000, 4_000);
+/// What Intear DEX attaches to the call after the operations of a deposit that waited for an
+/// oracle, which refunds the deposit if they failed
+const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(5_000, 5_000);
 /// Under what a transaction can attach, with room for the other calls in it
 const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 
@@ -342,7 +359,11 @@ impl CallBlueprint {
                 token_id,
                 operations,
                 ..
-            } => ft_transfer_call_gas(token_id) + Gas::from_ggas(2_600, 2_600) + operations.gas(),
+            } => {
+                ft_transfer_call_gas(token_id)
+                    + Gas::from_ggas(2_600, 2_600)
+                    + operations.gas_with_deposit()
+            }
             CallBlueprint::InputNep141FeeTransfer { token_id, .. } => ft_transfer_gas(token_id),
             CallBlueprint::RheaStorageDeposit { .. } => Gas::from_ggas(2_610, 3_000),
             CallBlueprint::RheaRegisterTokens { token_ids } => {
@@ -366,8 +387,8 @@ impl CallBlueprint {
             CallBlueprint::IntearDexDepositNear {
                 operations: Some(operations),
                 ..
-            }
-            | CallBlueprint::IntearDexExecuteOperations { operations } => {
+            } => Gas::from_ggas(3_600, 3_600) + operations.gas_with_deposit(),
+            CallBlueprint::IntearDexExecuteOperations { operations } => {
                 Gas::from_ggas(3_600, 3_600) + operations.gas()
             }
             CallBlueprint::IntearDexWithdraw {
@@ -731,10 +752,23 @@ impl IntearDexOperations {
                     + intear_dex_sending_out_gas(&withdrawal.asset, self.trader_account_id.as_ref())
             })
             .sum::<Gas>();
+        let oracle_request_gas = match self.swap.oracle_request {
+            Some(_) => ORACLE_REQUEST_GAS,
+            None => Gas::from_ggas(0, 0),
+        };
         Gas::from_ggas(600, 600) * self.referral_fees.0.len() as u64
+            + oracle_request_gas
             + swap_gas
             + withdrawals_gas
             + GAS_MARGIN
+    }
+
+    /// Of the operations of a deposit, which Intear DEX holds while they wait for an oracle
+    fn gas_with_deposit(&self) -> Gas {
+        match self.swap.oracle_request {
+            Some(_) => self.gas() + HELD_DEPOSIT_GAS,
+            None => self.gas(),
+        }
     }
 
     fn engine_args(&self) -> serde_json::Value {
@@ -786,8 +820,16 @@ impl IntearDexOperations {
                 to: None,
                 rescue_address: None,
             });
-        let operations = [swap_operation]
-            .into_iter()
+        let oracle_request =
+            swap.oracle_request
+                .iter()
+                .map(|oracle_request| Operation::OracleRequest {
+                    oracle_key: oracle_request.request.oracle_key.clone(),
+                    dex_id: oracle_request.dex_id.clone(),
+                    request: oracle_request.request.request.clone(),
+                });
+        let operations = oracle_request
+            .chain([swap_operation])
             .chain(withdrawals)
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -914,6 +956,7 @@ mod tests {
                     message: Base64VecU8(vec![1, 0, 0, 0]),
                     gas: Gas::from_ggas(34_000, 34_000),
                 }],
+                oracle_request: None,
             },
             withdrawals,
             referrer: account("ref.near"),

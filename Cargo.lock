@@ -52,6 +52,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amp-dex-types"
+version = "0.1.0"
+source = "git+https://github.com/INTEARnear/dex?rev=d598675001f6e794ba9d29a4a8bb936aecf151e0#d598675001f6e794ba9d29a4a8bb936aecf151e0"
+dependencies = [
+ "ethnum",
+ "intear-dex-common",
+ "near-sdk",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3226,6 +3236,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "pathfinder"
 version = "0.1.0"
 dependencies = [
+ "amp-dex-types",
  "anyhow",
  "bigdecimal",
  "borsh",
@@ -3486,6 +3497,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "200b9ff220857e53e184257720a14553b2f4aa02577d2ed9842d45d4b9654810"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "qoq-hook"
+version = "0.1.0"
+dependencies = [
+ "amp-dex-types",
+ "anyhow",
+ "bigdecimal",
+ "borsh",
+ "futures-util",
+ "intear-dex-common",
+ "near-min-api",
+ "near-sdk",
+ "pathfinder",
+ "reqwest 0.12.28",
+ "serde",
+ "swap-router-types",
+ "tokio",
 ]
 
 [[package]]

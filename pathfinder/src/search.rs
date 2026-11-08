@@ -519,6 +519,37 @@ impl SplitRoute {
     pub fn hops(&self) -> usize {
         self.parts.iter().map(|part| part.route.hops.len()).sum()
     }
+
+    /// What the route swaps on `graph` in total: the output for exact in, the input for exact out
+    pub fn emulate_total<P: Pool>(
+        &self,
+        graph: &Graph<P>,
+        amount: QuoteAmount,
+    ) -> Result<Balance, anyhow::Error> {
+        let mut total: Balance = 0;
+        let mut pools_delta = PoolsDelta::default();
+        for (part, amount_part) in self
+            .parts
+            .iter()
+            .zip(split_exactly(amount.value(), &self.parts))
+        {
+            let swapped = match amount {
+                QuoteAmount::ExactIn(_) => {
+                    part.route
+                        .emulate_exact_in(graph, amount_part, &mut pools_delta)
+                }
+                QuoteAmount::ExactOut(_) => part
+                    .route
+                    .emulate_exact_out(graph, amount_part, &mut pools_delta)
+                    .map(|(amount_in, _)| amount_in),
+            }
+            .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
+            total = total
+                .checked_add(swapped)
+                .ok_or_else(|| anyhow::anyhow!("Total amount overflows u128"))?;
+        }
+        Ok(total)
+    }
 }
 
 /// The amount of each part of a split route that adds up to the parts' total weight of `amount`

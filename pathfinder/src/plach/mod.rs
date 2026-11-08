@@ -15,7 +15,6 @@ use tokio::time::Instant;
 
 pub use intear_dex_common::AssetId;
 use near_sdk::Timestamp;
-use ruint::aliases::U256;
 use swap_router_types::{indexed::AccountState, types::Gas};
 use xyk_dex_types::math::{exact_in_amount_out, exact_out_amount_in};
 use xyk_dex_types::{
@@ -96,10 +95,8 @@ pub struct ExactOutPoolStep {
     pub max_amount_in: U128,
 }
 
-const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
-const BASIS_POINTS: u128 = 10_000;
 
 #[derive(Clone)]
 pub struct Pool {
@@ -478,12 +475,6 @@ fn swap_gas(split_route: &SplitRoute) -> Gas {
     SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops
 }
 
-/// `amount` times `basis_points` of [`BASIS_POINTS`], rounded down
-fn with_slippage(amount: Balance, basis_points: u128) -> Balance {
-    let amount = U256::from(amount) * U256::from(basis_points) / U256::from(BASIS_POINTS);
-    amount.to::<Balance>()
-}
-
 fn to_api_response(
     split_route: &SplitRoute,
     graph: &Graph<Pool>,
@@ -504,7 +495,8 @@ fn to_api_response(
                     .route
                     .emulate_exact_in(graph, amount_part, &mut pools_delta)
                     .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let min_amount_out = with_slippage(estimated_out, BASIS_POINTS - slippage_bp);
+                let min_amount_out =
+                    crate::with_slippage(estimated_out, crate::BASIS_POINTS - slippage_bp);
 
                 let mut pools_resp = Vec::new();
                 let mut current_token = token_in.clone();
@@ -558,7 +550,8 @@ fn to_api_response(
                     .route
                     .emulate_exact_out(graph, amount_out_part, &mut pools_delta)
                     .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let max_amount_in = with_slippage(amount_in, BASIS_POINTS + slippage_bp);
+                let max_amount_in =
+                    crate::with_slippage(amount_in, crate::BASIS_POINTS + slippage_bp);
 
                 let mut pools_resp = Vec::new();
                 let mut current_token = token_in.clone();
@@ -573,9 +566,9 @@ fn to_api_response(
                         token_out: graph.token(hop.token_out).clone(),
                         amount_in: U128(step_amount.0),
                         amount_out: U128(step_amount.1),
-                        max_amount_in: U128(with_slippage(
+                        max_amount_in: U128(crate::with_slippage(
                             step_amount.0,
-                            BASIS_POINTS + slippage_bp,
+                            crate::BASIS_POINTS + slippage_bp,
                         )),
                     });
 
@@ -608,37 +601,6 @@ fn to_api_response(
             })
         }
     }
-}
-
-/// What `split_route` swaps on `graph` in total: the output for exact in, the input for exact out
-fn emulate_total(
-    split_route: &SplitRoute,
-    graph: &Graph<Pool>,
-    amount: QuoteAmount,
-) -> Result<Balance, anyhow::Error> {
-    let mut total: Balance = 0;
-    let mut pools_delta = PoolsDelta::default();
-    for (part, amount_part) in split_route
-        .parts
-        .iter()
-        .zip(split_exactly(amount.value(), &split_route.parts))
-    {
-        let swapped = match amount {
-            QuoteAmount::ExactIn(_) => {
-                part.route
-                    .emulate_exact_in(graph, amount_part, &mut pools_delta)
-            }
-            QuoteAmount::ExactOut(_) => part
-                .route
-                .emulate_exact_out(graph, amount_part, &mut pools_delta)
-                .map(|(amount_in, _)| amount_in),
-        }
-        .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-        total = total
-            .checked_add(swapped)
-            .ok_or_else(|| anyhow::anyhow!("Total amount overflows u128"))?;
-    }
-    Ok(total)
 }
 
 pub struct Request {
@@ -689,7 +651,7 @@ pub fn find_path_in(
     )?;
     if request.fee_discount.is_some() {
         // Compared to the same route without the fee discount
-        let undiscounted = emulate_total(&split_route, &pools.graph_for(None), request.amount)?;
+        let undiscounted = split_route.emulate_total(&pools.graph_for(None), request.amount)?;
         let (saved, discount, swap_gas) = match &mut response {
             SplitRouteApiResponse::ExactIn {
                 amount_out,

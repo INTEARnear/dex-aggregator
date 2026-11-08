@@ -211,6 +211,7 @@ impl Plach {
             worst_case_amount: U128(worst_case_amount),
             gas: swap_gas,
             discount: fee_discount.map(|_| U128(discount)),
+            oracle_request: None,
         })
     }
 }

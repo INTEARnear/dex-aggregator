@@ -17,13 +17,16 @@ use near_min_api::types::{AccountId, BlockHeight};
 use near_min_api::types::{Balance, NearGas, NearToken};
 #[cfg(feature = "indexer")]
 use pool_indexer::PoolIndexer;
+use ruint::aliases::U256;
 #[cfg(feature = "indexer")]
 use swap_router_types::indexed::{AccountState, Watch};
 #[cfg(feature = "indexer")]
 use tokio::sync::watch;
 
 pub mod dcl;
+mod intear_dex;
 pub mod plach;
+pub mod qoq;
 pub mod rhea;
 mod search;
 
@@ -179,6 +182,14 @@ fn pools_built(dex: PoolsDex, height: BlockHeight) {
         }
         newer
     });
+}
+
+const BASIS_POINTS: u128 = 10_000;
+
+/// `amount` times `basis_points` of [`BASIS_POINTS`], rounded down
+fn with_slippage(amount: Balance, basis_points: u128) -> Balance {
+    let amount = U256::from(amount) * U256::from(basis_points) / U256::from(BASIS_POINTS);
+    amount.to::<Balance>()
 }
 
 /// Slippage from 0 to 1 in basis points, rounded down

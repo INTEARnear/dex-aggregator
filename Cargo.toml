@@ -45,6 +45,7 @@ members = [
     "pathfinder",
     "plach-hook",
     "pool-indexer",
+    "qoq-hook",
     "shadow-proxy",
     "swap-router-types",
 ]

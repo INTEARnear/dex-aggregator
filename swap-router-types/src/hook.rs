@@ -3,14 +3,17 @@ use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 use bigdecimal::BigDecimal;
 use intear_dex_common::AssetId;
 use near_min_api::types::{AccountId, BlockHeight};
-use near_sdk::json_types::{Base64VecU8, U128};
+use near_sdk::{
+    json_types::{Base64VecU8, U128},
+    PublicKeyHandle,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
 use crate::types::{Amount, Gas, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 5;
+pub const HOOK_ABI_VERSION: u32 = 6;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -66,6 +69,17 @@ pub struct HookQuote {
     pub gas: Gas,
     /// What a discount that the message carries saves, already in the estimated amount
     pub discount: Option<U128>,
+    /// What the DEX's swap reads the response of its oracle to, which the operations start with
+    /// an `OracleRequest` of. Only one starts them, so quotes that ask for another one can't be
+    /// fallbacks of this one.
+    pub oracle_request: Option<OracleRequest>,
+}
+
+/// A request to the oracle that has `oracle_key`, on Intear DEX
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OracleRequest {
+    pub oracle_key: PublicKeyHandle,
+    pub request: Base64VecU8,
 }
 
 /// Prices of the smallest units of tokens in the smallest unit of USDt
@@ -408,6 +422,7 @@ mod export_tests {
                 worst_case_amount: U128(1),
                 gas: Gas::from_ggas(20_000, 25_000),
                 discount: None,
+                oracle_request: None,
             }])
         }
     }

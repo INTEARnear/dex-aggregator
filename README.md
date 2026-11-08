@@ -15,6 +15,7 @@ It's separated into 5 crates:
 - `pool-indexer`: keeps a copy of the contract storage that pools are built from.
 - `swap-router-types`: the API's types, the app fee split, the indexed storage, and filling OTC DEX intents, shared by `swap-router` and its hooks. With the `hook` feature, `Hook` and `export_hook!` build a hook library without writing its C ABI.
 - `plach-hook`: Plach as a hook, built with `cargo build --release -p plach-hook` and installed as `hooks/Plach.so` from `target/release/libplach.so`. It signs TEAR fee discounts with `FEE_DISCOUNTER_ACCOUNT_ID` and `FEE_DISCOUNTER_PRIVATE_KEY`.
+- `qoq-hook`: Qoq, the amp DEX of pools rated at an oracle's prices, as a hook, built with `cargo build --release -p qoq-hook` and installed as `hooks/Qoq.so` from `target/release/libqoq.so`. It routes through the pools that ask the oracle whose HTTP API is `QOQ_ORACLE_URL`, at the oracle's prices, and its swaps start with an oracle request of the prices of their pools. While Qoq is in its private beta, it only quotes for `slimedragon.near`.
 
 Routing is deterministic, so running `quote` again on the same block heights and queries gives identical output.
 
@@ -23,7 +24,7 @@ Routing is deterministic, so running `quote` again on the same block heights and
 - `Rhea`: uses `pathfinder`
 - `Wrap`: a no-op route (later converted to the necessary location, check [Different output token locations](#different-output-token-locations))
 - `RheaDcl`: uses `pathfinder`
-- `IntearDex`: every hook's quote in one swap on Intear DEX, a `SwapAdvanced` that tries the best quote first and falls back to the next ones in `FallbackQueue` mode when one fails.
+- `IntearDex`: every hook's quote in one swap on Intear DEX, a `SwapAdvanced` that tries the best quote first and falls back to the next ones in `FallbackQueue` mode when one fails. One oracle request can start the operations, so a quote that asks an oracle, like Qoq's, is only in the queue when it's the best, or asks for the same as the best.
 - `<name>`: a hook, loaded at startup from `hooks/<name>.so` in the working directory, like `Plach` from `plach-hook`.
 
 ## Different output token locations
