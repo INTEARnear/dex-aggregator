@@ -3507,13 +3507,13 @@ dependencies = [
  "anyhow",
  "bigdecimal",
  "borsh",
- "futures-util",
  "intear-dex-common",
  "near-min-api",
  "near-sdk",
  "pathfinder",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "swap-router-types",
  "tokio",
 ]
@@ -5722,6 +5722,10 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "xyk-dex-types"

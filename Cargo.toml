@@ -48,4 +48,5 @@ members = [
     "qoq-hook",
     "shadow-proxy",
     "swap-router-types",
+    "xtask",
 ]

@@ -8,14 +8,15 @@ Refer to https://docs.intear.tech/docs/dex-aggregator/ for integration instructi
 
 ## Architecture
 
-It's separated into 5 crates:
+It's separated into 7 crates:
 
 - `swap-router`: the main aggregator crate, hosts the API and builds transactions. Example URL: https://router.intear.tech/route?token_in=rhea-nep141:wrap.near&token_out=juij.launch.intear.near&amount_in=1000000000000000000000000&slippage_type=Fixed&slippage=0.01&dexes=Rhea%2CWrap%2CRheaDcl%2CPlach&trader_account_id=intear.near&signing_public_key=ed25519%3A4WZAP6JoruNHR2W4mi9fM219viZKYskqLRDYkwBHCUY8&referrer_id=intear.near
 - `pathfinder`: library that finds the best route within the pools of Rhea, Intear Plach or Rhea DCL. Rhea DCL swap math in `pathfinder::dcl` is ported from iZiSwap (GPL-2.0-or-later). `swap-router` runs it in the same process, so a route is found with a function call: `pathfinder::run` follows every final block, keeps Rhea's and Rhea DCL's pool snapshots up to date and gives hooks the storage they watch, and `pathfinder::<dex>::find_path` searches the newest snapshot on a blocking thread. Without its `indexer` feature, it's only the search.
 - `pool-indexer`: keeps a copy of the contract storage that pools are built from.
 - `swap-router-types`: the API's types, the app fee split, the indexed storage, and filling OTC DEX intents, shared by `swap-router` and its hooks. With the `hook` feature, `Hook` and `export_hook!` build a hook library without writing its C ABI.
-- `plach-hook`: Plach as a hook, built with `cargo build --release -p plach-hook` and installed as `hooks/Plach.so` from `target/release/libplach.so`. It signs TEAR fee discounts with `FEE_DISCOUNTER_ACCOUNT_ID` and `FEE_DISCOUNTER_PRIVATE_KEY`.
-- `qoq-hook`: Qoq, the amp DEX of pools rated at an oracle's prices, as a hook, built with `cargo build --release -p qoq-hook` and installed as `hooks/Qoq.so` from `target/release/libqoq.so`. It routes through the pools that ask the oracle whose HTTP API is `QOQ_ORACLE_URL`, at the oracle's prices, and its swaps start with an oracle request of the prices of their pools. While Qoq is in its private beta, it only quotes for `slimedragon.near`.
+- `plach-hook`: Plach dex hook
+- `qoq-hook`: Qoq dex hook
+- `xtask`: build tools
 
 Routing is deterministic, so running `quote` again on the same block heights and queries gives identical output.
 

@@ -1,4 +1,4 @@
-use intear_dex_common::{AssetId, SwapRequestAmount, TokenAmount};
+use intear_dex_common::{AssetId, DexId, SwapRequestAmount, TokenAmount};
 use intear_dex_types::{
     DirectWithdrawAmount, Operation, SwapAdvancedMode, SwapOperationAmount, SwapOption,
     WithdrawAmount,
@@ -260,9 +260,14 @@ fn ft_transfer_gas(token_id: &AccountId) -> Gas {
 /// Not burnt, attached so a call doesn't run out of gas when it burns more than estimated
 const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
 /// Intear DEX runs DEXes in an interpreter, simulated Plach swaps burnt up to 2.6 Tgas more than
-/// estimated
+/// estimated, which is all that's measured of the DEXes it runs other than Qoq
 const INTEAR_DEX_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
 const INTEAR_DEX_SWAP_MARGIN_PERCENT: u64 = 15;
+/// Qoq's swaps burnt no more than estimated in sandbox and in its first swap on mainnet (29.9 of
+/// an estimated 30.2 Tgas after the oracle's response), but its StableSwap math takes more steps
+/// the further a pool is from its balance, which those swaps didn't cover
+const QOQ_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
+const QOQ_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
 /// them in a receipt of their own. Holding them burnt 4 Tgas in sandbox.
 const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(4_000, 4_000);
@@ -734,12 +739,23 @@ impl CallBlueprint {
 impl IntearDexOperations {
     fn gas(&self) -> Gas {
         let swap_options = &self.swap.options;
+        let qoq_dex_id: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
+        let options_gas = |of_qoq: bool| {
+            swap_options
+                .iter()
+                .filter(|option| (option.dex_id == qoq_dex_id) == of_qoq)
+                .map(|option| option.gas)
+                .reduce(|total, gas| total + gas)
+        };
         // The first option usually fills the swap, the engine tries the others until one does
-        let all_options_gas = swap_options
-            .iter()
-            .map(|option| option.gas)
-            .sum::<Gas>()
-            .with_margin(INTEAR_DEX_SWAP_MARGIN, INTEAR_DEX_SWAP_MARGIN_PERCENT);
+        let all_options_gas = [
+            options_gas(true).map(|gas| gas.with_margin(QOQ_SWAP_MARGIN, QOQ_SWAP_MARGIN_PERCENT)),
+            options_gas(false)
+                .map(|gas| gas.with_margin(INTEAR_DEX_SWAP_MARGIN, INTEAR_DEX_SWAP_MARGIN_PERCENT)),
+        ]
+        .into_iter()
+        .flatten()
+        .sum::<Gas>();
         let swap_gas = Gas {
             estimated_burn: swap_options[0].gas.estimated_burn,
             needs_attached: all_options_gas.needs_attached,
@@ -1111,6 +1127,22 @@ mod tests {
             }
             .gas(),
             gas(45_623_182_562_500, 105_323_182_562_500)
+        );
+    }
+
+    #[test]
+    fn qoq_swap_options_get_their_own_margin() {
+        let plach_only = intear_operations(vec![]);
+        let mut with_qoq = intear_operations(vec![]);
+        with_qoq.swap.options.push(IntearDexSwapOption {
+            dex_id: pathfinder::qoq::QOQ_DEX_ID.parse().unwrap(),
+            message: Base64VecU8(vec![2, 0, 0, 0]),
+            gas: Gas::from_ggas(24_800, 24_800),
+        });
+        // 24.8 Tgas, 4 Tgas and 15% of 24.8 Tgas
+        assert_eq!(
+            with_qoq.gas().needs_attached.as_gas() - plach_only.gas().needs_attached.as_gas(),
+            NearGas::from_ggas(32_520).as_gas()
         );
     }
 

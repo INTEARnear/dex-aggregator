@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::search::{self, Graph, MaxHops, QuoteAmount, Settings};
 
-const QOQ_DEX_ID: &str = "slimedragon.near/amp";
+pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
 const SETTINGS: Settings = Settings {
