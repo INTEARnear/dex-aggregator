@@ -34,6 +34,8 @@ intear-dex-common = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d0
 xyk-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d01906ccca1e7363b5fecf2cef537acb06" }
 otc-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d01906ccca1e7363b5fecf2cef537acb06" }
 libloading = "0.9.0"
+inindexer = { git = "https://github.com/INTEARnear/inindexer" }
+trade-indexer = { git = "https://github.com/INTEARnear/trade-indexer", rev = "7c073c50a266d2765df01e18e2722df4a08ddd77" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
 

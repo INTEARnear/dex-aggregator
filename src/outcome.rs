@@ -11,19 +11,19 @@ use near_min_api::{
     types::{
         AccountId, ActionError, ActionErrorKind, ActionView, Balance, BlockHeight, BlockId,
         BlockReference, CryptoHash, ExecutionStatusView, FinalExecutionOutcomeWithReceiptView,
-        FunctionCallError, ReceiptEnumView, TxExecutionError, TxExecutionStatus,
+        FunctionCallError, ReceiptEnumView, ReceiptView, TxExecutionError, TxExecutionStatus,
     },
     ExperimentalTxDetails, QueryFinality, RpcClient,
 };
 use near_sdk::{json_types::U128, NearToken};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::time::Instant;
 
+use inindexer::{transaction_trees::ExecutedReceipt, IndexerExecutionOutcomeWithReceipt};
 use intear_dex_common::AssetId;
+use trade_indexer::{receipt_events, ReceiptEvent};
 
 use crate::{
-    hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
-    providers::{rhea::RHEA_CONTRACT_ID, rhea_dcl::RHEA_DCL_CONTRACT_ID},
     route::{into_transactions, resolve_steps},
     shared_utils::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
@@ -279,8 +279,8 @@ struct ExecutedTransaction {
     native_received: Balance,
     /// Errors of the transaction and its receipts, in the order they executed
     failures: Vec<String>,
-    /// Swaps of the signer that DEXes logged in receipts that succeeded
-    swaps: Vec<LoggedSwap>,
+    /// What the swaps of the signer took and gave of each token
+    traded: HashMap<TokenId, i128>,
 }
 
 impl ExecutedTransaction {
@@ -417,23 +417,6 @@ impl ExecutedTransaction {
             })
             .collect();
 
-        // A receipt that failed keeps the logs it made before failing, but its swaps are reverted
-        let swaps = outcome
-            .receipts_outcome
-            .iter()
-            .filter(|receipt| {
-                matches!(
-                    receipt.outcome.status,
-                    ExecutionStatusView::SuccessValue(_) | ExecutionStatusView::SuccessReceiptId(_)
-                )
-            })
-            .flat_map(|receipt| {
-                receipt.outcome.logs.iter().flat_map(|log| {
-                    logged_swaps(&receipt.outcome.executor_id, log, &transaction.signer_id)
-                })
-            })
-            .collect();
-
         Ok(Self {
             hash: transaction.hash,
             signer_id: transaction.signer_id.clone(),
@@ -446,7 +429,7 @@ impl ExecutedTransaction {
             native_spent,
             native_received,
             failures,
-            swaps,
+            traded: traded_amounts(view)?,
         })
     }
 }
@@ -592,117 +575,92 @@ async fn wait_for_execution(
     }
 }
 
-/// A swap that a DEX logged, with its tokens as they're held in the wallet or on that DEX
-#[derive(Debug, Clone, PartialEq)]
-struct LoggedSwap {
-    token_in: TokenId,
-    token_out: TokenId,
-    amount_in: Balance,
-    amount_out: Balance,
+/// The same view in the types of the indexers, which have the same JSON
+fn indexer_view<View: Serialize, IndexerView: DeserializeOwned>(
+    view: &View,
+) -> Result<IndexerView, String> {
+    serde_json::to_value(view)
+        .and_then(serde_json::from_value)
+        .map_err(|err| format!("Failed to convert {}: {err}", std::any::type_name::<View>()))
 }
 
-/// The `data` of an Intear DEX `swap` event
-#[derive(Deserialize)]
-struct IntearDexSwap {
-    request: IntearDexSwapRequest,
-    amount_in: U128,
-    amount_out: U128,
-    trader: AccountId,
-    #[serde(default)]
-    referral_fees_paid: Vec<(AccountId, U128)>,
-}
-
-#[derive(Deserialize)]
-struct IntearDexSwapRequest {
-    asset_in: String,
-    asset_out: String,
-}
-
-/// An item of the `data` of a Rhea DCL `swap` event
-#[derive(Deserialize)]
-struct RheaDclSwap {
-    swapper: AccountId,
-    token_in: AccountId,
-    token_out: AccountId,
-    amount_in: U128,
-    amount_out: U128,
-}
-
-/// The swaps of `trader` that a log of a receipt executed by `executor_id` tells of: Intear DEX's
-/// and Rhea DCL's `swap` events, and Rhea's `Swapped <in> <token> for <out> <token>[, fees]`
-fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<LoggedSwap> {
-    let event = |standard: &str| {
-        let event: serde_json::Value =
-            serde_json::from_str(log.strip_prefix("EVENT_JSON:")?).ok()?;
-        (event["standard"] == standard && event["event"] == "swap").then(|| event["data"].clone())
-    };
-    match executor_id.as_str() {
-        s if s == INTEAR_DEX_CONTRACT_ID => event("inteardex")
-            .and_then(|data| serde_json::from_value::<IntearDexSwap>(data).ok())
-            .filter(|swap| &swap.trader == trader)
-            .and_then(|swap| {
-                Some(LoggedSwap {
-                    token_in: TokenId::TokenOnIntearDex(
-                        swap.request
-                            .asset_in
-                            .parse::<AssetId>()
-                            .ok()?
-                            .try_into()
-                            .ok()?,
-                    ),
-                    token_out: TokenId::TokenOnIntearDex(
-                        swap.request
-                            .asset_out
-                            .parse::<AssetId>()
-                            .ok()?
-                            .try_into()
-                            .ok()?,
-                    ),
-                    amount_in: swap
-                        .referral_fees_paid
-                        .iter()
-                        .fold(swap.amount_in.0, |amount_in, (_, fee)| {
-                            amount_in.saturating_add(fee.0)
-                        }),
-                    amount_out: swap.amount_out.0,
-                })
-            })
-            .into_iter()
-            .collect(),
-        s if s == RHEA_DCL_CONTRACT_ID => event("dcl.ref")
-            .and_then(|data| serde_json::from_value::<Vec<RheaDclSwap>>(data).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|swap| &swap.swapper == trader)
-            .map(|swap| LoggedSwap {
-                token_in: TokenId::Nep141(swap.token_in),
-                token_out: TokenId::Nep141(swap.token_out),
-                amount_in: swap.amount_in.0,
-                amount_out: swap.amount_out.0,
-            })
-            .collect(),
-        // Rhea doesn't log the trader, but these are the trader's own transactions
-        s if s == RHEA_CONTRACT_ID => (|| {
-            let swap = log.strip_prefix("Swapped ")?;
-            // Stable, rated and degen pools add ", total fee <fee>, admin fee <fee>"
-            let swap = swap
-                .split_once(", total fee ")
-                .map_or(swap, |(swap, _fees)| swap);
-            let words = swap.split(' ').collect::<Vec<_>>();
-            let [amount_in, token_in, "for", amount_out, token_out] = words.as_slice() else {
-                return None;
+/// What the swaps of the signer took and gave of each token, in the receipts of the transaction
+/// that succeeded. Native NEAR traded on Intear DEX is `TokenId::Near`.
+fn traded_amounts(
+    view: &FinalExecutionOutcomeWithReceiptView,
+) -> Result<HashMap<TokenId, i128>, String> {
+    let transaction = &view.final_outcome.transaction;
+    let transaction_id = indexer_view(&transaction.hash)?;
+    // A transaction to the signer's own account is converted to a local receipt, which the RPC
+    // doesn't list with the others
+    let transaction_outcome = &view.final_outcome.transaction_outcome.outcome;
+    let transaction_receipt =
+        transaction_outcome
+            .receipt_ids
+            .first()
+            .map(|receipt_id| ReceiptView {
+                predecessor_id: transaction.signer_id.clone(),
+                receiver_id: transaction.receiver_id.clone(),
+                receipt_id: *receipt_id,
+                receipt: ReceiptEnumView::Action {
+                    signer_id: transaction.signer_id.clone(),
+                    signer_public_key: transaction.public_key.clone(),
+                    gas_price: transaction_outcome.tokens_burnt
+                        / Balance::from(transaction_outcome.gas_burnt.as_gas()),
+                    output_data_receivers: Vec::new(),
+                    input_data_ids: Vec::new(),
+                    actions: transaction.actions.clone(),
+                    is_promise_yield: false,
+                    refund_to: None,
+                },
+                priority: 0,
+            });
+    let receipts = transaction_receipt
+        .iter()
+        .chain(&view.receipts)
+        .map(|receipt| (receipt.receipt_id, receipt))
+        .collect::<HashMap<_, _>>();
+    let mut traded = HashMap::new();
+    for outcome in &view.final_outcome.receipts_outcome {
+        let receipt = receipts.get(&outcome.id).ok_or_else(|| {
+            format!(
+                "Receipt {} of transaction {} is missing",
+                outcome.id, transaction.hash
+            )
+        })?;
+        let receipt = ExecutedReceipt {
+            receipt: IndexerExecutionOutcomeWithReceipt {
+                execution_outcome: indexer_view(outcome)?,
+                receipt: indexer_view(receipt)?,
+                tx_hash: transaction_id,
+            },
+            // Only what the receipt traded is read, not when
+            block_height: 0,
+            block_timestamp_nanosec: 0,
+        };
+        for event in receipt_events(&receipt, transaction_id, None, false) {
+            let ReceiptEvent::BalanceChangeSwap {
+                context,
+                balance_changes,
+                ..
+            } = event
+            else {
+                continue;
             };
-            Some(LoggedSwap {
-                token_in: TokenId::Nep141(token_in.parse().ok()?),
-                token_out: TokenId::Nep141(token_out.parse().ok()?),
-                amount_in: amount_in.parse().ok()?,
-                amount_out: amount_out.parse().ok()?,
-            })
-        })()
-        .into_iter()
-        .collect(),
-        _ => Vec::new(),
+            if context.trader != transaction.signer_id {
+                continue;
+            }
+            for (token, change) in balance_changes.balance_changes {
+                let token = if token == "near" {
+                    TokenId::Near
+                } else {
+                    TokenId::Nep141(token)
+                };
+                *traded.entry(token).or_insert(0) += change;
+            }
+        }
     }
+    Ok(traded)
 }
 
 /// What the swaps of a route did, from what the DEXes logged of them, once each transaction has
@@ -729,31 +687,23 @@ fn swapped(
                 ),
             ));
         }
-        let mut swaps = Vec::new();
-        for execution in
-            std::iter::once(&outcome.transaction_outcome).chain(&outcome.receipts_outcome)
+        // Why it failed is told once everything executed
+        if std::iter::once(&outcome.transaction_outcome)
+            .chain(&outcome.receipts_outcome)
+            .any(|execution| matches!(execution.outcome.status, ExecutionStatusView::Failure(_)))
         {
-            // Why it failed is told once everything executed
-            if let ExecutionStatusView::Failure(_) = execution.outcome.status {
-                return Ok(None);
-            }
-            for log in &execution.outcome.logs {
-                swaps.extend(logged_swaps(
-                    &execution.outcome.executor_id,
-                    log,
-                    trader_account_id,
-                ));
-            }
-        }
-        if !executed && swaps.is_empty() {
             return Ok(None);
         }
-        for swap in swaps {
-            if input_locations.contains(&swap.token_in) {
-                amount_in = amount_in.saturating_add(swap.amount_in);
+        let traded = traded_amounts(view).map_err(|err| (StatusCode::BAD_GATEWAY, err))?;
+        if !executed && traded.is_empty() {
+            return Ok(None);
+        }
+        for (token, change) in traded {
+            if change < 0 && input_locations.contains(&token) {
+                amount_in = amount_in.saturating_add(change.unsigned_abs());
             }
-            if output_locations.contains(&swap.token_out) {
-                amount_out = amount_out.saturating_add(swap.amount_out);
+            if change > 0 && output_locations.contains(&token) {
+                amount_out = amount_out.saturating_add(change.unsigned_abs());
             }
         }
     }
@@ -1001,8 +951,8 @@ async fn outcome_of(
     let output_swapped = same_token
         || transactions
             .iter()
-            .flat_map(|transaction| &transaction.swaps)
-            .any(|swap| output_locations.contains(&swap.token_out) && swap.amount_out > 0);
+            .flat_map(|transaction| &transaction.traded)
+            .any(|(token, change)| output_locations.contains(token) && *change > 0);
     let charge_fee = output_swapped && amount_out > 0;
 
     // Whatever of a token ended up elsewhere is moved to where the trader asked for it, but for
