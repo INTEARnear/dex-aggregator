@@ -629,7 +629,7 @@ struct RheaDclSwap {
 }
 
 /// The swaps of `trader` that a log of a receipt executed by `executor_id` tells of: Intear DEX's
-/// and Rhea DCL's `swap` events, and Rhea's `Swapped <in> <token> for <out> <token>`
+/// and Rhea DCL's `swap` events, and Rhea's `Swapped <in> <token> for <out> <token>[, fees]`
 fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<LoggedSwap> {
     let event = |standard: &str| {
         let event: serde_json::Value =
@@ -683,7 +683,12 @@ fn logged_swaps(executor_id: &AccountId, log: &str, trader: &AccountId) -> Vec<L
             .collect(),
         // Rhea doesn't log the trader, but these are the trader's own transactions
         s if s == RHEA_CONTRACT_ID => (|| {
-            let words = log.strip_prefix("Swapped ")?.split(' ').collect::<Vec<_>>();
+            let swap = log.strip_prefix("Swapped ")?;
+            // Stable, rated and degen pools add ", total fee <fee>, admin fee <fee>"
+            let swap = swap
+                .split_once(", total fee ")
+                .map_or(swap, |(swap, _fees)| swap);
+            let words = swap.split(' ').collect::<Vec<_>>();
             let [amount_in, token_in, "for", amount_out, token_out] = words.as_slice() else {
                 return None;
             };

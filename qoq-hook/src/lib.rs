@@ -21,8 +21,6 @@ use swap_router_types::{
 use crate::oracle_prices::OraclePricesFeed;
 
 const QOQ_DEX_ID: &str = "slimedragon.near/amp";
-/// The only trader that can swap on Qoq while it's in its private beta
-const PRIVATE_BETA_TRADER_ID: &str = "slimedragon.near";
 
 struct Qoq {
     pools: RwLock<Option<Arc<Pools>>>,
@@ -86,13 +84,6 @@ impl Qoq {
         trade: &IntearDexTrade,
         find_path: impl FnOnce(&qoq::Request) -> Result<qoq::Quote, anyhow::Error>,
     ) -> Option<HookQuote> {
-        if trade
-            .trader_account_id
-            .as_ref()
-            .is_none_or(|trader_id| trader_id.as_str() != PRIVATE_BETA_TRADER_ID)
-        {
-            return None;
-        }
         let (near_price_raw, quoted_token_price_raw) = {
             let prices = self.prices.read().unwrap();
             let price = |asset_id: &AssetId| {
@@ -149,9 +140,10 @@ mod tests {
     use super::*;
 
     const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
+    const USDC_TOKEN_ID: &str = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
 
     fn usdc() -> AssetId {
-        AssetId::Nep141("usdc.near".parse().unwrap())
+        AssetId::Nep141(USDC_TOKEN_ID.parse().unwrap())
     }
 
     /// Without pools or oracle prices, which [`Qoq::quote`] gets the route of from `find_path`
@@ -176,37 +168,44 @@ mod tests {
         }
     }
 
-    /// Through pool 1
-    fn find_path(request: &qoq::Request) -> Result<qoq::Quote, anyhow::Error> {
-        Ok(qoq::Quote {
-            routes: vec![SwapRoute {
-                fraction: FULL_ROUTE_FRACTION,
-                pool_ids: vec![PoolId::new(1)],
-            }],
-            estimated_amount: 2_400_000,
-            worst_case_amount: 2_376_000,
-            oracle_key: ORACLE_KEY.parse().unwrap(),
-            prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
-            swap_gas: Gas::from_ggas(24_800, 24_800),
-        })
+    /// Through pool 1, at a tenth of USDC per NEAR times `usdc_per_near_tenths`
+    fn find_path_at(
+        usdc_per_near_tenths: u128,
+    ) -> impl FnOnce(&qoq::Request) -> Result<qoq::Quote, anyhow::Error> {
+        move |request| {
+            let near_to_usdc = |near: u128| near * usdc_per_near_tenths / 10u128.pow(19);
+            let usdc_to_near = |usdc: u128| usdc * 10u128.pow(19) / usdc_per_near_tenths;
+            let estimated_amount = match (&request.token_in, &request.amount) {
+                (AssetId::Near, QuoteAmount::ExactIn(near_in)) => near_to_usdc(*near_in),
+                (AssetId::Near, QuoteAmount::ExactOut(usdc_out)) => usdc_to_near(*usdc_out),
+                (_, QuoteAmount::ExactIn(usdc_in)) => usdc_to_near(*usdc_in),
+                (_, QuoteAmount::ExactOut(near_out)) => near_to_usdc(*near_out),
+            };
+            Ok(qoq::Quote {
+                routes: vec![SwapRoute {
+                    fraction: FULL_ROUTE_FRACTION,
+                    pool_ids: vec![PoolId::new(1)],
+                }],
+                estimated_amount,
+                worst_case_amount: estimated_amount * 99 / 100,
+                oracle_key: ORACLE_KEY.parse().unwrap(),
+                prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
+                swap_gas: Gas::from_ggas(24_800, 24_800),
+            })
+        }
     }
 
     #[test]
-    fn quotes_only_for_the_private_beta_trader() {
+    fn quotes_for_any_trader() {
         let qoq = qoq();
-        assert!(
-            qoq.quote(&trade(Some("slimedragon.near")), find_path)
-                .is_some()
-        );
-        assert!(qoq.quote(&trade(Some("trader.near")), find_path).is_none());
-        assert!(qoq.quote(&trade(None), find_path).is_none());
+        for trader_id in [Some("slimedragon.near"), Some("trader.near"), None] {
+            assert!(qoq.quote(&trade(trader_id), find_path_at(24)).is_some());
+        }
     }
 
     #[test]
     fn swaps_after_asking_the_oracle_for_the_prices_of_the_route() {
-        let quote = qoq()
-            .quote(&trade(Some("slimedragon.near")), find_path)
-            .unwrap();
+        let quote = qoq().quote(&trade(None), find_path_at(24)).unwrap();
         assert_eq!(quote.dex_id, QOQ_DEX_ID.parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(2_400_000));
         assert_eq!(quote.worst_case_amount, U128(2_376_000));
