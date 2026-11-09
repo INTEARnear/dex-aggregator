@@ -184,16 +184,16 @@ fn pools_built(dex: PoolsDex, height: BlockHeight) {
     });
 }
 
-const BASIS_POINTS: u128 = 10_000;
+pub const BASIS_POINTS: u128 = 10_000;
 
 /// `amount` times `basis_points` of [`BASIS_POINTS`], rounded down
-fn with_slippage(amount: Balance, basis_points: u128) -> Balance {
+pub fn with_slippage(amount: Balance, basis_points: u128) -> Balance {
     let amount = U256::from(amount) * U256::from(basis_points) / U256::from(BASIS_POINTS);
     amount.to::<Balance>()
 }
 
 /// Slippage from 0 to 1 in basis points, rounded down
-fn slippage_bp(slippage: &BigDecimal) -> Result<u128, anyhow::Error> {
+pub fn slippage_bp(slippage: &BigDecimal) -> Result<u128, anyhow::Error> {
     if *slippage < 0 || *slippage > 1 {
         anyhow::bail!("Invalid slippage {slippage}");
     }

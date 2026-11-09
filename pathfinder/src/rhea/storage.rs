@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use borsh::BorshDeserialize;
 use near_min_api::types::{AccountId, Balance};
@@ -17,6 +17,8 @@ const DEGENS_KEY: &[u8] = b"custom_degen_key";
 const DEGEN_ORACLES_KEY: &[u8] = b"custom_degen_oracle_config_key";
 /// The contract's state, where admin_fee_bps is
 const STATE_KEY: &[u8] = b"STATE";
+/// Elements of the frozen token set, keys are the prefix and u64 index
+const FROZEN_TOKENS_PREFIX: &[u8] = &[6, b'e'];
 /// Rated pools refuse swaps with a rate this old
 const RATE_EXPIRY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
@@ -29,6 +31,7 @@ pub fn watch() -> Watch {
             DEGENS_KEY.to_vec(),
             DEGEN_ORACLES_KEY.to_vec(),
             STATE_KEY.to_vec(),
+            FROZEN_TOKENS_PREFIX.to_vec(),
         ],
     }
 }
@@ -135,24 +138,61 @@ enum StoredDegenOracle {
     },
 }
 
-/// The first fields of the contract's state, the rest follow admin_fee_bps
+#[derive(BorshDeserialize)]
+struct StoredVector {
+    len: u64,
+    prefix: Vec<u8>,
+}
+
+#[derive(BorshDeserialize)]
+struct StoredUnorderedSet {
+    _index_prefix: Vec<u8>,
+    elements: StoredVector,
+}
+
+/// The first fields of the contract's state, the rest follow frozen_tokens
 #[derive(BorshDeserialize)]
 struct StoredContractHead {
     _owner_id: AccountId,
     _boost_farm_id: AccountId,
     _burrowland_id: AccountId,
     admin_fee_bps: u32,
+    _pools: StoredVector,
+    _accounts_prefix: Vec<u8>,
+    _whitelisted_tokens: StoredUnorderedSet,
+    _guardians: StoredUnorderedSet,
+    _running_state: u8,
+    frozen_tokens: StoredUnorderedSet,
 }
 
-/// The share of curve pools' trade fees that the contract takes, out of FEE_DIVISOR
-fn admin_fee_bps(state: &AccountState) -> Result<u32, anyhow::Error> {
+/// The share of curve pools' trade fees that the contract takes, out of FEE_DIVISOR, and the
+/// tokens it refuses to swap
+fn contract(state: &AccountState) -> Result<(u32, HashSet<AccountId>), anyhow::Error> {
     let value = state
         .entries
         .get(STATE_KEY)
         .ok_or_else(|| anyhow::anyhow!("STATE is missing"))?;
     let head = StoredContractHead::deserialize(&mut value.as_slice())
         .map_err(|e| anyhow::anyhow!("Invalid STATE {value:02x?}: {e}"))?;
-    Ok(head.admin_fee_bps)
+    if head.frozen_tokens.elements.prefix != FROZEN_TOKENS_PREFIX {
+        anyhow::bail!(
+            "Frozen tokens moved to prefix {:02x?}",
+            head.frozen_tokens.elements.prefix
+        );
+    }
+    let frozen_tokens = (0..head.frozen_tokens.elements.len)
+        .map(|index| {
+            let mut key = FROZEN_TOKENS_PREFIX.to_vec();
+            key.extend(index.to_le_bytes());
+            let value = state
+                .entries
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("Frozen token {index} is missing"))?;
+            borsh::from_slice::<AccountId>(value)
+                .map_err(|e| anyhow::anyhow!("Invalid frozen token {index}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((head.admin_fee_bps, frozen_tokens))
 }
 
 /// Rate of tokens without a stored rate
@@ -163,7 +203,7 @@ type Price = Option<Balance>;
 
 pub(super) fn pools(state: &AccountState) -> Result<Vec<Pool>, anyhow::Error> {
     let timestamp = state.block.timestamp_nanosec;
-    let admin_fee_bps = admin_fee_bps(state)?;
+    let (admin_fee_bps, frozen_tokens) = contract(state)?;
     let rates = match state.entries.get(RATES_KEY) {
         Some(value) => borsh::from_slice::<Vec<(AccountId, StoredRate)>>(value)
             .map_err(|e| anyhow::anyhow!("Invalid {}: {e}", String::from_utf8_lossy(RATES_KEY)))?
@@ -214,6 +254,12 @@ pub(super) fn pools(state: &AccountState) -> Result<Vec<Pool>, anyhow::Error> {
         else {
             continue;
         };
+        if tokens
+            .iter()
+            .any(|token_id| frozen_tokens.contains(token_id))
+        {
+            continue;
+        }
         pools.push(Pool {
             id: index,
             tokens: tokens.into(),
@@ -370,4 +416,75 @@ fn amp_factor(pool: &StoredStablePool, timestamp: u64) -> Result<u64, anyhow::Er
         pool.target_amp_factor
     };
     Ok(u64::try_from(amp)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use swap_router_types::indexed::BlockInfo;
+
+    use super::*;
+
+    /// STATE of v2.ref-finance.near at block 223710480
+    const MAINNET_STATE_HEX: &str = concat!(
+        "1c0000007265662d66696e616e63652e737075746e696b2d64616f2e6e65617217000000626f6f73",
+        "746661726d2e7265662d6c6162732e6e65617219000000636f6e74726163742e6d61696e2e627572",
+        "726f772e6e656172d0070000362300000000000001000000000100000001020000000369d9000000",
+        "00000000020000000365020000000469020000000000000002000000046500020000000669000000",
+        "0000000000020000000665020000000769100000000000000002000000076b100000000000000002",
+        "0000000776d0020000020000000969010000000000000002000000096b0100000000000000020000",
+        "0009760109000000777261702e6e65617206000000190000002e6c61756e63682e73686f72656d61",
+        "726b6574732e6e656172180000002e6c61756e63687061642e6a757374686f6f742e6e6561721200",
+        "00002e6d656d652d636f6f6b696e672e6e6561720c0000002e716c797068732e6e65617209000000",
+        "2e746b6e2e6e6561720a0000002e746b6e782e6e656172",
+    );
+    /// The frozen token set of [`MAINNET_STATE_HEX`], empty, and with one token
+    const NO_FROZEN_TOKENS_HEX: &str = "0200000006690000000000000000020000000665";
+    const ONE_FROZEN_TOKEN_HEX: &str = "0200000006690100000000000000020000000665";
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn account_state(entries: Vec<(Vec<u8>, Vec<u8>)>) -> AccountState {
+        AccountState {
+            block: BlockInfo {
+                height: 223710480,
+                hash: Default::default(),
+                timestamp_nanosec: 0,
+            },
+            entries: entries.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn reads_the_admin_fee_and_frozen_tokens_of_mainnet_state() {
+        let state = account_state(vec![(STATE_KEY.to_vec(), from_hex(MAINNET_STATE_HEX))]);
+        let (admin_fee_bps, frozen_tokens) = contract(&state).unwrap();
+        assert_eq!(admin_fee_bps, 2000);
+        assert!(frozen_tokens.is_empty());
+    }
+
+    #[test]
+    fn reads_frozen_tokens_from_their_set() {
+        let state_hex = MAINNET_STATE_HEX.replace(NO_FROZEN_TOKENS_HEX, ONE_FROZEN_TOKEN_HEX);
+        let frozen_token: AccountId = "frozen.near".parse().unwrap();
+        let mut frozen_token_key = FROZEN_TOKENS_PREFIX.to_vec();
+        frozen_token_key.extend(0u64.to_le_bytes());
+        let state = account_state(vec![
+            (STATE_KEY.to_vec(), from_hex(&state_hex)),
+            (frozen_token_key, borsh::to_vec(&frozen_token).unwrap()),
+        ]);
+        let (_, frozen_tokens) = contract(&state).unwrap();
+        assert_eq!(frozen_tokens, HashSet::from([frozen_token]));
+    }
+
+    #[test]
+    fn a_missing_frozen_token_fails() {
+        let state_hex = MAINNET_STATE_HEX.replace(NO_FROZEN_TOKENS_HEX, ONE_FROZEN_TOKEN_HEX);
+        let state = account_state(vec![(STATE_KEY.to_vec(), from_hex(&state_hex))]);
+        assert!(contract(&state).is_err());
+    }
 }

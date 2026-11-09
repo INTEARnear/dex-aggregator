@@ -124,6 +124,25 @@ fn record_stats(
 }
 
 fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
+    const MAX_SLIPPAGE_DECIMALS: i64 = 18;
+
+    let slippages = match &request.slippage {
+        Slippage::Auto {
+            max_slippage,
+            min_slippage,
+        } => vec![max_slippage, min_slippage],
+        Slippage::Fixed { slippage } => vec![slippage],
+    };
+    if slippages
+        .iter()
+        .any(|slippage| slippage.fractional_digit_count() > MAX_SLIPPAGE_DECIMALS)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Slippage must have at most {MAX_SLIPPAGE_DECIMALS} decimals"),
+        ));
+    }
+
     match &request.slippage {
         Slippage::Auto {
             max_slippage,

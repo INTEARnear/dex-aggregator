@@ -100,8 +100,9 @@ impl IntearDexSwap {
     }
 
     /// The quotes, best first, as options that the engine falls back through when one fails. The
-    /// swap is constrained to the loosest of their worst cases, which hooks keep within the trade's
-    /// slippage, so when a quote without slippage fails, one that gives a bit less still fills it.
+    /// swap is constrained to the loosest of their worst cases, but no looser than the trade's
+    /// slippage from the best quote, so when a quote without slippage fails, one that gives a bit
+    /// less still fills it, and the quotes that give less than the slippage allows are left out.
     /// One oracle request starts the operations, so the quotes that ask an oracle for something
     /// else than the best quote does are left out. None without quotes, one quote is swapped on
     /// alone.
@@ -112,10 +113,27 @@ impl IntearDexSwap {
             }
             Amount::AmountOut(_) => quotes.sort_by_key(|quote| quote.estimated_amount.0),
         }
-        let best_oracle_request = oracle_request_of(quotes.first()?);
+        let best = quotes.first()?;
+        let best_oracle_request = oracle_request_of(best);
+        let slippage_bp =
+            pathfinder::slippage_bp(&trade.slippage).expect("Slippage of a trade is from 0 to 1");
+        let worst_case_within_slippage = match trade.amount {
+            Amount::AmountIn(_) => pathfinder::with_slippage(
+                best.estimated_amount.0,
+                pathfinder::BASIS_POINTS - slippage_bp,
+            ),
+            Amount::AmountOut(_) => pathfinder::with_slippage(
+                best.estimated_amount.0,
+                pathfinder::BASIS_POINTS + slippage_bp,
+            ),
+        };
         quotes.retain(|quote| {
             let oracle_request = oracle_request_of(quote);
-            oracle_request.is_none() || oracle_request == best_oracle_request
+            let within_slippage = match trade.amount {
+                Amount::AmountIn(_) => quote.estimated_amount.0 >= worst_case_within_slippage,
+                Amount::AmountOut(_) => quote.estimated_amount.0 <= worst_case_within_slippage,
+            };
+            within_slippage && (oracle_request.is_none() || oracle_request == best_oracle_request)
         });
         if quotes.len() < 2 {
             return quotes.into_iter().next().map(Self::of_quote);
@@ -123,10 +141,15 @@ impl IntearDexSwap {
         let best = &quotes[0];
         let worst_case_amounts = quotes.iter().map(|quote| quote.worst_case_amount.0);
         let worst_case_amount = match trade.amount {
-            Amount::AmountIn(_) => worst_case_amounts.min(),
-            Amount::AmountOut(_) => worst_case_amounts.max(),
-        }
-        .expect("There are several quotes");
+            Amount::AmountIn(_) => worst_case_amounts
+                .min()
+                .expect("There are several quotes")
+                .max(worst_case_within_slippage),
+            Amount::AmountOut(_) => worst_case_amounts
+                .max()
+                .expect("There are several quotes")
+                .min(worst_case_within_slippage),
+        };
         Some(Self {
             estimated_amount: best.estimated_amount.0,
             worst_case_amount,
@@ -723,11 +746,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_in_falls_back_from_the_best_quote_within_the_loosest_worst_case() {
+    fn exact_in_falls_back_from_the_best_quote_within_its_slippage() {
         let (operations, gas) = swap_operations(
             Amount::AmountIn(100),
             vec![
-                quote("slimedragon.near/xyk", 80, 79, 34),
+                quote("slimedragon.near/xyk", 81, 80, 34),
                 quote("slimedragon.near/otc", 82, 82, 27),
             ],
         );
@@ -738,8 +761,9 @@ mod tests {
                     "asset_in": "near",
                     "asset_out": "nep141:ft",
                     "amount": { "Amount": { "ExactIn": "100" } },
-                    // The least of the worst cases, so the fallback fills it when the best fails
-                    "constraint": "79",
+                    // The least of the worst cases, so the fallback fills it when the best fails,
+                    // but no less than 1% slippage from the best quote
+                    "constraint": "81",
                     "options": [
                         { "dex_id": "slimedragon.near/otc", "message": "c2xpbWVkcmFnb24ubmVhci9vdGM=" },
                         { "dex_id": "slimedragon.near/xyk", "message": "c2xpbWVkcmFnb24ubmVhci94eWs=" },
@@ -750,7 +774,7 @@ mod tests {
         );
         assert_eq!(
             operations[1]["Withdraw"]["amount"]["Full"]["at_least"],
-            "79"
+            "81"
         );
         // Enough to try both
         assert_eq!(
@@ -760,19 +784,50 @@ mod tests {
     }
 
     #[test]
-    fn exact_out_falls_back_from_the_cheapest_quote_within_the_loosest_worst_case() {
+    fn exact_out_falls_back_from_the_cheapest_quote_within_its_slippage() {
         let (operations, _) = swap_operations(
             Amount::AmountOut(80),
             vec![
-                quote("slimedragon.near/otc", 101, 101, 27),
-                quote("slimedragon.near/xyk", 100, 102, 34),
+                quote("slimedragon.near/xyk", 101, 102, 34),
+                quote("slimedragon.near/otc", 100, 100, 27),
             ],
         );
         let swap = &operations[0]["SwapAdvanced"];
-        // The most of the worst cases
-        assert_eq!(swap["constraint"], "102");
-        assert_eq!(swap["options"][0]["dex_id"], "slimedragon.near/xyk");
-        assert_eq!(swap["options"][1]["dex_id"], "slimedragon.near/otc");
+        // The most of the worst cases, but no more than 1% slippage from the cheapest quote
+        assert_eq!(swap["constraint"], "101");
+        assert_eq!(swap["options"][0]["dex_id"], "slimedragon.near/otc");
+        assert_eq!(swap["options"][1]["dex_id"], "slimedragon.near/xyk");
+    }
+
+    #[test]
+    fn quotes_that_give_less_than_the_slippage_allows_from_the_best_are_left_out() {
+        let (operations, _) = swap_operations(
+            Amount::AmountIn(100),
+            vec![
+                quote("slimedragon.near/xyk", 80, 79, 34),
+                quote("slimedragon.near/otc", 82, 82, 27),
+            ],
+        );
+        assert_eq!(
+            operations[0]["SwapSimple"]["dex_id"],
+            "slimedragon.near/otc"
+        );
+        assert_eq!(operations[0]["SwapSimple"]["constraint"], "82");
+    }
+
+    #[test]
+    fn exact_out_quotes_that_take_more_than_the_slippage_allows_from_the_cheapest_are_left_out() {
+        let (operations, _) = swap_operations(
+            Amount::AmountOut(80),
+            vec![
+                quote("slimedragon.near/xyk", 102, 103, 34),
+                quote("slimedragon.near/otc", 100, 100, 27),
+            ],
+        );
+        assert_eq!(
+            operations[0]["SwapSimple"]["dex_id"],
+            "slimedragon.near/otc"
+        );
     }
 
     #[test]
@@ -780,7 +835,7 @@ mod tests {
         let (operations, gas) = swap_operations(
             Amount::AmountIn(100),
             vec![
-                quote("slimedragon.near/xyk", 80, 79, 34),
+                quote("slimedragon.near/xyk", 81, 80, 34),
                 oracle_quote("slimedragon.near/amp", 82, 82, 25, b"near,usdc"),
                 // Can't be a fallback, since it asks for something else
                 oracle_quote("slimedragon.near/amp", 81, 81, 25, b"near,usdt"),

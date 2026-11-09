@@ -279,6 +279,8 @@ struct ExecutedTransaction {
     native_received: Balance,
     /// Errors of the transaction and its receipts, in the order they executed
     failures: Vec<String>,
+    /// Swaps of the signer that DEXes logged in receipts that succeeded
+    swaps: Vec<LoggedSwap>,
 }
 
 impl ExecutedTransaction {
@@ -415,6 +417,23 @@ impl ExecutedTransaction {
             })
             .collect();
 
+        // A receipt that failed keeps the logs it made before failing, but its swaps are reverted
+        let swaps = outcome
+            .receipts_outcome
+            .iter()
+            .filter(|receipt| {
+                matches!(
+                    receipt.outcome.status,
+                    ExecutionStatusView::SuccessValue(_) | ExecutionStatusView::SuccessReceiptId(_)
+                )
+            })
+            .flat_map(|receipt| {
+                receipt.outcome.logs.iter().flat_map(|log| {
+                    logged_swaps(&receipt.outcome.executor_id, log, &transaction.signer_id)
+                })
+            })
+            .collect();
+
         Ok(Self {
             hash: transaction.hash,
             signer_id: transaction.signer_id.clone(),
@@ -427,6 +446,7 @@ impl ExecutedTransaction {
             native_spent,
             native_received,
             failures,
+            swaps,
         })
     }
 }
@@ -973,7 +993,12 @@ async fn outcome_of(
     };
     let amount_in = (-input_change).max(0).unsigned_abs();
     let amount_out = output_change.max(0).unsigned_abs();
-    let charge_fee = amount_out > 0;
+    let output_swapped = same_token
+        || transactions
+            .iter()
+            .flat_map(|transaction| &transaction.swaps)
+            .any(|swap| output_locations.contains(&swap.token_out) && swap.amount_out > 0);
+    let charge_fee = output_swapped && amount_out > 0;
 
     // Whatever of a token ended up elsewhere is moved to where the trader asked for it, but for
     // what the fee transactions pay out of the wallet after a swap that went through
