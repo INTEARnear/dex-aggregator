@@ -17,7 +17,7 @@ fn main() -> ExitCode {
             Ok(_) => run(),
             Err(err) => Err(err),
         },
-        _ => Err("Usage: cargo xtask hooks | cargo xtask run [ARGS of swap-router]".to_string()),
+        _ => Err("Usage: cargo xtask hooks | cargo xtask run".to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
