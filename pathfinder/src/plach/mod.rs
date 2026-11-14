@@ -458,10 +458,10 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 
-const SWAP_GAS: Gas = Gas::from_ggas(17_900, 17_900);
+const SWAP_GAS: Gas = Gas::from_ggas(7_200, 7_200);
 const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
 const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
-const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_500, 1_500);
+const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 
 fn swap_gas(split_route: &SplitRoute) -> Gas {
     let hops = split_route
@@ -932,10 +932,9 @@ mod tests {
             },
         )
         .unwrap();
-        // 17.9 to load the DEX and 2 for the pool, the engine call attaches the margin
         assert!(matches!(
             response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(19_900, 19_900)
+            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(9_200, 9_200)
         ));
     }
 }

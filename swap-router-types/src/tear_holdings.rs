@@ -5,12 +5,12 @@ use std::{
 };
 
 use near_min_api::{
-    QueryFinality, RpcClient,
     types::{AccountId, Balance, Finality},
+    QueryFinality, RpcClient,
 };
 use near_sdk::json_types::U128;
 use serde::Deserialize;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::fee_discount::{TEAR_STAKING_CONTRACT_ID, TEAR_TOKEN_ID};
 
@@ -85,8 +85,7 @@ impl TearHoldings {
             .expect("TEAR holdings are fetched as long as the hook is loaded");
     }
 
-    /// With the traders it's asked to fetch
-    #[cfg(test)]
+    /// With the traders it's asked to fetch, which it doesn't fetch, for the tests of hooks
     pub fn known(
         holdings: impl IntoIterator<Item = (AccountId, Balance)>,
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<AccountId>) {

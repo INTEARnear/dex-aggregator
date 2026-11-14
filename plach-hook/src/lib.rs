@@ -1,6 +1,3 @@
-mod fee_discount;
-mod tear_holdings;
-
 use std::sync::{Arc, RwLock};
 
 use bigdecimal::Zero;
@@ -13,18 +10,14 @@ use pathfinder::{
 };
 use swap_router_types::{
     export_hook,
+    fee_discount::{FEE_DISCOUNT_VALIDITY_BLOCKS, FeeDiscounter, tear_fee_discount},
     hook::{Hook, HookInput, HookQuote, IntearDexTrade, Prices},
     indexed::{AccountState, Watch},
+    tear_holdings::TearHoldings,
     types::Amount,
 };
 use xyk_dex_types::{FeeDiscount, PoolId, RouteFraction, SwapArgs, SwapRoute};
 
-use crate::{
-    fee_discount::{FEE_DISCOUNT_VALIDITY_BLOCKS, FeeDiscounter, tear_fee_discount},
-    tear_holdings::TearHoldings,
-};
-
-const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 
 struct Plach {
@@ -188,15 +181,18 @@ impl Plach {
             return None;
         }
         let signed_fee_discount = fee_discount.map(|fee_discount| {
-            self.fee_discounter.sign(FeeDiscount {
-                route: swap_routes.clone(),
-                asset_in: trade.asset_in.clone(),
-                asset_out: trade.asset_out.clone(),
-                trader_id: trade.trader_account_id.clone(),
-                amount: dex_amount,
-                fee_discount,
-                expiration_block_height: block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
-            })
+            self.fee_discounter.sign(
+                &PLACH_DEX_ID.parse().unwrap(),
+                FeeDiscount {
+                    route: swap_routes.clone(),
+                    asset_in: trade.asset_in.clone(),
+                    asset_out: trade.asset_out.clone(),
+                    trader_id: trade.trader_account_id.clone(),
+                    amount: dex_amount,
+                    fee_discount,
+                    expiration_block_height: block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
+                },
+            )
         });
         Some(HookQuote {
             dex_id: PLACH_DEX_ID.parse().unwrap(),
@@ -225,7 +221,7 @@ mod tests {
     use xyk_dex_types::{FULL_ROUTE_FRACTION, SignedFeeDiscount};
 
     use super::*;
-    use crate::fee_discount::fee_discount_signature_payload;
+    use swap_router_types::fee_discount::fee_discount_signature_payload;
 
     const ONE_TEAR: u128 = 10u128.pow(24);
 
@@ -350,7 +346,11 @@ mod tests {
                 .unwrap()
                 .verify(
                     &Sha256::digest(
-                        borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap()
+                        borsh::to_vec(&fee_discount_signature_payload(
+                            &PLACH_DEX_ID.parse().unwrap(),
+                            &discount
+                        ))
+                        .unwrap()
                     ),
                     &plach.fee_discounter.secret_key.public_key(),
                 )

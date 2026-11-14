@@ -1,5 +1,5 @@
 use amp_dex_types::{
-    Amplification, AssetWithBalance, FeeFraction, PayoutGroups, Price, TotalShares,
+    Amplification, AssetWithBalance, FeeConfiguration, PayoutGroups, Price, TotalShares,
 };
 use borsh::BorshDeserialize;
 use near_sdk::PublicKeyHandle;
@@ -17,7 +17,7 @@ pub struct StoredPool {
     pub amplification: Amplification,
     pub oracle_key: PublicKeyHandle,
     pub _last_oracle_price: Price,
-    pub fee: FeeFraction,
+    pub fees: FeeConfiguration,
     pub _providers_prefix: Vec<u8>,
     pub _total_shares: TotalShares,
     pub _payout_groups: PayoutGroups,

@@ -317,15 +317,12 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
     )?)
 }
 
-// Source of SWAP_GAS and HOP_GAS: routes simulated on mainnet state with INTEAR_simulate_transactions
-const SWAP_GAS: Gas = Gas::from_ggas(3_000, 3_000);
-const HOP_GAS: Gas = Gas::from_ggas(7_000, 7_000);
-const RANGE_GAS: Gas = Gas::from_ggas(3_000, 3_000);
-const CROSSING_GAS: Gas = Gas::from_ggas(500, 500);
-const ORDER_GAS: Gas = Gas::from_ggas(4_000, 4_000);
-const BITMAP_WORD_GAS: Gas = Gas::from_ggas(50, 50);
-/// Simulated swaps burnt up to 3.9 Tgas more than estimated, and the estimate can't see what
-/// the amount changes, small ones burn up to half of it
+const SWAP_GAS: Gas = Gas::from_ggas(7_300, 7_300);
+const HOP_GAS: Gas = Gas::from_ggas(1_500, 1_500);
+const RANGE_GAS: Gas = Gas::from_ggas(3_100, 3_100);
+const CROSSING_GAS: Gas = Gas::from_ggas(1_000, 1_000);
+const ORDER_GAS: Gas = Gas::from_ggas(1_800, 1_800);
+const BITMAP_WORD_GAS: Gas = Gas::from_ggas(60, 60);
 const GAS_MARGIN: NearGas = NearGas::from_tgas(8);
 const GAS_MARGIN_PERCENT: u64 = 30;
 

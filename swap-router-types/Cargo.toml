@@ -12,12 +12,13 @@ num-traits = "0.2.19"
 sha2 = "0.10.9"
 borsh = { version = "1.6.0", features = ["derive"] }
 near-min-api = { git = "https://github.com/INTEARnear/wallet" }
-intear-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d01906ccca1e7363b5fecf2cef537acb06" }
-intear-dex-common = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d01906ccca1e7363b5fecf2cef537acb06" }
-otc-dex-types = { git = "https://github.com/INTEARnear/dex", rev = "6895c0d01906ccca1e7363b5fecf2cef537acb06" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex" }
+intear-dex-common = { git = "https://github.com/INTEARnear/dex" }
+otc-dex-types = { git = "https://github.com/INTEARnear/dex" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
+tokio = { version = "1.45.1", features = ["rt", "sync", "macros"], optional = true }
 
 [features]
 # For usage in hooks
-hook = []
+hook = ["dep:tokio"]

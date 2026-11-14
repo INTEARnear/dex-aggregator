@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(options[0]["dex_id"], "slimedragon.near/amp");
         assert_eq!(options[1]["dex_id"], "slimedragon.near/xyk");
         // The deposit is held while the operations wait for the oracle
-        let oracle_request_and_held_deposit = NearGas::from_tgas(4 + 5);
+        let oracle_request_and_held_deposit = NearGas::from_tgas(4 + 15);
         // Qoq's option has a fixed margin of its own besides the other options'
         let qoq_swap_margin = NearGas::from_tgas(4);
         assert_eq!(

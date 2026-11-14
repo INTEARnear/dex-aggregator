@@ -259,21 +259,20 @@ fn ft_transfer_gas(token_id: &AccountId) -> Gas {
 
 /// Not burnt, attached so a call doesn't run out of gas when it burns more than estimated
 const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
-/// Intear DEX runs DEXes in an interpreter, simulated Plach swaps burnt up to 2.6 Tgas more than
-/// estimated, which is all that's measured of the DEXes it runs other than Qoq
+/// Intear DEX runs DEXes in an interpreter, simulated Plach and OTC swaps burnt up to 0.8 Tgas
+/// more than estimated
 const INTEAR_DEX_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
 const INTEAR_DEX_SWAP_MARGIN_PERCENT: u64 = 15;
-/// Qoq's swaps burnt no more than estimated in sandbox and in its first swap on mainnet (29.9 of
-/// an estimated 30.2 Tgas after the oracle's response), but its StableSwap math takes more steps
-/// the further a pool is from its balance, which those swaps didn't cover
+/// Simulated Qoq swaps of 1 to 500 NEAR burnt up to 0.2 Tgas more than estimated, its StableSwap
+/// math takes more steps the further a pool is from its balance
 const QOQ_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
 const QOQ_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
 /// them in a receipt of their own. Holding them burnt 4 Tgas in sandbox.
 const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(4_000, 4_000);
-/// What Intear DEX attaches to the call after the operations of a deposit that waited for an
-/// oracle, which refunds the deposit if they failed
-const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(5_000, 5_000);
+/// What Intear DEX attaches to the calls after the operations of a deposit that waited for an
+/// oracle, which refund the deposit if they failed
+const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(4_300, 15_000);
 /// Under what a transaction can attach, with room for the other calls in it
 const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 

@@ -1,6 +1,6 @@
 use intear_dex_common::{AssetId, TokenAmount};
 use near_min_api::types::{
-    near_crypto::{SecretKey, Signature},
+    near_crypto::{KeyType, SecretKey, Signature},
     AccountId,
 };
 use near_sdk::json_types::{Base64VecU8, U128};
@@ -14,7 +14,14 @@ use crate::{
     types::{Amount, Gas},
 };
 
-pub const OTC_SWAP_GAS: Gas = Gas::from_ggas(22_000, 50_000);
+/// Of a swap with an intent signed by a key of `key_type`
+pub fn otc_swap_gas(key_type: KeyType) -> Gas {
+    match key_type {
+        KeyType::ED25519 => Gas::from_ggas(13_000, 13_000),
+        KeyType::SECP256K1 => Gas::from_ggas(13_100, 13_100),
+        KeyType::MLDSA65 => Gas::from_ggas(16_800, 16_800),
+    }
+}
 
 /// What a market maker's intent takes the other side of: the trader sends `asset_in` and gets
 /// `asset_out`
@@ -63,8 +70,7 @@ impl OtcTrade {
 }
 
 /// Signs `trade_intent` the way the OTC DEX `otc_dex_id` on mainnet's Intear DEX checks it, with a
-/// `nonce` the intent can't be filled with again while it's valid. Only ED25519 and SECP256K1 keys
-/// can sign for the OTC DEX.
+/// `nonce` the intent can't be filled with again while it's valid
 pub fn sign_intent(
     secret_key: &SecretKey,
     otc_dex_id: &intear_dex_common::DexId,
@@ -85,7 +91,7 @@ pub fn sign_intent(
         signature @ Signature::SECP256K1(_) => {
             near_sdk::borsh::to_vec(&signature).unwrap()[1..].to_vec()
         }
-        Signature::MLDSA65(_) => panic!("The OTC DEX can't verify ML-DSA-65 signatures"),
+        Signature::MLDSA65(signature) => signature.0.to_vec(),
     };
     AuthorizedTradeIntent {
         trade_intent: payload.trade_intent,
@@ -144,7 +150,7 @@ mod tests {
         assert!(OtcTrade::of_trade(&trade(Amount::AmountIn(1), None)).is_none());
     }
     #[test]
-    fn signs_the_payload_the_otc_dex_verifies_with_both_key_types() {
+    fn signs_the_payload_the_otc_dex_verifies_with_every_key_type() {
         let otc_dex_id: intear_dex_common::DexId = "owner.near/otc".parse().unwrap();
         let trade_intent = TradeIntent {
             user_id: "maker.near".parse().unwrap(),
@@ -157,7 +163,7 @@ mod tests {
                 only_for_whitelisted_parties: Some(vec!["trader.near".parse().unwrap()]),
             },
         };
-        for key_type in [KeyType::ED25519, KeyType::SECP256K1] {
+        for key_type in [KeyType::ED25519, KeyType::SECP256K1, KeyType::MLDSA65] {
             let secret_key = SecretKey::from_seed(key_type, "maker");
             let AuthorizedTradeIntent {
                 authorization_method: AuthorizationMethod::Signature { signature, nonce },

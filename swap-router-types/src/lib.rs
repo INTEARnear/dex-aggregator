@@ -1,7 +1,11 @@
+#[cfg(feature = "hook")]
+pub mod fee_discount;
 pub mod fees;
 pub mod hook;
 pub mod indexed;
 pub mod otc;
+#[cfg(feature = "hook")]
+pub mod tear_holdings;
 pub mod types;
 
 pub use intear_dex_common;

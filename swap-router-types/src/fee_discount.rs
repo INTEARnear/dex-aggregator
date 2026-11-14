@@ -1,14 +1,13 @@
+use intear_dex_common::{
+    DexId, FeeDiscount, FeeDiscountFraction, FeeDiscountSignaturePayload, SignedFeeDiscount,
+    FULL_FEE_DISCOUNT,
+};
 use near_min_api::types::{
-    AccountId, Balance, BlockHeight,
     near_crypto::{SecretKey, Signature},
+    AccountId, Balance, BlockHeight,
 };
+use near_sdk::borsh::BorshSerialize;
 use sha2::{Digest, Sha256};
-use xyk_dex_types::{
-    FULL_FEE_DISCOUNT, FeeDiscount, FeeDiscountFraction, FeeDiscountSignaturePayload,
-    SignedFeeDiscount,
-};
-
-use crate::{INTEAR_DEX_CONTRACT_ID, PLACH_DEX_ID};
 
 pub const TEAR_TOKEN_ID: &str = "token.intear.near";
 pub const TEAR_STAKING_CONTRACT_ID: &str = "stakeyourtears.intear.near";
@@ -43,9 +42,9 @@ pub fn tear_fee_discount(tear_balance: Balance) -> Option<FeeDiscountFraction> {
         .map(|(_, fee_discount)| fee_discount)
 }
 
-/// Signs fee discounts with the key set as the xyk DEX's fee discount signer
+/// Signs fee discounts with the key set as the fee discount signer of the DEXes
 pub struct FeeDiscounter {
-    pub(crate) secret_key: SecretKey,
+    pub secret_key: SecretKey,
 }
 
 impl FeeDiscounter {
@@ -58,21 +57,27 @@ impl FeeDiscounter {
             .parse()
             .map_err(|err| format!("Invalid FEE_DISCOUNTER_PRIVATE_KEY: {err}"))?;
         eprintln!(
-            "Signing Plach fee discounts as {account_id} with {}",
+            "Signing fee discounts as {account_id} with {}",
             secret_key.public_key()
         );
         Ok(Self { secret_key })
     }
 
-    /// Signs sha256(borsh([`FeeDiscountSignaturePayload`])) of `discount` for Plach on mainnet
-    /// Intear DEX, which the DEX verifies
-    pub fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
-        let hash =
-            Sha256::digest(borsh::to_vec(&fee_discount_signature_payload(&discount)).unwrap());
+    /// Signs sha256(borsh([`FeeDiscountSignaturePayload`])) of `discount` for `dex_id` on
+    /// mainnet Intear DEX, which the DEX verifies
+    pub fn sign<Route: BorshSerialize + Clone>(
+        &self,
+        dex_id: &DexId,
+        discount: FeeDiscount<Route>,
+    ) -> SignedFeeDiscount<Route> {
+        let payload = fee_discount_signature_payload(dex_id, &discount);
+        let hash = Sha256::digest(near_sdk::borsh::to_vec(&payload).unwrap());
         let signature = match self.secret_key.sign(&hash) {
             Signature::ED25519(signature) => signature.to_bytes().to_vec(),
             // Borsh puts the key type before the 65 bytes of r, s, and the recovery id
-            signature @ Signature::SECP256K1(_) => borsh::to_vec(&signature).unwrap()[1..].to_vec(),
+            signature @ Signature::SECP256K1(_) => {
+                near_sdk::borsh::to_vec(&signature).unwrap()[1..].to_vec()
+            }
             Signature::MLDSA65(_) => panic!("The DEX can't verify ML-DSA-65 fee discounts"),
         };
         SignedFeeDiscount {
@@ -82,11 +87,14 @@ impl FeeDiscounter {
     }
 }
 
-pub fn fee_discount_signature_payload(discount: &FeeDiscount) -> FeeDiscountSignaturePayload {
+pub fn fee_discount_signature_payload<Route: Clone>(
+    dex_id: &DexId,
+    discount: &FeeDiscount<Route>,
+) -> FeeDiscountSignaturePayload<Route> {
     FeeDiscountSignaturePayload {
         chain_id: "mainnet".to_string(),
-        engine_contract_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
-        dex_id: PLACH_DEX_ID.parse().unwrap(),
+        engine_contract_id: "dex.intear.near".parse().unwrap(),
+        dex_id: dex_id.clone(),
         discount: discount.clone(),
     }
 }
