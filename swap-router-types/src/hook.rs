@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
 use intear_dex_common::AssetId;
-use near_min_api::types::{AccountId, BlockHeight};
+use near_min_api::types::{AccountId, BlockHeight, NearToken};
 use near_sdk::{
     json_types::{Base64VecU8, U128},
     PublicKeyHandle,
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
-use crate::types::{Amount, Gas, Quote, SwapRequest};
+use crate::types::{Amount, CostPrices, Gas, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 6;
+pub const HOOK_ABI_VERSION: u32 = 7;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -51,6 +51,21 @@ pub struct HookInput<'a> {
     pub block_height: BlockHeight,
     /// The quotes of the other DEXes, best first
     pub quotes: Cow<'a, [Quote]>,
+    pub route_costs: Cow<'a, IntearDexRouteCosts>,
+}
+
+/// What the route of a hook's quote costs besides the gas its swap burns, which the aggregator
+/// ranks it with against the other quotes, as [`crate::types::net_amount`] does
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntearDexRouteCosts {
+    /// The gas fee and storage deposits of the route
+    pub without_oracle_request: NearToken,
+    /// The same, when the swap's operations start with an oracle request
+    pub with_oracle_request: NearToken,
+    /// Of a unit of gas that the swap burns
+    pub gas_price: NearToken,
+    /// None when quotes are ranked by their amounts alone
+    pub prices: Option<CostPrices>,
 }
 
 /// A swap on Intear DEX that a hook quotes for the [`IntearDexTrade`]. The aggregator builds its
@@ -337,6 +352,15 @@ mod tests {
             trade: Cow::Borrowed(&trade),
             block_height: 100,
             quotes: Cow::Borrowed(&quotes),
+            route_costs: Cow::Owned(IntearDexRouteCosts {
+                without_oracle_request: NearToken::from_millinear(1),
+                with_oracle_request: NearToken::from_millinear(2),
+                gas_price: NearToken::from_yoctonear(100_000_000),
+                prices: Some(CostPrices {
+                    near_price_raw: "0.000000000000000000000002".parse().unwrap(),
+                    quoted_token_price_raw: "0.000001".parse().unwrap(),
+                }),
+            }),
         })
         .unwrap()
     }
@@ -357,6 +381,10 @@ mod tests {
         assert_eq!(read.trade.amount, Amount::AmountIn(995));
         assert_eq!(read.trade.slippage, "0.01".parse::<BigDecimal>().unwrap());
         assert_eq!(read.quotes.len(), 1);
+        assert_eq!(
+            read.route_costs.prices.as_ref().unwrap().near_price_raw,
+            "0.000000000000000000000002".parse::<BigDecimal>().unwrap()
+        );
         assert_eq!(serde_json::to_string(&read).unwrap(), input);
     }
 

@@ -37,7 +37,8 @@ pub enum SplitRouteApiResponse {
         contract_out: AssetId,
         amount_in: U128,
         amount_out: U128,
-        /// Added to `amount_out` by the fee discount, 0 without one
+        /// Added to `amount_out` by the fee discount on top of the one it's counted from, 0
+        /// without one
         discount: U128,
         swap_gas: Gas,
     },
@@ -48,7 +49,8 @@ pub enum SplitRouteApiResponse {
         amount_in: U128,
         max_amount_in: U128,
         amount_out: U128,
-        /// Taken off `amount_in` by the fee discount, 0 without one
+        /// Taken off `amount_in` by the fee discount on top of the one it's counted from, 0
+        /// without one
         discount: U128,
         swap_gas: Gas,
     },
@@ -614,6 +616,8 @@ pub struct Request {
     pub quoted_token_price_raw: BigDecimal,
     /// Taken off the pool and protocol fees of every pool by a signed fee discount
     pub fee_discount: Option<FeeDiscountFraction>,
+    /// The fee discount that the response's `discount` is counted from, on the same route
+    pub discount_counted_from: Option<FeeDiscountFraction>,
 }
 
 pub fn find_path_in(
@@ -650,21 +654,24 @@ pub fn find_path_in(
         slippage_bp,
     )?;
     if request.fee_discount.is_some() {
-        // Compared to the same route without the fee discount
-        let undiscounted = split_route.emulate_total(&pools.graph_for(None), request.amount)?;
+        // Compared to the same route with the discount it's counted from
+        let counted_from = split_route.emulate_total(
+            &pools.graph_for(request.discount_counted_from),
+            request.amount,
+        )?;
         let (saved, discount, swap_gas) = match &mut response {
             SplitRouteApiResponse::ExactIn {
                 amount_out,
                 discount,
                 swap_gas,
                 ..
-            } => (amount_out.0.checked_sub(undiscounted), discount, swap_gas),
+            } => (amount_out.0.checked_sub(counted_from), discount, swap_gas),
             SplitRouteApiResponse::ExactOut {
                 amount_in,
                 discount,
                 swap_gas,
                 ..
-            } => (undiscounted.checked_sub(amount_in.0), discount, swap_gas),
+            } => (counted_from.checked_sub(amount_in.0), discount, swap_gas),
         };
         *discount =
             U128(saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?);
@@ -929,6 +936,7 @@ mod tests {
                 near_price_raw: BigDecimal::from(1),
                 quoted_token_price_raw: BigDecimal::from(1),
                 fee_discount: None,
+                discount_counted_from: None,
             },
         )
         .unwrap();

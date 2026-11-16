@@ -1,8 +1,13 @@
+use bigdecimal::Zero;
 use intear_dex_common::{AssetId, TokenAmount};
 use intear_dex_types::ReferralFees;
 use near_min_api::types::{AccountId, NearToken};
-use near_sdk::json_types::U128;
-use swap_router_types::hook::{HookQuote, IntearDexTrade};
+use near_sdk::json_types::{Base64VecU8, U128};
+use swap_router_types::{
+    fees::amount_in_with_referral_fees,
+    hook::{HookQuote, IntearDexTrade, OracleRequest},
+    types::Gas,
+};
 
 use crate::{
     calls::{
@@ -99,6 +104,32 @@ impl IntearDexSwap {
         }
     }
 
+    /// A swap whose costs are only those of its route: it burns no gas and asks the oracle, if it
+    /// does, for nothing. Its quote gives less in the worst case when the trade has slippage, as
+    /// the hooks' quotes do, so the route converts the output the same way.
+    pub fn burning_no_gas(trade: &IntearDexTrade, asks_oracle: bool) -> Self {
+        let trade_amount = match trade.amount {
+            Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
+        };
+        let worst_case_amount = match trade.amount {
+            _ if trade.slippage.is_zero() => trade_amount,
+            Amount::AmountIn(_) => trade_amount - 1,
+            Amount::AmountOut(_) => trade_amount + 1,
+        };
+        Self::of_quote(HookQuote {
+            dex_id: "placeholder.near/burning-no-gas".parse().unwrap(),
+            message: Base64VecU8(vec![]),
+            estimated_amount: U128(trade_amount),
+            worst_case_amount: U128(worst_case_amount),
+            gas: Gas::from_ggas(0, 0),
+            discount: None,
+            oracle_request: asks_oracle.then(|| OracleRequest {
+                oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
+                request: Base64VecU8(vec![]),
+            }),
+        })
+    }
+
     /// The quotes, best first, as options that the engine falls back through when one fails. The
     /// swap is constrained to the loosest of their worst cases, but no looser than the trade's
     /// slippage from the best quote, so when a quote without slippage fails, one that gives a bit
@@ -190,7 +221,6 @@ pub fn route(
     let token_out = IntearAssetId::try_from(trade.asset_out.clone())
         .expect("Trades are only of NEAR and NEP-141s");
     let referral_fees = payable_referral_fees(&request.fees);
-    let engine_referral_fees = ReferralFees::from(&referral_fees);
     let discount = swap.discount.map(|discount| match request.amount {
         Amount::AmountIn(_) => Amount::AmountOut(discount.0),
         Amount::AmountOut(_) => Amount::AmountIn(discount.0),
@@ -205,12 +235,8 @@ pub fn route(
         Amount::AmountOut(_) => {
             // Fees on top of the input the DEX takes, so the most it can take with them is the
             // constraint
-            let with_fees = |amount_in: u128| {
-                amount_in
-                    + fees_total(
-                        engine_referral_fees.amounts_on_top_of(TokenAmount::new(amount_in)),
-                    )
-            };
+            let with_fees =
+                |amount_in: u128| amount_in_with_referral_fees(&request.fees, amount_in);
             (
                 with_fees(swap.worst_case_amount),
                 Amount::AmountIn(with_fees(swap.estimated_amount)),
@@ -1254,6 +1280,42 @@ mod tests {
         })
         .unwrap();
         assert_eq!(last_call(&route).0["operations"]["referrer"], "ref.near");
+    }
+
+    #[tokio::test]
+    async fn a_swap_burning_no_gas_costs_what_the_route_costs_besides_the_swap() {
+        let network = TestNetworkView::default().with_test_prices();
+        let request = request(TokenId::Near, ft_output(), Amount::AmountIn(10u128.pow(24)));
+        let trade = trade_of_request(&network, &request).unwrap();
+        let resolved = |route| async { resolve(&network, route).await.unwrap() };
+        let plach =
+            resolved(plach_route(request.clone(), &network, &TestPlachQuotes::default()).unwrap())
+                .await;
+        let burning_no_gas = |asks_oracle| {
+            route(
+                DexId::IntearDex,
+                &request,
+                &trade,
+                IntearDexSwap::burning_no_gas(&trade, asks_oracle),
+            )
+            .unwrap()
+        };
+        let without_oracle_request = resolved(burning_no_gas(false)).await;
+        let with_oracle_request = resolved(burning_no_gas(true)).await;
+
+        assert_eq!(
+            plach.gas().estimated_burn.as_gas(),
+            without_oracle_request.gas().estimated_burn.as_gas()
+                + PLACH_SWAP_GAS.estimated_burn.as_gas()
+        );
+        assert_eq!(
+            plach.storage_deposits(),
+            without_oracle_request.storage_deposits()
+        );
+        assert_eq!(plach.token_output, without_oracle_request.token_output);
+        assert!(
+            with_oracle_request.gas().estimated_burn > without_oracle_request.gas().estimated_burn
+        );
     }
 
     #[tokio::test]

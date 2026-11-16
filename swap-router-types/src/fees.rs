@@ -1,4 +1,5 @@
-use intear_dex_common::{FeeFraction, FULL_FEE_FRACTION};
+use intear_dex_common::{FeeFraction, TokenAmount, FULL_FEE_FRACTION};
+use intear_dex_types::ReferralFees;
 use near_min_api::types::AccountIdRef;
 
 use crate::types::QuoteFees;
@@ -47,6 +48,12 @@ pub fn payable_referral_fees(referral_fees: &QuoteFees) -> QuoteFees {
         }
     }
     QuoteFees(payable)
+}
+
+pub fn amount_in_with_referral_fees(referral_fees: &QuoteFees, dex_amount_in: u128) -> u128 {
+    let fees = ReferralFees::from(&payable_referral_fees(referral_fees))
+        .amounts_on_top_of(TokenAmount::new(dex_amount_in));
+    dex_amount_in + fees.iter().map(|(_, fee)| fee.get()).sum::<u128>()
 }
 
 #[cfg(test)]

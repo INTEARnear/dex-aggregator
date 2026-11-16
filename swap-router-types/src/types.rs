@@ -448,6 +448,33 @@ pub struct Quote {
     pub signing: Option<SigningContext>,
 }
 
+/// What quotes' costs, in NEAR, are weighed with against their amounts, in the token whose amount
+/// is quoted
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostPrices {
+    #[serde(deserialize_with = "from_str", serialize_with = "to_str")]
+    pub near_price_raw: BigDecimal,
+    #[serde(deserialize_with = "from_str", serialize_with = "to_str")]
+    pub quoted_token_price_raw: BigDecimal,
+}
+
+/// What quotes are ranked by: the estimated amount net of what the route costs. Without prices,
+/// the amount alone.
+pub fn net_amount(
+    estimated_amount: Amount,
+    cost: NearToken,
+    prices: Option<&CostPrices>,
+) -> BigDecimal {
+    let cost = prices.map_or_else(BigDecimal::zero, |prices| {
+        BigDecimal::from(cost.as_yoctonear()) * &prices.near_price_raw
+            / &prices.quoted_token_price_raw
+    });
+    match estimated_amount {
+        Amount::AmountOut(amount_out) => BigDecimal::from(amount_out) - cost,
+        Amount::AmountIn(amount_in) => -(BigDecimal::from(amount_in) + cost),
+    }
+}
+
 /// The nonce and block hash to sign a route's transactions with
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct SigningContext {

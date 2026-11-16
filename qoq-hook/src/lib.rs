@@ -16,6 +16,7 @@ use swap_router_types::{
     fee_discount::{FEE_DISCOUNT_VALIDITY_BLOCKS, FeeDiscounter, tear_fee_discount},
     hook::{Hook, HookInput, HookQuote, IntearDexTrade, OracleRequest, Prices},
     indexed::{AccountState, Watch},
+    last_look::{LastLook, SwapEstimate, with_tear_fee_discount},
     tear_holdings::TearHoldings,
     types::Amount,
 };
@@ -77,9 +78,12 @@ impl Hook for Qoq {
         let Some(oracle_prices) = self.oracle_prices.fresh() else {
             return Ok(vec![]);
         };
-        let quote = self.quote(&input.trade, input.block_height, |request| {
-            qoq::find_path_in(&pools, &oracle_prices, request)
-        });
+        let quote = self.quote(
+            &input.trade,
+            input.block_height,
+            LastLook::of(&input).as_ref(),
+            |request| qoq::find_path_in(&pools, &oracle_prices, request),
+        );
         Ok(quote.into_iter().collect())
     }
 }
@@ -89,7 +93,8 @@ impl Qoq {
         &self,
         trade: &IntearDexTrade,
         block_height: BlockHeight,
-        find_path: impl FnOnce(&qoq::Request) -> Result<qoq::Quote, anyhow::Error>,
+        last_look: Option<&LastLook>,
+        find_path: impl Fn(&qoq::Request) -> Result<qoq::Quote, anyhow::Error>,
     ) -> Option<HookQuote> {
         let (near_price_raw, quoted_token_price_raw) = {
             let prices = self.prices.read().unwrap();
@@ -105,12 +110,12 @@ impl Qoq {
             };
             (price(&AssetId::Near)?, price(quoted_token)?)
         };
-        let fee_discount = trade
+        let tear_fee_discount = trade
             .trader_account_id
             .as_ref()
             .and_then(|trader_id| self.tear_holdings.of(trader_id))
             .and_then(tear_fee_discount);
-        let quote = find_path(&qoq::Request {
+        let request = |fee_discount, discount_counted_from| qoq::Request {
             token_in: trade.asset_in.clone(),
             token_out: trade.asset_out.clone(),
             amount: match trade.amount {
@@ -119,11 +124,25 @@ impl Qoq {
             },
             max_hops: MaxHops::Four,
             slippage: trade.slippage.clone(),
-            near_price_raw,
-            quoted_token_price_raw,
+            near_price_raw: near_price_raw.clone(),
+            quoted_token_price_raw: quoted_token_price_raw.clone(),
             fee_discount,
-        })
-        .ok()?;
+            discount_counted_from,
+        };
+        let last_look_fee_discount = last_look.and_then(|last_look| {
+            last_look.fee_discount(|fee_discount| {
+                find_path(&request(fee_discount, None))
+                    .ok()
+                    .map(|quote| SwapEstimate {
+                        estimated_amount: quote.estimated_amount,
+                        gas: quote.swap_gas,
+                        asks_oracle: true,
+                    })
+            })
+        });
+        // Only what the TEAR holder's discount adds is shown as the discount
+        let fee_discount = with_tear_fee_discount(last_look_fee_discount, tear_fee_discount);
+        let quote = find_path(&request(fee_discount, last_look_fee_discount)).ok()?;
         let signed_fee_discount = fee_discount.map(|fee_discount| {
             self.fee_discounter.sign(
                 &QOQ_DEX_ID.parse().unwrap(),
@@ -157,7 +176,7 @@ impl Qoq {
             estimated_amount: U128(quote.estimated_amount),
             worst_case_amount: U128(quote.worst_case_amount),
             gas: quote.swap_gas,
-            discount: fee_discount.map(|_| U128(quote.discount)),
+            discount: tear_fee_discount.map(|_| U128(quote.discount)),
             oracle_request: Some(OracleRequest {
                 oracle_key: quote.oracle_key,
                 request: Base64VecU8(borsh::to_vec(&quote.prices_request).unwrap()),
@@ -168,10 +187,18 @@ impl Qoq {
 
 #[cfg(test)]
 mod tests {
-    use amp_dex_types::{FULL_ROUTE_FRACTION, PoolId, PricesRequest, SignedFeeDiscount, SwapRoute};
+    use amp_dex_types::{
+        FULL_ROUTE_FRACTION, FeeDiscountFraction, PoolId, PricesRequest, SignedFeeDiscount,
+        SwapRoute,
+    };
+    use near_min_api::types::NearToken;
     use near_min_api::types::near_crypto::{KeyType, SecretKey, Signature};
     use sha2::{Digest, Sha256};
-    use swap_router_types::{fee_discount::fee_discount_signature_payload, types::Gas};
+    use swap_router_types::{
+        fee_discount::fee_discount_signature_payload,
+        hook::IntearDexRouteCosts,
+        types::{CostPrices, Gas},
+    };
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
@@ -220,7 +247,7 @@ mod tests {
     /// with a fee discount
     fn find_path_at(
         usdc_per_near_tenths: u128,
-    ) -> impl FnOnce(&qoq::Request) -> Result<qoq::Quote, anyhow::Error> {
+    ) -> impl Fn(&qoq::Request) -> Result<qoq::Quote, anyhow::Error> {
         move |request| {
             let near_to_usdc = |near: u128| near * usdc_per_near_tenths / 10u128.pow(19);
             let usdc_to_near = |usdc: u128| usdc * 10u128.pow(19) / usdc_per_near_tenths;
@@ -252,7 +279,7 @@ mod tests {
         let (qoq, _traders_to_fetch) = qoq([]);
         for trader_id in [Some("slimedragon.near"), Some("trader.near"), None] {
             assert!(
-                qoq.quote(&trade(trader_id), 1_000_000, find_path_at(24))
+                qoq.quote(&trade(trader_id), 1_000_000, None, find_path_at(24))
                     .is_some()
             );
         }
@@ -262,7 +289,7 @@ mod tests {
     fn swaps_after_asking_the_oracle_for_the_prices_of_the_route() {
         let (qoq, _) = qoq([]);
         let quote = qoq
-            .quote(&trade(None), 1_000_000, find_path_at(24))
+            .quote(&trade(None), 1_000_000, None, find_path_at(24))
             .unwrap();
         assert_eq!(quote.dex_id, QOQ_DEX_ID.parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(2_400_000));
@@ -281,7 +308,12 @@ mod tests {
     fn signs_fee_discount_for_tear_holders() {
         let (qoq, _) = qoq([("trader.near".parse().unwrap(), 1_000 * ONE_TEAR)]);
         let quote = qoq
-            .quote(&trade(Some("trader.near")), 1_000_000, find_path_at(24))
+            .quote(
+                &trade(Some("trader.near")),
+                1_000_000,
+                None,
+                find_path_at(24),
+            )
             .unwrap();
         assert_eq!(quote.estimated_amount, U128(2_400_005));
         assert_eq!(quote.discount, Some(U128(5)));
@@ -315,5 +347,110 @@ mod tests {
                     &qoq.fee_discounter.secret_key.public_key(),
                 )
         );
+    }
+
+    /// Through pool 1, 2,400,000 out and a unit more per percent of fee discount
+    fn find_path_gaining_a_unit_per_discount_percent(
+        request: &qoq::Request,
+    ) -> Result<qoq::Quote, anyhow::Error> {
+        let estimated_amount_with = |fee_discount: Option<FeeDiscountFraction>| {
+            2_400_000 + u128::from(fee_discount.map_or(0, FeeDiscountFraction::get) / 10_000)
+        };
+        let estimated_amount = estimated_amount_with(request.fee_discount);
+        let discount = match request.fee_discount {
+            Some(_) => estimated_amount - estimated_amount_with(request.discount_counted_from),
+            None => 0,
+        };
+        Ok(qoq::Quote {
+            routes: vec![SwapRoute {
+                fraction: FULL_ROUTE_FRACTION,
+                pool_ids: vec![PoolId::new(1)],
+            }],
+            estimated_amount,
+            worst_case_amount: estimated_amount * 99 / 100,
+            discount,
+            oracle_key: ORACLE_KEY.parse().unwrap(),
+            prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
+            swap_gas: Gas::from_ggas(24_800, 24_800),
+        })
+    }
+
+    /// Of the best other quote of `best_other_amount`, without prices to weigh costs with
+    fn last_look_by_amounts_alone(best_other_amount: Amount) -> LastLook {
+        LastLook {
+            best_other_amount,
+            best_other_cost: NearToken::from_millinear(1),
+            referral_fees: Default::default(),
+            route_costs: IntearDexRouteCosts {
+                without_oracle_request: NearToken::from_millinear(1),
+                with_oracle_request: NearToken::from_millinear(2),
+                gas_price: NearToken::from_yoctonear(100_000_000),
+                prices: None,
+            },
+        }
+    }
+
+    fn signed_fee_discount_of(quote: &HookQuote) -> Option<u32> {
+        let swap_args: SwapArgs = borsh::from_slice(&quote.message.0).unwrap();
+        swap_args
+            .fee_discount
+            .map(|signed| signed.discount.fee_discount.get())
+    }
+
+    #[test]
+    fn last_look_matches_the_best_other_quote_and_tear_fee_discount_goes_on_top() {
+        let last_look = last_look_by_amounts_alone(Amount::AmountOut(2_400_050));
+        let (qoq, _) = qoq([("trader.near".parse().unwrap(), 10 * ONE_TEAR)]);
+        let quote_for = |trader_id| {
+            qoq.quote(
+                &trade(trader_id),
+                1_000_000,
+                Some(&last_look),
+                find_path_gaining_a_unit_per_discount_percent,
+            )
+            .unwrap()
+        };
+
+        let without_tear = quote_for(None);
+        assert_eq!(signed_fee_discount_of(&without_tear), Some(500_000));
+        assert_eq!(without_tear.estimated_amount, U128(2_400_050));
+        assert_eq!(without_tear.discount, None);
+
+        // 50% of the fees off to match, and 10% of the rest for the TEAR holder
+        let with_tear = quote_for(Some("trader.near"));
+        assert_eq!(signed_fee_discount_of(&with_tear), Some(550_000));
+        assert_eq!(with_tear.estimated_amount, U128(2_400_055));
+        assert_eq!(with_tear.discount, Some(U128(5)));
+    }
+
+    #[test]
+    fn last_look_counts_the_cost_of_the_oracle_request() {
+        // The oracle request costs 30 USDC units, the gas costs nothing
+        let last_look = LastLook {
+            route_costs: IntearDexRouteCosts {
+                without_oracle_request: NearToken::from_near(0),
+                with_oracle_request: NearToken::from_near(30),
+                gas_price: NearToken::from_yoctonear(0),
+                prices: Some(CostPrices {
+                    near_price_raw: 1.into(),
+                    quoted_token_price_raw: 10u128.pow(24).into(),
+                }),
+            },
+            best_other_cost: NearToken::from_near(0),
+            ..last_look_by_amounts_alone(Amount::AmountOut(2_400_050))
+        };
+        let (qoq, _) = qoq([("trader.near".parse().unwrap(), 10 * ONE_TEAR)]);
+        let quote = qoq
+            .quote(
+                &trade(Some("trader.near")),
+                1_000_000,
+                Some(&last_look),
+                find_path_gaining_a_unit_per_discount_percent,
+            )
+            .unwrap();
+        // 80% of the fees off to match, and 10% of the rest for the TEAR holder
+        assert_eq!(signed_fee_discount_of(&quote), Some(820_000));
+        assert_eq!(quote.estimated_amount, U128(2_400_082));
+        assert_eq!(quote.discount, Some(U128(2)));
     }
 }

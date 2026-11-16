@@ -7,7 +7,6 @@ use axum::{
     routing::get,
     Extension, Router,
 };
-use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use near_min_api::{types::Finality, QueryFinality, RpcClient};
@@ -26,7 +25,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use swap_router_types::{
-    hook::{IntearDexTrade, RequestDetails},
+    hook::{IntearDexRouteCosts, IntearDexTrade, RequestDetails},
     types,
 };
 
@@ -40,8 +39,8 @@ use crate::{
     },
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
-        Amount, DexId, OutcomeRequest, Quote, Route, SigningContext, Slippage, SwapOutcome,
-        SwapRequest,
+        Amount, CostPrices, DexId, OutcomeRequest, Quote, Route, SigningContext, Slippage,
+        SwapOutcome, SwapRequest,
     },
 };
 
@@ -236,6 +235,22 @@ async fn find_routes(
         .clone()
         .unwrap_or_else(|| vec![DexId::Wrap, DexId::Rhea, DexId::RheaDcl, DexId::IntearDex]);
 
+    let intear_dex_requested = dexes.contains(&DexId::IntearDex);
+    let asked_hooks = hooks::loaded()
+        .iter()
+        .filter(|hook| intear_dex_requested || dexes.contains(&hook.dex_id()))
+        .collect::<Vec<_>>();
+    let hook_trade_and_block_height = if asked_hooks.is_empty() {
+        None
+    } else {
+        let block_height = Mainnet
+            .current_block_height()
+            .inspect_err(|err| tracing::warn!("No block height for hooks: {err}"))
+            .ok();
+        let trade = hooks::inteardex::trade_of_request(&Mainnet, request);
+        trade.zip(block_height)
+    };
+
     let mut routes = Vec::new();
     for provider in providers {
         if !dexes.contains(&provider.dex_id()) {
@@ -266,11 +281,20 @@ async fn find_routes(
     }
 
     let _abort_routes_on_drop = AbortOnDrop(routes.iter().map(JoinHandle::abort_handle).collect());
-    // The nonce is read while the routes are found, so it doesn't add to the wait
-    let (routes, signing) = tokio::join!(
+    // The nonce and the costs of hooks' routes are found out while the routes are found, so they
+    // don't add to the wait
+    let (routes, signing, hook_route_costs) = tokio::join!(
         futures_util::future::join_all(routes),
-        signing_context(request)
+        signing_context(request),
+        async {
+            let (trade, _) = hook_trade_and_block_height.as_ref()?;
+            intear_dex_route_costs(request, trade).await
+        }
     );
+    // Hooks' quotes have no route without the route their costs are of
+    let hook_trade = hook_trade_and_block_height
+        .zip(hook_route_costs)
+        .map(|((trade, block_height), route_costs)| (trade, block_height, route_costs));
     let (mut route_stats, routes): (Vec<_>, Vec<_>) = routes
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
@@ -295,30 +319,11 @@ async fn find_routes(
     }
     sort_quotes(request, &mut quotes);
 
-    let intear_dex_requested = dexes.contains(&DexId::IntearDex);
-    let asked_hooks = hooks::loaded()
-        .iter()
-        .filter(|hook| intear_dex_requested || dexes.contains(&hook.dex_id()))
-        .collect::<Vec<_>>();
-    let hook_trade = if asked_hooks.is_empty() {
-        None
-    } else {
-        let block_height = Mainnet
-            .current_block_height()
-            .inspect_err(|err| tracing::warn!("No block height for hooks: {err}"))
-            .ok();
-        let trade = hooks::inteardex::trade_of_request(&Mainnet, request);
-        if let (Some(block_height), Some(trade)) = (block_height, trade) {
-            Some((trade, block_height))
-        } else {
-            None
-        }
-    };
     let intear_dex_started_at = Instant::now();
     let mut intear_dex_hook_quotes = Vec::new();
     for hook in asked_hooks {
         let started_at = Instant::now();
-        let Some((trade, block_height)) = &hook_trade else {
+        let Some((trade, block_height, route_costs)) = &hook_trade else {
             route_stats.push(RouteStats {
                 dex_id: hook.dex_id(),
                 duration: started_at.elapsed(),
@@ -328,7 +333,14 @@ async fn find_routes(
             continue;
         };
         let (mut outcome, hook_quotes) = hook
-            .quotes(request, request_details, trade, *block_height, &quotes)
+            .quotes(
+                request,
+                request_details,
+                trade,
+                *block_height,
+                &quotes,
+                route_costs,
+            )
             .await;
         intear_dex_hook_quotes.extend(hook_quotes.iter().cloned());
         let mut estimated_amount = hook_quotes.first().map(|quote| quote.estimated_amount.0);
@@ -353,7 +365,7 @@ async fn find_routes(
     }
     if intear_dex_requested {
         let (outcome, intear_dex_quote) = match &hook_trade {
-            Some((trade, _)) => {
+            Some((trade, _, _)) => {
                 match IntearDexSwap::fallback_queue(trade, intear_dex_hook_quotes) {
                     Some(swap) => {
                         intear_dex_quotes(DexId::IntearDex, request, trade, vec![swap], &signing)
@@ -414,6 +426,32 @@ fn estimated_amount_of(quote: &Quote) -> u128 {
 
 /// The route with its output converted to the requested token location, and what its steps need
 /// found out. None if that can't be found out.
+/// What the route of a hook's quote costs besides the gas its swap burns, as its quote has it.
+/// None if there's no such route.
+async fn intear_dex_route_costs(
+    request: &SwapRequest,
+    trade: &IntearDexTrade,
+) -> Option<IntearDexRouteCosts> {
+    let cost_of_route = |asks_oracle| async move {
+        let swap = IntearDexSwap::burning_no_gas(trade, asks_oracle);
+        let route = hooks::inteardex::route(DexId::IntearDex, request, trade, swap)?;
+        let quote = quote_of_route(resolve_route(request, route).await?, None);
+        Some(
+            quote
+                .estimated_gas_usage
+                .saturating_add(quote.storage_deposits),
+        )
+    };
+    let (without_oracle_request, with_oracle_request) =
+        tokio::join!(cost_of_route(false), cost_of_route(true));
+    Some(IntearDexRouteCosts {
+        without_oracle_request: without_oracle_request?,
+        with_oracle_request: with_oracle_request?,
+        gas_price: pathfinder::MIN_GAS_PRICE,
+        prices: cost_prices(request),
+    })
+}
+
 async fn resolve_route(request: &SwapRequest, mut route: RouteBlueprint) -> Option<ResolvedRoute> {
     let amount_out = match (
         request.amount,
@@ -475,19 +513,35 @@ fn quote_of_route(route: ResolvedRoute, signing: Option<SigningContext>) -> Quot
 
 /// Best first, by what each quote gets net of its costs
 fn sort_quotes(request: &SwapRequest, quotes: &mut [Quote]) {
-    // Costs are in NEAR, the amounts in the token whose amount is quoted
-    let quoted_token = match request.amount {
-        Amount::AmountIn(_) => &request.token_out,
-        Amount::AmountOut(_) => &request.token_in,
-    };
-    let prices_raw =
-        price_raw(&Mainnet, &BaseTokenId::Near).zip(price_raw(&Mainnet, &base_token(quoted_token)));
-    if prices_raw.is_none() {
+    let prices = cost_prices(request);
+    if prices.is_none() {
         info!(
             "No price to weigh the costs of routes against their amounts, comparing amounts only"
         );
     }
-    quotes.sort_by_cached_key(|quote| std::cmp::Reverse(net_amount(quote, prices_raw.as_ref())));
+    quotes.sort_by_cached_key(|quote| {
+        std::cmp::Reverse(types::net_amount(
+            quote.route.estimated_amount,
+            quote
+                .estimated_gas_usage
+                .saturating_add(quote.storage_deposits),
+            prices.as_ref(),
+        ))
+    });
+}
+
+/// Costs are in NEAR, the amounts in the token whose amount is quoted
+fn cost_prices(request: &SwapRequest) -> Option<CostPrices> {
+    let quoted_token = match request.amount {
+        Amount::AmountIn(_) => &request.token_out,
+        Amount::AmountOut(_) => &request.token_in,
+    };
+    let (near_price_raw, quoted_token_price_raw) = price_raw(&Mainnet, &BaseTokenId::Near)
+        .zip(price_raw(&Mainnet, &base_token(quoted_token)))?;
+    Some(CostPrices {
+        near_price_raw,
+        quoted_token_price_raw,
+    })
 }
 
 /// The nonce of the trader's signing key and a recent final block's hash, to sign the routes'
@@ -527,25 +581,6 @@ async fn signing_context(request: &SwapRequest) -> Option<SigningContext> {
 /// What a quote gets net of its costs, higher is better: the output minus the costs for exact-in,
 /// minus the input and the costs for exact-out. Costs count only with `prices_raw`, the USD prices
 /// of a yoctoNEAR and of a raw unit of the quoted token.
-fn net_amount(quote: &Quote, prices_raw: Option<&(BigDecimal, BigDecimal)>) -> BigDecimal {
-    let cost = prices_raw.map_or_else(
-        BigDecimal::zero,
-        |(near_price_raw, quoted_token_price_raw)| {
-            BigDecimal::from(
-                quote
-                    .estimated_gas_usage
-                    .saturating_add(quote.storage_deposits)
-                    .as_yoctonear(),
-            ) * near_price_raw
-                / quoted_token_price_raw
-        },
-    );
-    match quote.route.estimated_amount {
-        Amount::AmountOut(amount_out) => BigDecimal::from(amount_out) - cost,
-        Amount::AmountIn(amount_in) => -(BigDecimal::from(amount_in) + cost),
-    }
-}
-
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();

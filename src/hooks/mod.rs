@@ -19,8 +19,8 @@ use near_min_api::types::{AccountId, BlockHeight};
 use pathfinder::IndexedHook;
 use swap_router_types::{
     hook::{
-        HookInput, HookQuote, IntearDexTrade, Prices, PricesJson, RequestDetails, HOOK_ABI_VERSION,
-        HOOK_ANSWER_TIMEOUT,
+        HookInput, HookQuote, IntearDexRouteCosts, IntearDexTrade, Prices, PricesJson,
+        RequestDetails, HOOK_ABI_VERSION, HOOK_ANSWER_TIMEOUT,
     },
     indexed::{AccountState, Watch},
 };
@@ -258,6 +258,7 @@ impl Hook {
         trade: &IntearDexTrade,
         block_height: BlockHeight,
         quotes: &[Quote],
+        route_costs: &IntearDexRouteCosts,
     ) -> (RouteOutcome, Vec<HookQuote>) {
         let Ok(call_running) = self.calls_running.clone().try_acquire_owned() else {
             return (RouteOutcome::TimedOut, vec![]);
@@ -268,6 +269,7 @@ impl Hook {
             trade: Cow::Borrowed(trade),
             block_height,
             quotes: Cow::Borrowed(quotes),
+            route_costs: Cow::Borrowed(route_costs),
         })
         .unwrap();
         let plugin = self.plugin.clone();

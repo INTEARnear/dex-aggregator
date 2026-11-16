@@ -13,6 +13,7 @@ use swap_router_types::{
     fee_discount::{FEE_DISCOUNT_VALIDITY_BLOCKS, FeeDiscounter, tear_fee_discount},
     hook::{Hook, HookInput, HookQuote, IntearDexTrade, Prices},
     indexed::{AccountState, Watch},
+    last_look::{LastLook, SwapEstimate, with_tear_fee_discount},
     tear_holdings::TearHoldings,
     types::Amount,
 };
@@ -65,9 +66,12 @@ impl Hook for Plach {
         if pools.check_fresh().is_err() {
             return Ok(vec![]);
         }
-        let quote = self.quote(&input.trade, input.block_height, |request| {
-            plach::find_path_in(&pools, request)
-        });
+        let quote = self.quote(
+            &input.trade,
+            input.block_height,
+            LastLook::of(&input).as_ref(),
+            |request| plach::find_path_in(&pools, request),
+        );
         Ok(quote.into_iter().collect())
     }
 }
@@ -77,7 +81,8 @@ impl Plach {
         &self,
         trade: &IntearDexTrade,
         block_height: BlockHeight,
-        find_path: impl FnOnce(&plach::Request) -> Result<SplitRouteApiResponse, anyhow::Error>,
+        last_look: Option<&LastLook>,
+        find_path: impl Fn(&plach::Request) -> Result<SplitRouteApiResponse, anyhow::Error>,
     ) -> Option<HookQuote> {
         let (near_price_raw, quoted_token_price_raw) = {
             let prices = self.prices.read().unwrap();
@@ -93,13 +98,12 @@ impl Plach {
             };
             (price(&AssetId::Near)?, price(quoted_token)?)
         };
-        let fee_discount = trade
+        let tear_fee_discount = trade
             .trader_account_id
             .as_ref()
             .and_then(|trader_id| self.tear_holdings.of(trader_id))
             .and_then(tear_fee_discount);
-
-        let response = find_path(&plach::Request {
+        let request = |fee_discount, discount_counted_from| plach::Request {
             token_in: trade.asset_in.clone(),
             token_out: trade.asset_out.clone(),
             amount: match trade.amount {
@@ -108,11 +112,36 @@ impl Plach {
             },
             max_hops: MaxHops::Four,
             slippage: trade.slippage.clone(),
-            near_price_raw,
-            quoted_token_price_raw,
+            near_price_raw: near_price_raw.clone(),
+            quoted_token_price_raw: quoted_token_price_raw.clone(),
             fee_discount,
-        })
-        .ok()?;
+            discount_counted_from,
+        };
+        let last_look_fee_discount = last_look.and_then(|last_look| {
+            last_look.fee_discount(|fee_discount| {
+                let (estimated_amount, swap_gas) =
+                    match find_path(&request(fee_discount, None)).ok()? {
+                        SplitRouteApiResponse::ExactIn {
+                            amount_out,
+                            swap_gas,
+                            ..
+                        } => (amount_out.0, swap_gas),
+                        SplitRouteApiResponse::ExactOut {
+                            amount_in,
+                            swap_gas,
+                            ..
+                        } => (amount_in.0, swap_gas),
+                    };
+                Some(SwapEstimate {
+                    estimated_amount,
+                    gas: swap_gas,
+                    asks_oracle: false,
+                })
+            })
+        });
+        // Only what the TEAR holder's discount adds is shown as the discount
+        let fee_discount = with_tear_fee_discount(last_look_fee_discount, tear_fee_discount);
+        let response = find_path(&request(fee_discount, last_look_fee_discount)).ok()?;
 
         let swap_route = |split_fraction, pool_ids| SwapRoute {
             fraction: RouteFraction::new(split_fraction),
@@ -206,7 +235,7 @@ impl Plach {
             estimated_amount: U128(estimated_amount),
             worst_case_amount: U128(worst_case_amount),
             gas: swap_gas,
-            discount: fee_discount.map(|_| U128(discount)),
+            discount: tear_fee_discount.map(|_| U128(discount)),
             oracle_request: None,
         })
     }
@@ -214,11 +243,12 @@ impl Plach {
 
 #[cfg(test)]
 mod tests {
+    use near_min_api::types::NearToken;
     use near_min_api::types::near_crypto::{KeyType, SecretKey, Signature};
     use sha2::{Digest, Sha256};
-    use swap_router_types::types::Gas;
+    use swap_router_types::{hook::IntearDexRouteCosts, types::Gas};
     use tokio::sync::mpsc::UnboundedReceiver;
-    use xyk_dex_types::{FULL_ROUTE_FRACTION, SignedFeeDiscount};
+    use xyk_dex_types::{FULL_ROUTE_FRACTION, FeeDiscountFraction, SignedFeeDiscount};
 
     use super::*;
     use swap_router_types::fee_discount::fee_discount_signature_payload;
@@ -289,7 +319,7 @@ mod tests {
     #[test]
     fn quotes_the_route_without_a_discount_for_too_little_tear() {
         let (plach, _) = plach([("trader.near".parse().unwrap(), 10 * ONE_TEAR - 1)]);
-        let quote = plach.quote(&trade(), 1_000_000, find_path).unwrap();
+        let quote = plach.quote(&trade(), 1_000_000, None, find_path).unwrap();
         assert_eq!(quote.dex_id, PLACH_DEX_ID.parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(80));
         assert_eq!(quote.worst_case_amount, U128(79));
@@ -303,21 +333,21 @@ mod tests {
     #[test]
     fn no_discount_until_holdings_are_known() {
         let (plach, mut traders_to_fetch) = plach([]);
-        let quote = plach.quote(&trade(), 1_000_000, find_path).unwrap();
+        let quote = plach.quote(&trade(), 1_000_000, None, find_path).unwrap();
         assert_eq!(quote.discount, None);
         assert_eq!(
             traders_to_fetch.try_recv(),
             Ok("trader.near".parse().unwrap())
         );
         // Asked for once while it's fetched
-        plach.quote(&trade(), 1_000_000, find_path).unwrap();
+        plach.quote(&trade(), 1_000_000, None, find_path).unwrap();
         assert!(traders_to_fetch.try_recv().is_err());
     }
 
     #[test]
     fn signs_fee_discount() {
         let (plach, _) = plach([("trader.near".parse().unwrap(), 1_000 * ONE_TEAR)]);
-        let quote = plach.quote(&trade(), 1_000_000, find_path).unwrap();
+        let quote = plach.quote(&trade(), 1_000_000, None, find_path).unwrap();
         assert_eq!(quote.discount, Some(U128(5)));
         assert_eq!(quote.estimated_amount, U128(85));
         let SwapArgs {
@@ -357,10 +387,121 @@ mod tests {
         );
     }
 
+    /// One pool, a unit more output per percent of fee discount
+    fn find_path_gaining_a_unit_per_discount_percent(
+        request: &plach::Request,
+    ) -> Result<SplitRouteApiResponse, anyhow::Error> {
+        let amount_out_with = |fee_discount: Option<FeeDiscountFraction>| {
+            80 + u128::from(fee_discount.map_or(0, FeeDiscountFraction::get) / 10_000)
+        };
+        let amount_out = amount_out_with(request.fee_discount);
+        let discount = match request.fee_discount {
+            Some(_) => amount_out - amount_out_with(request.discount_counted_from),
+            None => 0,
+        };
+        let QuoteAmount::ExactIn(amount_in) = request.amount else {
+            panic!("Exact in");
+        };
+        Ok(SplitRouteApiResponse::ExactIn {
+            routes: vec![plach::ExactInRoute {
+                split_fraction: FULL_ROUTE_FRACTION.get(),
+                pools: vec![plach::ExactInPoolStep {
+                    pool_id: 1,
+                    token_in: request.token_in.clone(),
+                    token_out: request.token_out.clone(),
+                    amount_in: near_min_api::types::U128(amount_in),
+                    min_amount_out: near_min_api::types::U128(amount_out - 1),
+                }],
+                amount_in: near_min_api::types::U128(amount_in),
+                min_amount_out: near_min_api::types::U128(amount_out - 1),
+                amount_out: near_min_api::types::U128(amount_out),
+            }],
+            contract_in: request.token_in.clone(),
+            contract_out: request.token_out.clone(),
+            amount_in: near_min_api::types::U128(amount_in),
+            amount_out: near_min_api::types::U128(amount_out),
+            discount: near_min_api::types::U128(discount),
+            swap_gas: Gas::from_ggas(25_000, 28_000),
+        })
+    }
+
+    /// Of the best other quote of `best_other_amount`, without prices to weigh costs with
+    fn last_look_by_amounts_alone(best_other_amount: Amount) -> LastLook {
+        LastLook {
+            best_other_amount,
+            best_other_cost: NearToken::from_millinear(1),
+            referral_fees: Default::default(),
+            route_costs: IntearDexRouteCosts {
+                without_oracle_request: NearToken::from_millinear(1),
+                with_oracle_request: NearToken::from_millinear(2),
+                gas_price: NearToken::from_yoctonear(100_000_000),
+                prices: None,
+            },
+        }
+    }
+
+    fn signed_fee_discount_of(quote: &HookQuote) -> Option<u32> {
+        let swap_args: SwapArgs = borsh::from_slice(&quote.message.0).unwrap();
+        swap_args
+            .fee_discount
+            .map(|signed| signed.discount.fee_discount.get())
+    }
+
+    #[test]
+    fn last_look_matches_the_best_other_quote_without_showing_its_discount() {
+        let last_look = last_look_by_amounts_alone(Amount::AmountOut(130));
+        let (plach, _traders_to_fetch) = plach([]);
+        let quote = plach
+            .quote(
+                &trade(),
+                1_000_000,
+                Some(&last_look),
+                find_path_gaining_a_unit_per_discount_percent,
+            )
+            .unwrap();
+        assert_eq!(quote.estimated_amount, U128(130));
+        assert_eq!(quote.discount, None);
+        assert_eq!(signed_fee_discount_of(&quote), Some(500_000));
+    }
+
+    #[test]
+    fn tear_fee_discount_goes_on_top_of_last_look() {
+        let last_look = last_look_by_amounts_alone(Amount::AmountOut(130));
+        let (plach, _) = plach([("trader.near".parse().unwrap(), 1_000 * ONE_TEAR)]);
+        let quote = plach
+            .quote(
+                &trade(),
+                1_000_000,
+                Some(&last_look),
+                find_path_gaining_a_unit_per_discount_percent,
+            )
+            .unwrap();
+        // 50% of the fees off to match, and 25% of the rest for the TEAR holder
+        assert_eq!(signed_fee_discount_of(&quote), Some(625_000));
+        assert_eq!(quote.estimated_amount, U128(142));
+        assert_eq!(quote.discount, Some(U128(12)));
+    }
+
+    #[test]
+    fn no_last_look_discount_when_already_the_best() {
+        let last_look = last_look_by_amounts_alone(Amount::AmountOut(80));
+        let (plach, _traders_to_fetch) = plach([]);
+        let quote = plach
+            .quote(
+                &trade(),
+                1_000_000,
+                Some(&last_look),
+                find_path_gaining_a_unit_per_discount_percent,
+            )
+            .unwrap();
+        assert_eq!(quote.estimated_amount, U128(80));
+        assert_eq!(signed_fee_discount_of(&quote), None);
+    }
+
     #[test]
     fn no_quote_without_prices() {
         let (plach, _) = plach([]);
         plach.prices.write().unwrap().clear();
-        assert!(plach.quote(&trade(), 1_000_000, find_path).is_none());
+        assert!(plach.quote(&trade(), 1_000_000, None, find_path).is_none());
     }
 }

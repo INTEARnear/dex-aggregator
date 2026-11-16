@@ -240,6 +240,8 @@ pub struct Request {
     pub quoted_token_price_raw: BigDecimal,
     /// Taken off the pool and protocol fees of every pool by a signed fee discount
     pub fee_discount: Option<FeeDiscountFraction>,
+    /// The fee discount that the quote's `discount` is counted from, on the same route
+    pub discount_counted_from: Option<FeeDiscountFraction>,
 }
 
 /// A swap on routes of pools that ask one oracle, which the swap asks for the prices of their
@@ -251,7 +253,7 @@ pub struct Quote {
     /// The least it gives, or the most it takes, with the slippage
     pub worst_case_amount: Balance,
     /// Added to the output for exact in, or taken off the input for exact out, by the fee
-    /// discount, 0 without one
+    /// discount on top of the one it's counted from, 0 without one
     pub discount: Balance,
     pub oracle_key: PublicKeyHandle,
     /// As the contract asks for it, of the assets of the pools of the routes in their order
@@ -312,12 +314,14 @@ pub fn find_path_in(
     let swap_gas = SWAP_GAS + HOP_GAS * split_route.hops() as u64;
     let (discount, swap_gas) = match request.fee_discount {
         Some(_) => {
-            // Compared to the same route without the fee discount
-            let undiscounted = split_route
-                .emulate_total(&oracle_graph(pools, oracle_prices, None), request.amount)?;
+            // Compared to the same route with the discount it's counted from
+            let counted_from = split_route.emulate_total(
+                &oracle_graph(pools, oracle_prices, request.discount_counted_from),
+                request.amount,
+            )?;
             let saved = match request.amount {
-                QuoteAmount::ExactIn(_) => estimated_amount.checked_sub(undiscounted),
-                QuoteAmount::ExactOut(_) => undiscounted.checked_sub(estimated_amount),
+                QuoteAmount::ExactIn(_) => estimated_amount.checked_sub(counted_from),
+                QuoteAmount::ExactOut(_) => counted_from.checked_sub(estimated_amount),
             };
             (
                 saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?,
@@ -485,6 +489,7 @@ mod tests {
             near_price_raw: "0.000000000000000000000002".parse().unwrap(),
             quoted_token_price_raw: "0.004".parse().unwrap(),
             fee_discount: None,
+            discount_counted_from: None,
         }
     }
 
