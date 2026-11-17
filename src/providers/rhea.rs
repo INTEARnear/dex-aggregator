@@ -492,6 +492,10 @@ mod tests {
                 vec![
                     trader_storage("ft"),
                     trader_storage(WRAP_NEAR),
+                    RouteStep::RegisterOnRheaIfNeeded {
+                        trader_account_id: trader(),
+                        token_ids: vec![account(WRAP_NEAR)],
+                    },
                     RouteStep::Call(CallBlueprint::RheaWithdraw {
                         token_id: account(WRAP_NEAR),
                         amount: 100,
@@ -585,7 +589,7 @@ mod tests {
             vec![
                 CallBlueprint::RheaStorageDeposit {
                     account_id: None,
-                    amount: "0.00098 NEAR".parse().unwrap(),
+                    amount: "0.00456 NEAR".parse().unwrap(),
                 },
                 CallBlueprint::RheaRegisterTokens {
                     token_ids: vec![account("other")],
@@ -626,6 +630,10 @@ mod tests {
             Some(rhea_route(
                 vec![
                     trader_storage("ft"),
+                    RouteStep::RegisterOnRheaIfNeeded {
+                        trader_account_id: trader(),
+                        token_ids: vec![account("ft")],
+                    },
                     RouteStep::Call(CallBlueprint::RheaWithdraw {
                         token_id: account("ft"),
                         amount: 100,
@@ -875,16 +883,23 @@ mod tests {
         assert_eq!(route.fee_steps, vec![]);
 
         // A new Rhea account with a balance of one token for the referrer that has none
+        let enough_storage = NearToken::from_yoctonear((614 + 506 * 2) * 10u128.pow(19));
         let network = TestNetworkView::default()
             .with_rhea_registered("trader.near", "ft", true)
             .with_rhea_registered("trader.near", "other", true)
-            .with_rhea_registered(AGGREGATOR_FEE_RECEIVER_ID.as_str(), "ft", true);
+            .with_rhea_storage_state("trader.near", enough_storage, enough_storage)
+            .with_rhea_registered(AGGREGATOR_FEE_RECEIVER_ID.as_str(), "ft", true)
+            .with_rhea_storage_state(
+                AGGREGATOR_FEE_RECEIVER_ID.as_str(),
+                enough_storage,
+                enough_storage,
+            );
         let resolved = resolve(&network, route).await.unwrap();
         assert_eq!(
             resolved.calls[1],
             CallBlueprint::RheaStorageDeposit {
                 account_id: Some(account("ref.near")),
-                amount: NearToken::from_yoctonear(250 * 10u128.pow(19)),
+                amount: NearToken::from_yoctonear((614 + 506) * 10u128.pow(19)),
             }
         );
         // The fees come out of the Rhea balance, not the wallet

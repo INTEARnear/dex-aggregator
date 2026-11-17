@@ -48,7 +48,8 @@ pub enum RouteStep {
     TraderStorageDepositOnRheaDclIfNeeded {
         trader_account_id: AccountId,
     },
-    /// Registers the tokens the trader has no balance of on Rhea, with the storage they lack
+    /// Registers the tokens the trader has no balance of on Rhea, with the storage they lack, also
+    /// when the trader's account uses more than its deposit already
     RegisterOnRheaIfNeeded {
         trader_account_id: AccountId,
         token_ids: Vec<AccountId>,
@@ -137,11 +138,39 @@ pub async fn resolve_steps(
     network: &impl NetworkView,
     steps: Vec<RouteStep>,
 ) -> Option<Vec<CallBlueprint>> {
+    let steps = merge_rhea_registrations(steps);
     let calls = join_all(steps.into_iter().map(|step| resolve_step(network, step)))
         .await
         .into_iter()
         .collect::<Option<Vec<_>>>()?;
     Some(calls.concat())
+}
+
+/// Each Rhea registration of a trader would pay all their account lacks, as the network is asked
+/// before any of them happen, so a route's are merged into its first one
+fn merge_rhea_registrations(steps: Vec<RouteStep>) -> Vec<RouteStep> {
+    let mut merged: Vec<RouteStep> = Vec::with_capacity(steps.len());
+    for step in steps {
+        if let RouteStep::RegisterOnRheaIfNeeded {
+            trader_account_id,
+            token_ids,
+        } = &step
+        {
+            let first = merged.iter_mut().find_map(|merged_step| match merged_step {
+                RouteStep::RegisterOnRheaIfNeeded {
+                    trader_account_id: first_trader_account_id,
+                    token_ids: first_token_ids,
+                } if first_trader_account_id == trader_account_id => Some(first_token_ids),
+                _ => None,
+            });
+            if let Some(first_token_ids) = first {
+                first_token_ids.extend(token_ids.iter().cloned());
+                continue;
+            }
+        }
+        merged.push(step);
+    }
+    merged
 }
 
 async fn resolve_step(network: &impl NetworkView, step: RouteStep) -> Option<Vec<CallBlueprint>> {

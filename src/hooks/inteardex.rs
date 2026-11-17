@@ -1028,6 +1028,10 @@ mod tests {
                 vec![
                     registration(vec![ft()]),
                     trader_storage("ft"),
+                    RouteStep::RegisterOnRheaIfNeeded {
+                        trader_account_id: trader(),
+                        token_ids: vec![account(WRAP_NEAR)],
+                    },
                     RouteStep::Call(CallBlueprint::RheaWithdraw {
                         token_id: account(WRAP_NEAR),
                         amount: 100,
@@ -1104,6 +1108,10 @@ mod tests {
                 vec![
                     registration(vec![IntearAssetId::Near]),
                     trader_storage("ft"),
+                    RouteStep::RegisterOnRheaIfNeeded {
+                        trader_account_id: trader(),
+                        token_ids: vec![account("ft")],
+                    },
                     RouteStep::Call(CallBlueprint::RheaWithdraw {
                         token_id: account("ft"),
                         amount: 100,

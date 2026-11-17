@@ -163,7 +163,7 @@ async fn rhea_registration_shape() {
         Some(vec![
             CallBlueprint::RheaStorageDeposit {
                 account_id: None,
-                amount: storage_bytes(102 + 148),
+                amount: storage_bytes(614 + 506),
             },
             CallBlueprint::RheaRegisterTokens {
                 token_ids: vec![account("ft")],
@@ -172,8 +172,8 @@ async fn rhea_registration_shape() {
     );
 }
 
-/// Rhea's storage as get_user_storage_state reported it on mainnet: 102 bytes per account and
-/// 148 per token, whatever the account ID
+/// Rhea's storage as get_user_storage_state reported it on mainnet since v1.9.22: 614 bytes per
+/// account and 506 per token, whatever the account ID
 #[tokio::test]
 async fn rhea_registration_pays_what_the_contract_counts() {
     let tokens = ["a.near", "b.near", "c.near", "d.near", "e.near"].map(account);
@@ -190,27 +190,28 @@ async fn rhea_registration_pays_what_the_contract_counts() {
         }
     };
 
-    // 9421fd3a…e82c registered with 102 bytes of usage at block 220398361
-    let new_account = "9421fd3a82539a62f76731e4cef32b0d4bef17db405d2ee086589d5847a0e82c";
+    // storage_balance_bounds min is 614 bytes since block 224770356
     let network = TestNetworkView::default();
     assert_eq!(
-        deposit(&network, new_account, 1).await,
-        Some(storage_bytes(102 + 148))
+        deposit(&network, "new.near", 1).await,
+        Some(storage_bytes(614 + 506))
     );
 
-    // slimedragon.near: 23 tokens, 3506 bytes used of a 4.101e22 deposit at block 220407351
+    // zorro7.near: 2 tokens, 1626 bytes used of a 0.1 NEAR deposit at block 224770356
     let network = TestNetworkView::default().with_rhea_storage_state(
-        "slimedragon.near",
-        NearToken::from_yoctonear(41_010_000_000_000_000_000_000),
-        storage_bytes(102 + 148 * 23),
+        "zorro7.near",
+        NearToken::from_millinear(100),
+        storage_bytes(614 + 506 * 2),
     );
-    assert_eq!(deposit(&network, "slimedragon.near", 1).await, None);
+    assert_eq!(deposit(&network, "zorro7.near", 1).await, None);
+    let network = TestNetworkView::default().with_rhea_storage_state(
+        "zorro7.near",
+        NearToken::from_millinear(10),
+        storage_bytes(614 + 506 * 2),
+    );
     assert_eq!(
-        deposit(&network, "slimedragon.near", 5).await,
-        Some(
-            storage_bytes(102 + 148 * 28)
-                .saturating_sub(NearToken::from_yoctonear(41_010_000_000_000_000_000_000))
-        )
+        deposit(&network, "zorro7.near", 5).await,
+        Some(storage_bytes(614 + 506 * 7).saturating_sub(NearToken::from_millinear(10)))
     );
 
     // An account using more than its deposit from older storage rules pays that too
@@ -221,15 +222,142 @@ async fn rhea_registration_pays_what_the_contract_counts() {
     );
     assert_eq!(
         deposit(&network, "old.near", 1).await,
-        Some(storage_bytes(200 + 148))
+        Some(storage_bytes(200 + 506))
     );
 
     // Registered tokens need nothing
-    let network = TestNetworkView::default().with_rhea_registered("trader.near", "a.near", true);
+    let network = TestNetworkView::default()
+        .with_rhea_registered("trader.near", "a.near", true)
+        .with_rhea_storage_state(
+            "trader.near",
+            storage_bytes(614 + 506),
+            storage_bytes(614 + 506),
+        );
     assert!(rhea_registration(&network, &trader(), &tokens[..1])
         .await
         .unwrap()
         .is_empty());
+}
+
+/// shitzu-buyback.near: 26 tokens, 0.05 NEAR deposit, and 13770 bytes used at block 224770356,
+/// up from 3950 the block before. Rhea refuses its swaps even of tokens it has registered.
+#[tokio::test]
+async fn rhea_registration_tops_up_accounts_over_their_deposit() {
+    let network = TestNetworkView::default()
+        .with_rhea_registered("shitzu-buyback.near", "ft", true)
+        .with_rhea_storage_state(
+            "shitzu-buyback.near",
+            NearToken::from_millinear(50),
+            storage_bytes(614 + 506 * 26),
+        );
+    assert_eq!(
+        rhea_registration(&network, &account("shitzu-buyback.near"), &[account("ft")]).await,
+        Some(vec![CallBlueprint::RheaStorageDeposit {
+            account_id: None,
+            amount: storage_bytes(614 + 506 * 26).saturating_sub(NearToken::from_millinear(50)),
+        }])
+    );
+}
+
+/// Rhea refuses withdrawals of accounts using more than their deposit, so it's topped up first
+#[tokio::test]
+async fn rhea_withdrawal_tops_up_accounts_over_their_deposit() {
+    let network = TestNetworkView::default()
+        .with_rhea_registered("trader.near", "ft", true)
+        .with_rhea_storage_state(
+            "trader.near",
+            NearToken::from_millinear(50),
+            storage_bytes(614 + 506 * 26),
+        );
+    let (steps, _) = convert_to_nep141(&rhea_ft(), Some(&trader()), 9);
+    assert_eq!(
+        resolve_steps(&network, steps).await,
+        Some(vec![
+            CallBlueprint::RheaStorageDeposit {
+                account_id: None,
+                amount: storage_bytes(614 + 506 * 26).saturating_sub(NearToken::from_millinear(50)),
+            },
+            CallBlueprint::RheaWithdraw {
+                token_id: account("ft"),
+                amount: 9,
+                output: RheaOutput::Nep141,
+            },
+        ])
+    );
+}
+
+/// What the account lacks is paid once, with the storage of the tokens of all its registrations
+#[tokio::test]
+async fn rhea_registrations_of_a_trader_are_paid_once() {
+    let network = TestNetworkView::default()
+        .with_rhea_registered("trader.near", "ft", true)
+        .with_rhea_storage_state(
+            "trader.near",
+            NearToken::from_millinear(50),
+            storage_bytes(614 + 506 * 26),
+        );
+    let steps = vec![
+        RouteStep::RegisterOnRheaIfNeeded {
+            trader_account_id: trader(),
+            token_ids: vec![account("ft")],
+        },
+        call(CallBlueprint::RheaWithdraw {
+            token_id: account("ft"),
+            amount: 9,
+            output: RheaOutput::Nep141,
+        }),
+        RouteStep::RegisterOnRheaIfNeeded {
+            trader_account_id: trader(),
+            token_ids: vec![account("other")],
+        },
+    ];
+    assert_eq!(
+        resolve_steps(&network, steps).await,
+        Some(vec![
+            CallBlueprint::RheaStorageDeposit {
+                account_id: None,
+                amount: storage_bytes(614 + 506 * 27).saturating_sub(NearToken::from_millinear(50)),
+            },
+            CallBlueprint::RheaRegisterTokens {
+                token_ids: vec![account("other")],
+            },
+            CallBlueprint::RheaWithdraw {
+                token_id: account("ft"),
+                amount: 9,
+                output: RheaOutput::Nep141,
+            },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn rhea_fee_receivers_registration_tops_up_receivers_over_their_deposit() {
+    // dex-aggregator.intear.near: 7 tokens and a 0.0175 NEAR deposit at block 224770356
+    let network = TestNetworkView::default()
+        .with_rhea_registered("receiver.near", "ft", true)
+        .with_rhea_storage_state(
+            "receiver.near",
+            "0.0175 NEAR".parse().unwrap(),
+            storage_bytes(614 + 506 * 7),
+        )
+        .with_rhea_registered("enough.near", "ft", true)
+        .with_rhea_storage_state(
+            "enough.near",
+            NearToken::from_millinear(100),
+            storage_bytes(614 + 506 * 7),
+        );
+    assert_eq!(
+        rhea_fee_receivers_registration(
+            &network,
+            &account("ft"),
+            &[account("receiver.near"), account("enough.near")],
+        )
+        .await,
+        Some(vec![CallBlueprint::RheaStorageDeposit {
+            account_id: Some(account("receiver.near")),
+            amount: storage_bytes(614 + 506 * 7).saturating_sub("0.0175 NEAR".parse().unwrap()),
+        }])
+    );
 }
 
 /// Intear DEX storage as storage_balance_of reported it on mainnet for accounts that registered
@@ -959,7 +1087,7 @@ async fn convert_to_rhea_destination_with_trader_includes_rhea_and_ft_storage() 
             // A new account with one token
             CallBlueprint::RheaStorageDeposit {
                 account_id: None,
-                amount: storage_bytes(102 + 148),
+                amount: storage_bytes(614 + 506),
             },
             CallBlueprint::RheaRegisterTokens {
                 token_ids: vec![account("ft")],
@@ -1034,6 +1162,10 @@ fn convert_to_step_order_is_register_withdraw_convert_deposit() {
             RouteStep::StorageDepositOnNep141IfNeeded {
                 token_id: account(WRAP_NEAR),
                 account_id: account("dex.intear.near"),
+            },
+            RouteStep::RegisterOnRheaIfNeeded {
+                trader_account_id: trader(),
+                token_ids: vec![account(WRAP_NEAR)],
             },
             call(CallBlueprint::RheaWithdraw {
                 token_id: account(WRAP_NEAR),

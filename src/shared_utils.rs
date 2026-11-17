@@ -539,7 +539,7 @@ impl NetworkView for TestNetworkView {
             "dex.intear.near" => NearToken::from_millinear(5),
             "dclv2.ref-labs.near" => NearToken::from_millinear(500),
             "v2.ref-finance.near" => {
-                NearToken::from_yoctonear(102 * STORAGE_BYTE_COST.as_yoctonear())
+                NearToken::from_yoctonear(614 * STORAGE_BYTE_COST.as_yoctonear())
             }
             _ => NearToken::from_yoctonear(125 * STORAGE_BYTE_COST.as_yoctonear()),
         };
@@ -607,9 +607,11 @@ pub async fn needs_storage_deposit_for_contract(
     storage_deposit.total.is_zero()
 }
 
-/// Rhea's storage of an account: 102 bytes, and 148 more for each token it has a balance of
-const RHEA_ACCOUNT_STORAGE_BYTES: u128 = 102;
-const RHEA_TOKEN_STORAGE_BYTES: u128 = 148;
+/// Rhea's storage of an account since v1.9.22: 614 bytes, and 506 more for each token it has a
+/// balance of. Accounts that registered under the older 102 + 148 per token can now use more than
+/// their deposit, and Rhea refuses to change their balances until it's topped up.
+const RHEA_ACCOUNT_STORAGE_BYTES: u128 = 614;
+const RHEA_TOKEN_STORAGE_BYTES: u128 = 506;
 
 /// NEAR the account lacks on Rhea for a balance of `new_tokens` more tokens.
 async fn rhea_storage_lacking(
@@ -636,7 +638,8 @@ async fn rhea_storage_lacking(
 }
 
 /// Registers the tokens the account has no balance of on Rhea yet, with the storage deposit they
-/// lack. `swap` adds a balance of every token it outputs, also the ones in the middle of a route.
+/// lack, also the deposit an account using more than it has lacks with all of them registered.
+/// `swap` adds a balance of every token it outputs, also the ones in the middle of a route.
 pub async fn rhea_registration(
     network: &impl NetworkView,
     account_id: &AccountId,
@@ -650,9 +653,6 @@ pub async fn rhea_registration(
             unregistered.push(token_id.clone());
         }
     }
-    if unregistered.is_empty() {
-        return Some(vec![]);
-    }
     let lacking = rhea_storage_lacking(network, account_id, unregistered.len()).await?;
     let mut calls = Vec::new();
     if !lacking.is_zero() {
@@ -661,15 +661,17 @@ pub async fn rhea_registration(
             amount: lacking,
         });
     }
-    calls.push(CallBlueprint::RheaRegisterTokens {
-        token_ids: unregistered,
-    });
+    if !unregistered.is_empty() {
+        calls.push(CallBlueprint::RheaRegisterTokens {
+            token_ids: unregistered,
+        });
+    }
     Some(calls)
 }
 
-/// Storage deposits for the referrers that have no balance of `token_id` on Rhea yet, for the
-/// storage a balance of it takes. Only the account itself can `register_tokens`, but a transfer
-/// adds the balance when the account has the storage for it.
+/// Storage deposits for the referrers that lack it for a balance of `token_id` on Rhea, also the
+/// ones that have it but use more than their deposit. Only the account itself can
+/// `register_tokens`, but a transfer adds the balance when the account has the storage for it.
 pub async fn rhea_fee_receivers_registration(
     network: &impl NetworkView,
     token_id: &AccountId,
@@ -677,13 +679,15 @@ pub async fn rhea_fee_receivers_registration(
 ) -> Option<Vec<CallBlueprint>> {
     let mut calls = Vec::new();
     for receiver_id in receiver_ids {
-        if network
+        let new_tokens = if network
             .is_rhea_token_registered(receiver_id, token_id)
             .await
         {
-            continue;
-        }
-        let lacking = rhea_storage_lacking(network, receiver_id, 1).await?;
+            0
+        } else {
+            1
+        };
+        let lacking = rhea_storage_lacking(network, receiver_id, new_tokens).await?;
         if !lacking.is_zero() {
             calls.push(CallBlueprint::RheaStorageDeposit {
                 account_id: Some(receiver_id.clone()),
@@ -1157,11 +1161,7 @@ pub fn convert_to_nep141(
         TokenId::Nep141OnRhea(token_id) => {
             // Rhea withdraws the whole balance for 0, so nothing is withdrawn instead
             let withdraw = if amount > 0 {
-                vec![RouteStep::Call(CallBlueprint::RheaWithdraw {
-                    token_id: token_id.clone(),
-                    amount,
-                    output: RheaOutput::Nep141,
-                })]
+                rhea_withdraw(trader_account_id, token_id, amount, RheaOutput::Nep141)
             } else {
                 vec![]
             };
@@ -1216,15 +1216,14 @@ pub fn convert_to_native(
     match token_id {
         TokenId::Near => Some(vec![]),
         TokenId::Nep141(token_id) if token_id == WRAP_NEAR => Some(vec![unwrap_near()]),
-        TokenId::Nep141OnRhea(token_id) if token_id == WRAP_NEAR => {
-            Some(vec![RouteStep::Call(CallBlueprint::RheaWithdraw {
-                token_id: token_id.clone(),
-                amount: amount.as_yoctonear(),
-                output: RheaOutput::Near {
-                    trader_account_id: trader_account_id.cloned(),
-                },
-            })])
-        }
+        TokenId::Nep141OnRhea(token_id) if token_id == WRAP_NEAR => Some(rhea_withdraw(
+            trader_account_id,
+            token_id,
+            amount.as_yoctonear(),
+            RheaOutput::Near {
+                trader_account_id: trader_account_id.cloned(),
+            },
+        )),
         TokenId::TokenOnIntearDex(IntearAssetId::Near) => {
             Some(vec![RouteStep::Call(CallBlueprint::IntearDexWithdraw {
                 asset: IntearAssetId::Near,
@@ -1246,6 +1245,25 @@ pub fn convert_to_native(
         | TokenId::Nep141OnRhea(_)
         | TokenId::TokenOnIntearDex(IntearAssetId::Nep141(_)) => None,
     }
+}
+
+/// Rhea refuses to save an account using more than its deposit, which a withdrawal does, so the
+/// trader's deposit is topped up first
+fn rhea_withdraw(
+    trader_account_id: Option<&AccountId>,
+    token_id: &AccountId,
+    amount: Balance,
+    output: RheaOutput,
+) -> Vec<RouteStep> {
+    [
+        deposit_storage_if_needed(&TokenId::Nep141OnRhea(token_id.clone()), trader_account_id),
+        vec![RouteStep::Call(CallBlueprint::RheaWithdraw {
+            token_id: token_id.clone(),
+            amount,
+            output,
+        })],
+    ]
+    .concat()
 }
 
 /// Registers the trader where `token_id` is, with the storage it needs, if they aren't yet
@@ -1347,17 +1365,18 @@ pub fn convert_to(
         TokenId::Nep141OnRhea(token_id) => {
             let unwrap_near = token_id == WRAP_NEAR && to_base_token == BaseTokenId::Near;
             (
-                vec![RouteStep::Call(CallBlueprint::RheaWithdraw {
-                    token_id: token_id.clone(),
+                rhea_withdraw(
+                    trader_account_id,
+                    token_id,
                     amount,
-                    output: if unwrap_near {
+                    if unwrap_near {
                         RheaOutput::Near {
                             trader_account_id: trader_account_id.cloned(),
                         }
                     } else {
                         RheaOutput::Nep141
                     },
-                })],
+                ),
                 if unwrap_near {
                     BaseTokenId::Near
                 } else {
