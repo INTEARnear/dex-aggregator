@@ -4,12 +4,13 @@ use std::{
     collections::HashMap,
     future::Future,
     str::FromStr,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 use bigdecimal::BigDecimal;
 use cached::proc_macro::cached;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use intear_dex_common::{AssetId, FULL_FEE_FRACTION};
 use lazy_static::lazy_static;
 use near_min_api::{
@@ -22,7 +23,7 @@ use near_min_api::{
 };
 use num_traits::{FromPrimitive, Zero};
 use reqwest::{Client, ClientBuilder};
-use serde::{Deserialize, Deserializer};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 pub use swap_router_types::fees::payable_referral_fees;
 use tracing::{error, info};
 
@@ -171,24 +172,88 @@ pub fn convert_to_nep141_with_fees(
 
 pub struct Mainnet;
 
+type SharedViewCall = Shared<BoxFuture<'static, Result<serde_json::Value, String>>>;
+
+/// The view calls of one block. They all give the same answer within it, so routes resolved at
+/// the same time for the same accounts share one RPC request instead of sending one each.
+struct BlockViewCalls {
+    block_height: BlockHeight,
+    calls: HashMap<(AccountId, &'static str, String), SharedViewCall>,
+}
+
+impl BlockViewCalls {
+    /// The call made at `block_height` or later, started with `start` if there's none. Calls of
+    /// earlier blocks are dropped once a later block's call comes.
+    fn get_or_start(
+        &mut self,
+        block_height: BlockHeight,
+        contract_id: AccountId,
+        method: &'static str,
+        args: serde_json::Value,
+        start: impl FnOnce(AccountId, &'static str, serde_json::Value) -> SharedViewCall,
+    ) -> SharedViewCall {
+        if block_height > self.block_height {
+            self.block_height = block_height;
+            self.calls.clear();
+        }
+        self.calls
+            .entry((contract_id.clone(), method, args.to_string()))
+            .or_insert_with(|| start(contract_id, method, args))
+            .clone()
+    }
+}
+
+fn start_view_call(
+    contract_id: AccountId,
+    method: &'static str,
+    args: serde_json::Value,
+) -> SharedViewCall {
+    async move {
+        RPC_CLIENT
+            .call::<serde_json::Value>(
+                contract_id,
+                method,
+                args,
+                QueryFinality::Finality(Finality::DoomSlug),
+            )
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+    .boxed()
+    .shared()
+}
+
+async fn view_call_of_current_block<T: DeserializeOwned>(
+    contract_id: AccountId,
+    method: &'static str,
+    args: serde_json::Value,
+) -> Result<T, String> {
+    let block_height = BLOCK_HEIGHT.read().unwrap().clone()?;
+    let call = BLOCK_VIEW_CALLS.lock().unwrap().get_or_start(
+        block_height,
+        contract_id,
+        method,
+        args,
+        start_view_call,
+    );
+    serde_json::from_value(call.await?).map_err(|err| format!("{err:?}"))
+}
+
 impl NetworkView for Mainnet {
     async fn storage_balance(
         &self,
         contract_id: AccountId,
         account_id: &AccountId,
     ) -> Result<Option<StorageDeposit>, String> {
-        RPC_CLIENT
-            .call::<Option<StorageDeposit>>(
-                contract_id,
-                "storage_balance_of",
-                serde_json::json!({
-                    "account_id": account_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .inspect_err(|err| println!("Error checking storage balance: {err:?}"))
-            .map_err(|err| format!("{err:?}"))
+        view_call_of_current_block(
+            contract_id,
+            "storage_balance_of",
+            serde_json::json!({
+                "account_id": account_id,
+            }),
+        )
+        .await
+        .inspect_err(|err| println!("Error checking storage balance: {err}"))
     }
 
     async fn storage_balance_bounds(
@@ -201,86 +266,73 @@ impl NetworkView for Mainnet {
     }
 
     async fn is_rhea_token_registered(&self, account_id: &AccountId, token_id: &AccountId) -> bool {
-        RPC_CLIENT
-            .call::<bool>(
-                "v2.ref-finance.near".parse().unwrap(),
-                "token_register_of",
-                serde_json::json!({
-                    "account_id": account_id,
-                    "token_id": token_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .inspect_err(|err| println!("Error checking rhea token registration: {err:?}"))
-            .unwrap_or_default()
+        view_call_of_current_block(
+            "v2.ref-finance.near".parse().unwrap(),
+            "token_register_of",
+            serde_json::json!({
+                "account_id": account_id,
+                "token_id": token_id,
+            }),
+        )
+        .await
+        .inspect_err(|err| println!("Error checking rhea token registration: {err}"))
+        .unwrap_or_default()
     }
 
     async fn is_intear_asset_registered(&self, account_id: &AccountId, asset_id: &AssetId) -> bool {
-        RPC_CLIENT
-            .call::<bool>(
-                "dex.intear.near".parse().unwrap(),
-                "are_assets_registered",
-                serde_json::json!({
-                    "asset_ids": [asset_id],
-                    "for": {
-                        "Account": account_id,
-                    }
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .inspect_err(|err| println!("Error checking intear asset registration: {err:?}"))
-            .unwrap_or_default()
+        view_call_of_current_block(
+            "dex.intear.near".parse().unwrap(),
+            "are_assets_registered",
+            serde_json::json!({
+                "asset_ids": [asset_id],
+                "for": {
+                    "Account": account_id,
+                }
+            }),
+        )
+        .await
+        .inspect_err(|err| println!("Error checking intear asset registration: {err}"))
+        .unwrap_or_default()
     }
 
     async fn rhea_storage_state(
         &self,
         account_id: &AccountId,
     ) -> Result<Option<RheaStorageState>, String> {
-        RPC_CLIENT
-            .call::<Option<RheaStorageState>>(
-                "v2.ref-finance.near".parse().unwrap(),
-                "get_user_storage_state",
-                serde_json::json!({
-                    "account_id": account_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .map_err(|err| format!("{err:?}"))
+        view_call_of_current_block(
+            "v2.ref-finance.near".parse().unwrap(),
+            "get_user_storage_state",
+            serde_json::json!({
+                "account_id": account_id,
+            }),
+        )
+        .await
     }
 
     async fn intear_balances_exist(&self, account_id: &AccountId) -> Result<bool, String> {
-        RPC_CLIENT
-            .call::<Vec<serde_json::Value>>(
-                "dex.intear.near".parse().unwrap(),
-                "registered_assets_of",
-                serde_json::json!({
-                    "account_id": account_id,
-                    "from_index": 0,
-                    "limit": 1,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .map(|assets| !assets.is_empty())
-            .map_err(|err| format!("{err:?}"))
+        view_call_of_current_block::<Vec<serde_json::Value>>(
+            "dex.intear.near".parse().unwrap(),
+            "registered_assets_of",
+            serde_json::json!({
+                "account_id": account_id,
+                "from_index": 0,
+                "limit": 1,
+            }),
+        )
+        .await
+        .map(|assets| !assets.is_empty())
     }
 
     async fn is_intear_asset_in_custody(&self, asset_id: &AssetId) -> Result<bool, String> {
-        RPC_CLIENT
-            .call::<Option<near_sdk::json_types::U128>>(
-                "dex.intear.near".parse().unwrap(),
-                "total_in_custody",
-                serde_json::json!({
-                    "asset_id": asset_id,
-                }),
-                QueryFinality::Finality(Finality::DoomSlug),
-            )
-            .await
-            .map(|total| total.is_some())
-            .map_err(|err| format!("{err:?}"))
+        view_call_of_current_block::<Option<near_sdk::json_types::U128>>(
+            "dex.intear.near".parse().unwrap(),
+            "total_in_custody",
+            serde_json::json!({
+                "asset_id": asset_id,
+            }),
+        )
+        .await
+        .map(|total| total.is_some())
     }
 
     fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
@@ -833,6 +885,10 @@ lazy_static! {
         RwLock::new(Err("Block height is not loaded yet".to_string()));
     static ref FINAL_BLOCK_HASH: RwLock<Result<CryptoHash, String>> =
         RwLock::new(Err("Final block hash is not loaded yet".to_string()));
+    static ref BLOCK_VIEW_CALLS: Mutex<BlockViewCalls> = Mutex::new(BlockViewCalls {
+        block_height: 0,
+        calls: HashMap::new(),
+    });
 }
 
 pub const TOKEN_INFOS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);

@@ -1587,3 +1587,48 @@ async fn get_slippage_auto_uses_max_of_input_and_output_scales() {
         expected_auto_slippage("0.01", "0.51", BigDecimal::from_f64(0.05).unwrap())
     );
 }
+
+/// Calls started through `block_view_calls` at `block_height`, counting how many were started
+fn view_call_at(
+    block_view_calls: &mut BlockViewCalls,
+    started: &Arc<std::sync::atomic::AtomicUsize>,
+    block_height: BlockHeight,
+    account_id: &str,
+) -> SharedViewCall {
+    let started = started.clone();
+    block_view_calls.get_or_start(
+        block_height,
+        account("ft"),
+        "storage_balance_of",
+        serde_json::json!({ "account_id": account_id }),
+        move |_, _, _| {
+            let call_number = started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(serde_json::json!(call_number)) }
+                .boxed()
+                .shared()
+        },
+    )
+}
+
+#[tokio::test]
+async fn view_calls_are_shared_within_a_block() {
+    let mut block_view_calls = BlockViewCalls {
+        block_height: 0,
+        calls: HashMap::new(),
+    };
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let first = view_call_at(&mut block_view_calls, &started, 10, "alice.near");
+    let same = view_call_at(&mut block_view_calls, &started, 10, "alice.near");
+    let other_account = view_call_at(&mut block_view_calls, &started, 10, "bob.near");
+    assert_eq!(first.await, Ok(serde_json::json!(0)));
+    assert_eq!(same.await, Ok(serde_json::json!(0)));
+    assert_eq!(other_account.await, Ok(serde_json::json!(1)));
+
+    let next_block = view_call_at(&mut block_view_calls, &started, 11, "alice.near");
+    assert_eq!(next_block.await, Ok(serde_json::json!(2)));
+    // A route that read an older block height takes the later block's answer
+    let older_block = view_call_at(&mut block_view_calls, &started, 10, "alice.near");
+    assert_eq!(older_block.await, Ok(serde_json::json!(2)));
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
