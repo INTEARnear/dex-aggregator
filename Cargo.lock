@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "amp-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex#ed0d89a67a28aa82771b0a434e5f1fd5b8c54bc9"
+source = "git+https://github.com/INTEARnear/dex#72bb79d2943a69fbe3369c4d8c6d740737b4f762"
 dependencies = [
  "ethnum",
  "intear-dex-common",
@@ -2216,7 +2216,7 @@ dependencies = [
 [[package]]
 name = "intear-dex-common"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex#ed0d89a67a28aa82771b0a434e5f1fd5b8c54bc9"
+source = "git+https://github.com/INTEARnear/dex#72bb79d2943a69fbe3369c4d8c6d740737b4f762"
 dependencies = [
  "ethnum",
  "near-sdk",
@@ -2225,7 +2225,7 @@ dependencies = [
 [[package]]
 name = "intear-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex#ed0d89a67a28aa82771b0a434e5f1fd5b8c54bc9"
+source = "git+https://github.com/INTEARnear/dex#72bb79d2943a69fbe3369c4d8c6d740737b4f762"
 dependencies = [
  "intear-dex-common",
  "near-sdk",
@@ -2234,7 +2234,7 @@ dependencies = [
 [[package]]
 name = "intear-events"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/intear-events#f6a7e280054739b4ef622e894fba69ffdfd4f338"
+source = "git+https://github.com/INTEARnear/intear-events#6ae0799bf5574a566abe9ad99b80f374169a2bbf"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -3061,7 +3061,7 @@ dependencies = [
 [[package]]
 name = "otc-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex#ed0d89a67a28aa82771b0a434e5f1fd5b8c54bc9"
+source = "git+https://github.com/INTEARnear/dex#72bb79d2943a69fbe3369c4d8c6d740737b4f762"
 dependencies = [
  "intear-dex-common",
  "near-sdk",
@@ -5163,7 +5163,7 @@ dependencies = [
 [[package]]
 name = "trade-indexer"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/trade-indexer#b183cad0d0313d1d188a3154833a048e16944dc2"
+source = "git+https://github.com/INTEARnear/trade-indexer#388f630d861e3f82e5612ae946607fab1c1c57f5"
 dependencies = [
  "amp-dex-types",
  "async-trait",
@@ -5685,7 +5685,7 @@ version = "0.1.0"
 [[package]]
 name = "xyk-dex-types"
 version = "0.1.0"
-source = "git+https://github.com/INTEARnear/dex#ed0d89a67a28aa82771b0a434e5f1fd5b8c54bc9"
+source = "git+https://github.com/INTEARnear/dex#72bb79d2943a69fbe3369c4d8c6d740737b4f762"
 dependencies = [
  "ethnum",
  "intear-dex-common",

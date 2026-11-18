@@ -75,14 +75,13 @@ impl Hook for Qoq {
         if pools.check_fresh().is_err() {
             return Ok(vec![]);
         }
-        let Some(oracle_prices) = self.oracle_prices.fresh() else {
-            return Ok(vec![]);
-        };
+        // Without fresh prices of the oracle, only the pools with a fixed price swap
+        let oracle_prices = self.oracle_prices.fresh();
         let quote = self.quote(
             &input.trade,
             input.block_height,
             LastLook::of(&input).as_ref(),
-            |request| qoq::find_path_in(&pools, &oracle_prices, request),
+            |request| qoq::find_path_in(&pools, oracle_prices.as_deref(), request),
         );
         Ok(quote.into_iter().collect())
     }
@@ -136,7 +135,7 @@ impl Qoq {
                     .map(|quote| SwapEstimate {
                         estimated_amount: quote.estimated_amount,
                         gas: quote.swap_gas,
-                        asks_oracle: true,
+                        asks_oracle: quote.oracle_request.is_some(),
                     })
             })
         });
@@ -177,9 +176,9 @@ impl Qoq {
             worst_case_amount: U128(quote.worst_case_amount),
             gas: quote.swap_gas,
             discount: tear_fee_discount.map(|_| U128(quote.discount)),
-            oracle_request: Some(OracleRequest {
-                oracle_key: quote.oracle_key,
-                request: Base64VecU8(borsh::to_vec(&quote.prices_request).unwrap()),
+            oracle_request: quote.oracle_request.map(|oracle_request| OracleRequest {
+                oracle_key: oracle_request.oracle_key,
+                request: Base64VecU8(borsh::to_vec(&oracle_request.prices_request).unwrap()),
             }),
         })
     }
@@ -267,8 +266,13 @@ mod tests {
                 estimated_amount,
                 worst_case_amount: estimated_amount * 99 / 100,
                 discount,
-                oracle_key: ORACLE_KEY.parse().unwrap(),
-                prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
+                oracle_request: Some(qoq::QuoteOracleRequest {
+                    oracle_key: ORACLE_KEY.parse().unwrap(),
+                    prices_request: PricesRequest::of_pools([(
+                        &request.token_in,
+                        &request.token_out,
+                    )]),
+                }),
                 swap_gas: Gas::from_ggas(24_800, 24_800),
             })
         }
@@ -369,8 +373,10 @@ mod tests {
             estimated_amount,
             worst_case_amount: estimated_amount * 99 / 100,
             discount,
-            oracle_key: ORACLE_KEY.parse().unwrap(),
-            prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
+            oracle_request: Some(qoq::QuoteOracleRequest {
+                oracle_key: ORACLE_KEY.parse().unwrap(),
+                prices_request: PricesRequest::of_pools([(&request.token_in, &request.token_out)]),
+            }),
             swap_gas: Gas::from_ggas(24_800, 24_800),
         })
     }
