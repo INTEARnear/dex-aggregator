@@ -189,8 +189,9 @@ pub struct IntearDexSwapOperation {
     /// Best first. One is swapped on alone, the engine falls back through more of them when one
     /// fails or doesn't meet the constraint.
     pub options: Vec<IntearDexSwapOption>,
-    /// What the operations ask before the swap, for the options that read the response. Boxed, as
-    /// it's most of the size of a call that has one.
+    /// What the operations ask before the swap, for the options that read the response, for the
+    /// oracle's fee in the asset in, which `amount` and `constraint` are after. Boxed, as it's
+    /// most of the size of a call that has one.
     pub oracle_request: Option<Box<IntearDexOracleRequest>>,
 }
 
@@ -268,11 +269,12 @@ const INTEAR_DEX_SWAP_MARGIN_PERCENT: u64 = 15;
 const QOQ_SWAP_MARGIN: NearGas = NearGas::from_tgas(4);
 const QOQ_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
-/// them in a receipt of their own. Holding them burnt 4 Tgas in sandbox.
-const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(4_000, 4_000);
-/// What Intear DEX attaches to the calls after the operations of a deposit that waited for an
-/// oracle, which refund the deposit if they failed
-const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(4_300, 15_000);
+/// them in a receipt of their own, and pays the oracle its fee in a call after them that it
+/// attaches 10 Tgas to. Holding them burnt 4.7 Tgas in sandbox, and paying the oracle 2.7.
+const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(7_400, 14_700);
+/// What Intear DEX attaches to the last call after the operations of a deposit that waited for
+/// an oracle, which keeps the deposit if refunding it failed. It burnt 2 Tgas in sandbox.
+const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(2_000, 10_000);
 /// Under what a transaction can attach, with room for the other calls in it
 const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 
@@ -842,6 +844,10 @@ impl IntearDexOperations {
                     oracle_key: oracle_request.request.oracle_key.clone(),
                     dex_id: oracle_request.dex_id.clone(),
                     request: oracle_request.request.request.clone(),
+                    fee: (
+                        AssetId::from(&swap.asset_in),
+                        TokenAmount::new(oracle_request.request.fee.0),
+                    ),
                 });
         let operations = oracle_request
             .chain([swap_operation])

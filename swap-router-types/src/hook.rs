@@ -9,11 +9,12 @@ use near_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::fees::amount_in_after_referral_fees;
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
 use crate::types::{Amount, CostPrices, Gas, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 7;
+pub const HOOK_ABI_VERSION: u32 = 8;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -54,6 +55,31 @@ pub struct HookInput<'a> {
     pub route_costs: Cow<'a, IntearDexRouteCosts>,
 }
 
+impl HookInput<'_> {
+    /// The trade of a swap whose operations start with a request to an oracle that takes
+    /// `oracle_fee` of the asset in: the engine takes it out of the input of an exact-in swap
+    /// before the app fees, and on top of the input of an exact-out one. None if the fee leaves
+    /// nothing of the input.
+    pub fn trade_after_oracle_fee(&self, oracle_fee: u128) -> Option<IntearDexTrade> {
+        let amount = match self.swap_request.amount {
+            Amount::AmountIn(amount_in) => {
+                let amount_in_after_oracle_fee = amount_in
+                    .checked_sub(oracle_fee)
+                    .filter(|amount_in| *amount_in > 0)?;
+                Amount::AmountIn(amount_in_after_referral_fees(
+                    &self.swap_request.fees,
+                    amount_in_after_oracle_fee,
+                ))
+            }
+            Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
+        };
+        Some(IntearDexTrade {
+            amount,
+            ..self.trade.clone().into_owned()
+        })
+    }
+}
+
 /// What the route of a hook's quote costs besides the gas its swap burns, which the aggregator
 /// ranks it with against the other quotes, as [`crate::types::net_amount`] does
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +102,7 @@ pub struct HookQuote {
     /// The swap's message to the DEX
     pub message: Base64VecU8,
     /// What the DEX gives for an exact-in trade, or takes for an exact-out one, without the app
-    /// fees
+    /// fees and the fee of the oracle
     pub estimated_amount: U128,
     /// The least the DEX gives, or the most it takes, which the swap is constrained to
     pub worst_case_amount: U128,
@@ -95,6 +121,10 @@ pub struct HookQuote {
 pub struct OracleRequest {
     pub oracle_key: PublicKeyHandle,
     pub request: Base64VecU8,
+    /// What the oracle takes for the request in the trade's asset in, which the engine takes from
+    /// the input before the swap. The quote is of a trade after it, as
+    /// [`HookInput::trade_after_oracle_fee`] makes it.
+    pub fee: U128,
 }
 
 /// Prices of the smallest units of tokens in the smallest unit of USDt
@@ -386,6 +416,25 @@ mod tests {
             "0.000000000000000000000002".parse::<BigDecimal>().unwrap()
         );
         assert_eq!(serde_json::to_string(&read).unwrap(), input);
+    }
+
+    #[test]
+    fn oracle_fee_comes_out_of_an_exact_input_before_the_app_fees() {
+        let mut input: HookInput<'static> = serde_json::from_str(&input_json()).unwrap();
+        input.swap_request.to_mut().amount = Amount::AmountIn(1_000_000);
+        // 0.5% of the 800,000 that the oracle's fee leaves goes to the app and the aggregator
+        assert_eq!(
+            input.trade_after_oracle_fee(200_000).unwrap().amount,
+            Amount::AmountIn(796_000)
+        );
+        assert!(input.trade_after_oracle_fee(1_000_000).is_none());
+
+        input.swap_request.to_mut().amount = Amount::AmountOut(1_000_000);
+        input.trade.to_mut().amount = Amount::AmountOut(1_000_000);
+        assert_eq!(
+            input.trade_after_oracle_fee(200_000).unwrap().amount,
+            Amount::AmountOut(1_000_000)
+        );
     }
 
     #[test]

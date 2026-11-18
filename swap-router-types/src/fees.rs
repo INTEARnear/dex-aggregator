@@ -50,6 +50,13 @@ pub fn payable_referral_fees(referral_fees: &QuoteFees) -> QuoteFees {
     QuoteFees(payable)
 }
 
+/// What the DEX gets of `amount_in`, which the engine takes the referral fees out of
+pub fn amount_in_after_referral_fees(referral_fees: &QuoteFees, amount_in: u128) -> u128 {
+    let fees = ReferralFees::from(&payable_referral_fees(referral_fees))
+        .amounts_out_of(TokenAmount::new(amount_in));
+    amount_in - fees.iter().map(|(_, fee)| fee.get()).sum::<u128>()
+}
+
 pub fn amount_in_with_referral_fees(referral_fees: &QuoteFees, dex_amount_in: u128) -> u128 {
     let fees = ReferralFees::from(&payable_referral_fees(referral_fees))
         .amounts_on_top_of(TokenAmount::new(dex_amount_in));

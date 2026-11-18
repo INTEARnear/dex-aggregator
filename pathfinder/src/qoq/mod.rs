@@ -21,6 +21,7 @@ use swap_router_types::{indexed::AccountState, types::Gas};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use crate::intear_dex::{self, OracleFees};
 use crate::search::{self, Graph, MaxHops, QuoteAmount, Settings};
 
 pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
@@ -55,8 +56,6 @@ struct PoolInfo {
     /// price, or the median of its oracle's prices
     price: Price,
     fees: SwapFees,
-    /// Taken from the input of every swap on the pool before `fees`, in the asset swapped in
-    oracle_fees: PoolAssets<TokenAmount>,
 }
 
 impl Pool {
@@ -66,7 +65,7 @@ impl Pool {
         price: Price,
         fee_discount: Option<FeeDiscountFraction>,
     ) -> Self {
-        let fees = SwapFees::of_pool_fee(stored.fees.fraction);
+        let fees = SwapFees::of_pool_fee(stored.fee);
         Self {
             id,
             balances: PoolAssets([stored.assets.0.balance, stored.assets.1.balance]),
@@ -82,10 +81,6 @@ impl Pool {
                     Some(fee_discount) => fees.discounted(fee_discount),
                     None => fees,
                 },
-                oracle_fees: PoolAssets([
-                    stored.fees.oracle_fee_per_swap.0,
-                    stored.fees.oracle_fee_per_swap.1,
-                ]),
             }),
         }
     }
@@ -105,12 +100,7 @@ impl Pool {
             amplification: self.info.amplification,
         };
         let swap_amounts = rated_pool
-            .swap_amounts(
-                in_index,
-                amount,
-                self.info.fees,
-                self.info.oracle_fees[in_index],
-            )
+            .swap_amounts(in_index, amount, self.info.fees)
             .ok()?;
         let out_index = in_index.other();
         self.balances[in_index] = self.balances[in_index]
@@ -176,6 +166,7 @@ pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
     pools: Vec<StoredPool>,
+    oracle_fees: OracleFees,
 }
 
 /// Builds pools from indexed storage
@@ -184,6 +175,7 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
         block_height: state.block.height,
         updated_at: Instant::now(),
         pools: storage::stored_pools(state)?,
+        oracle_fees: intear_dex::oracle_fees(state)?,
     })
 }
 
@@ -202,6 +194,12 @@ impl Pools {
             );
         }
         Ok(())
+    }
+
+    /// What the oracle takes in `asset_in` for the request that a swap starts with, which the
+    /// engine takes from the swap's input. None if it doesn't take requests paid in `asset_in`.
+    pub fn oracle_fee(&self, oracle_key: &PublicKeyHandle, asset_in: &AssetId) -> Option<u128> {
+        Some(self.oracle_fees.get(oracle_key)?.get(asset_in)?.get())
     }
 
     /// The assets of each pool, which swaps ask its oracle for the prices of
@@ -412,9 +410,7 @@ pub fn find_path_in(
 
 #[cfg(test)]
 mod tests {
-    use amp_dex_types::{
-        AssetWithBalance, FeeConfiguration, FeeFraction, PayoutGroups, TotalShares,
-    };
+    use amp_dex_types::{AssetWithBalance, FeeFraction, PayoutGroups, TotalShares};
 
     use super::*;
 
@@ -433,7 +429,7 @@ mod tests {
         AssetId::Nep141("xaut.near".parse().unwrap())
     }
 
-    /// A pool of 0.1% fee and no oracle fee with `balances` of assets of `decimals`
+    /// A pool of 0.1% fee with `balances` of assets of `decimals`
     fn stored_pool(
         assets: [AssetId; 2],
         decimals: (u8, u8),
@@ -458,18 +454,15 @@ mod tests {
                 key: oracle_key.parse().unwrap(),
                 last_price: Price::from_units(0),
             },
-            fees: FeeConfiguration {
-                fraction: FeeFraction::new(1_000),
-                oracle_fee_per_swap: (TokenAmount::ZERO, TokenAmount::ZERO),
-                oracle_fee_receiver: "qoq-oracle.intear.near".parse().unwrap(),
-            },
+            fee: FeeFraction::new(1_000),
             _providers_prefix: vec![],
             _total_shares: TotalShares::NONE,
             _payout_groups: PayoutGroups::default(),
         }
     }
 
-    /// NEAR/USDC and USDC/XAUT pools of the oracle, and a NEAR/XAUT pool of another one
+    /// NEAR/USDC and USDC/XAUT pools of the oracle, which takes 0.001 NEAR or 0.003 USDC for a
+    /// request, and a NEAR/XAUT pool of another one
     fn pools() -> Pools {
         Pools {
             block_height: 1,
@@ -494,6 +487,13 @@ mod tests {
                     OTHER_ORACLE_KEY,
                 ),
             ],
+            oracle_fees: HashMap::from([(
+                ORACLE_KEY.parse().unwrap(),
+                HashMap::from([
+                    (near(), TokenAmount::new(10u128.pow(21))),
+                    (usdc(), TokenAmount::new(3_000)),
+                ]),
+            )]),
         }
     }
 
@@ -530,7 +530,7 @@ mod tests {
         fee_discount: Option<FeeDiscountFraction>,
     ) -> SwapAmounts {
         let stored = &pools.pools[pool_id as usize];
-        let fees = SwapFees::of_pool_fee(stored.fees.fraction);
+        let fees = SwapFees::of_pool_fee(stored.fee);
         RatedPool {
             balances: PoolAssets([stored.assets.0.balance, stored.assets.1.balance]),
             decimals: PoolAssets([stored.decimals.0, stored.decimals.1]),
@@ -541,7 +541,6 @@ mod tests {
             AssetIndex::First,
             amount,
             fee_discount.map_or(fees, |fee_discount| fees.discounted(fee_discount)),
-            stored.fees.oracle_fee(AssetIndex::First),
         )
         .unwrap()
     }
@@ -609,82 +608,26 @@ mod tests {
         assert_eq!(quote.worst_case_amount, quote.estimated_amount * 101 / 100);
     }
 
-    /// [`pools`] with oracle fees of 0.01 NEAR and 0.005 USDC per swap
-    fn pools_with_oracle_fees() -> Pools {
-        let mut pools = pools();
-        pools.pools[0].fees.oracle_fee_per_swap =
-            (TokenAmount::new(10u128.pow(22)), TokenAmount::new(5_000));
-        pools.pools[1].fees.oracle_fee_per_swap = (TokenAmount::new(5_000), TokenAmount::ZERO);
-        pools
+    #[test]
+    fn oracles_take_their_fee_in_the_assets_they_set_it_in() {
+        let pools = pools();
+        let oracle_key = ORACLE_KEY.parse().unwrap();
+        assert_eq!(pools.oracle_fee(&oracle_key, &near()), Some(10u128.pow(21)));
+        assert_eq!(pools.oracle_fee(&oracle_key, &usdc()), Some(3_000));
+        assert_eq!(pools.oracle_fee(&oracle_key, &xaut()), None);
+        assert_eq!(
+            pools.oracle_fee(&OTHER_ORACLE_KEY.parse().unwrap(), &near()),
+            None
+        );
     }
 
     #[test]
-    fn every_hop_takes_the_oracle_fee_of_its_input() {
-        let with_oracle_fees = pools_with_oracle_fees();
-        let near_in = 10u128.pow(26);
-        let quote = find_path_in(
-            &with_oracle_fees,
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactIn(near_in)),
-        )
-        .unwrap();
-        let usdc_between = contract_swap(
-            &with_oracle_fees,
-            0,
-            SwapRequestAmount::ExactIn(TokenAmount::new(near_in)),
-            None,
-        );
-        assert_eq!(usdc_between.oracle_fee, TokenAmount::new(10u128.pow(22)));
-        let xaut_out = contract_swap(
-            &with_oracle_fees,
-            1,
-            SwapRequestAmount::ExactIn(usdc_between.amount_out),
-            None,
-        );
-        assert_eq!(xaut_out.oracle_fee, TokenAmount::new(5_000));
-        assert_eq!(quote.estimated_amount, xaut_out.amount_out.get());
-        let without_oracle_fees = find_path_in(
-            &pools(),
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactIn(near_in)),
-        )
-        .unwrap();
-        assert!(quote.estimated_amount < without_oracle_fees.estimated_amount);
-    }
-
-    #[test]
-    fn exact_out_takes_the_oracle_fees_on_top() {
-        let with_oracle_fees = pools_with_oracle_fees();
-        let xaut_out = 10u128.pow(6) / 100;
-        let quote = find_path_in(
-            &with_oracle_fees,
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactOut(xaut_out)),
-        )
-        .unwrap();
-        let usdc_between = contract_swap(
-            &with_oracle_fees,
-            1,
-            SwapRequestAmount::ExactOut(TokenAmount::new(xaut_out)),
-            None,
-        );
-        let near_in = contract_swap(
-            &with_oracle_fees,
-            0,
-            SwapRequestAmount::ExactOut(usdc_between.amount_in),
-            None,
-        );
-        assert_eq!(quote.estimated_amount, near_in.amount_in.get());
-    }
-
-    #[test]
-    fn fee_discount_takes_off_pool_and_protocol_fees_but_not_the_oracle_fee() {
-        let with_oracle_fees = pools_with_oracle_fees();
+    fn fee_discount_takes_off_pool_and_protocol_fees() {
         let near_in = 10u128.pow(26);
         let fee_discount = FeeDiscountFraction::new(250_000);
         let quote = |fee_discount| {
             find_path_in(
-                &with_oracle_fees,
+                &pools(),
                 Some(&oracle_prices()),
                 &Request {
                     token_out: usdc(),
@@ -697,12 +640,11 @@ mod tests {
         let discounted = quote(Some(fee_discount));
         let undiscounted = quote(None);
         let usdc_out = contract_swap(
-            &with_oracle_fees,
+            &pools(),
             0,
             SwapRequestAmount::ExactIn(TokenAmount::new(near_in)),
             Some(fee_discount),
         );
-        assert_eq!(usdc_out.oracle_fee, TokenAmount::new(10u128.pow(22)));
         assert_eq!(discounted.estimated_amount, usdc_out.amount_out.get());
         assert_eq!(undiscounted.discount, 0);
         assert_eq!(
@@ -714,17 +656,6 @@ mod tests {
             discounted.swap_gas,
             undiscounted.swap_gas + FEE_DISCOUNT_GAS
         );
-    }
-
-    #[test]
-    fn no_route_for_less_than_the_oracle_fee() {
-        let oracle_fee = 10u128.pow(22);
-        let result = find_path_in(
-            &pools_with_oracle_fees(),
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactIn(oracle_fee)),
-        );
-        assert!(result.is_err());
     }
 
     #[test]

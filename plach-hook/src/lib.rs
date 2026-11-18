@@ -135,7 +135,7 @@ impl Plach {
                 Some(SwapEstimate {
                     estimated_amount,
                     gas: swap_gas,
-                    asks_oracle: false,
+                    oracle_fee: None,
                 })
             })
         });

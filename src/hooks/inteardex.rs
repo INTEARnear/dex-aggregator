@@ -1,10 +1,9 @@
 use bigdecimal::Zero;
-use intear_dex_common::{AssetId, TokenAmount};
-use intear_dex_types::ReferralFees;
-use near_min_api::types::{AccountId, NearToken};
+use intear_dex_common::AssetId;
+use near_min_api::types::NearToken;
 use near_sdk::json_types::{Base64VecU8, U128};
 use swap_router_types::{
-    fees::amount_in_with_referral_fees,
+    fees::{amount_in_after_referral_fees, amount_in_with_referral_fees},
     hook::{HookQuote, IntearDexTrade, OracleRequest},
     types::Gas,
 };
@@ -45,12 +44,10 @@ pub fn trade_of_request(
         &base_token(&request.token_in),
         &base_token(&request.token_out),
     );
-    // The engine takes them out of the input before the DEX gets it
-    let referral_fees = ReferralFees::from(&payable_referral_fees(&request.fees));
     let amount = match request.amount {
-        Amount::AmountIn(amount_in) => Amount::AmountIn(
-            amount_in - fees_total(referral_fees.amounts_out_of(TokenAmount::new(amount_in))),
-        ),
+        Amount::AmountIn(amount_in) => {
+            Amount::AmountIn(amount_in_after_referral_fees(&request.fees, amount_in))
+        }
         Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
     };
     Some(IntearDexTrade {
@@ -73,10 +70,6 @@ fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
         }
         token_id => Some(AssetId::Nep141(convert_to_nep141(token_id, None, 0).1)),
     }
-}
-
-fn fees_total(fees: Vec<(AccountId, TokenAmount)>) -> u128 {
-    fees.iter().map(|(_, fee)| fee.get()).sum()
 }
 
 /// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, or on the first of several that
@@ -105,7 +98,7 @@ impl IntearDexSwap {
     }
 
     /// A swap whose costs are only those of its route: it burns no gas and asks the oracle, if it
-    /// does, for nothing. Its quote gives less in the worst case when the trade has slippage, as
+    /// does, for nothing and without a fee. Its quote gives less in the worst case when the trade has slippage, as
     /// the hooks' quotes do, so the route converts the output the same way.
     pub fn burning_no_gas(trade: &IntearDexTrade, asks_oracle: bool) -> Self {
         let trade_amount = match trade.amount {
@@ -126,6 +119,7 @@ impl IntearDexSwap {
             oracle_request: asks_oracle.then(|| OracleRequest {
                 oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
                 request: Base64VecU8(vec![]),
+                fee: U128(0),
             }),
         })
     }
@@ -142,7 +136,14 @@ impl IntearDexSwap {
             Amount::AmountIn(_) => {
                 quotes.sort_by_key(|quote| std::cmp::Reverse(quote.estimated_amount.0))
             }
-            Amount::AmountOut(_) => quotes.sort_by_key(|quote| quote.estimated_amount.0),
+            // The oracle's fee goes on top of what the DEX takes
+            Amount::AmountOut(_) => quotes.sort_by_key(|quote| {
+                quote.estimated_amount.0
+                    + quote
+                        .oracle_request
+                        .as_ref()
+                        .map_or(0, |oracle_request| oracle_request.fee.0)
+            }),
         }
         let best = quotes.first()?;
         let best_oracle_request = oracle_request_of(best);
@@ -225,22 +226,29 @@ pub fn route(
         Amount::AmountIn(_) => Amount::AmountOut(discount.0),
         Amount::AmountOut(_) => Amount::AmountIn(discount.0),
     });
+    // The engine takes it from the input before the swap, whose quote is of a trade after it
+    let oracle_fee = swap
+        .oracle_request
+        .as_ref()
+        .map_or(0, |oracle_request| oracle_request.request.fee.0);
     // The engine takes the fees out of the input of an exact-in swap
-    let (constraint, estimated_amount, worst_case_amount) = match request.amount {
-        Amount::AmountIn(_) => (
+    let (swap_amount, constraint, estimated_amount, worst_case_amount) = match request.amount {
+        Amount::AmountIn(amount_in) => (
+            Amount::AmountIn(amount_in - oracle_fee),
             swap.worst_case_amount,
             Amount::AmountOut(swap.estimated_amount),
             Amount::AmountOut(swap.worst_case_amount),
         ),
-        Amount::AmountOut(_) => {
+        Amount::AmountOut(amount_out) => {
             // Fees on top of the input the DEX takes, so the most it can take with them is the
             // constraint
             let with_fees =
                 |amount_in: u128| amount_in_with_referral_fees(&request.fees, amount_in);
             (
+                Amount::AmountOut(amount_out),
                 with_fees(swap.worst_case_amount),
-                Amount::AmountIn(with_fees(swap.estimated_amount)),
-                Amount::AmountIn(with_fees(swap.worst_case_amount)),
+                Amount::AmountIn(with_fees(swap.estimated_amount) + oracle_fee),
+                Amount::AmountIn(with_fees(swap.worst_case_amount) + oracle_fee),
             )
         }
     };
@@ -309,13 +317,13 @@ pub fn route(
 
     let input_amount = match request.amount {
         Amount::AmountIn(amount_in) => amount_in,
-        Amount::AmountOut(_) => constraint,
+        Amount::AmountOut(_) => constraint + oracle_fee,
     };
     let operations = IntearDexOperations {
         swap: IntearDexSwapOperation {
             asset_in: token_in.clone(),
             asset_out: token_out.clone(),
-            amount: request.amount,
+            amount: swap_amount,
             constraint,
             options: swap.options,
             oracle_request: swap.oracle_request.map(Box::new),
@@ -416,6 +424,7 @@ mod tests {
     const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
     const PLACH_SWAP_GAS: Gas = Gas::from_ggas(34_000, 34_000);
     const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
+    const ORACLE_FEE: u128 = 3;
 
     #[derive(Clone)]
     struct TestPlachQuotes {
@@ -601,7 +610,8 @@ mod tests {
         }
     }
 
-    /// A [`quote`] of a swap that reads the oracle's response to `request`
+    /// A [`quote`] of a swap that reads the oracle's response to `request`, which the oracle
+    /// takes [`ORACLE_FEE`] of the input for
     fn oracle_quote(
         dex_id: &str,
         estimated_amount: u128,
@@ -613,6 +623,7 @@ mod tests {
             oracle_request: Some(OracleRequest {
                 oracle_key: ORACLE_KEY.parse().unwrap(),
                 request: Base64VecU8(request.to_vec()),
+                fee: U128(ORACLE_FEE),
             }),
             ..quote(dex_id, estimated_amount, worst_case_amount, tgas)
         }
@@ -874,15 +885,21 @@ mod tests {
                     "oracle_key": ORACLE_KEY,
                     "dex_id": "slimedragon.near/amp",
                     "request": "bmVhcix1c2Rj",
+                    "fee": ["near", "3"],
                 },
             })
+        );
+        // The engine takes the oracle's fee from the deposit of 100 before the swap
+        assert_eq!(
+            operations[1]["SwapAdvanced"]["amount"],
+            serde_json::json!({ "Amount": { "ExactIn": "97" } })
         );
         let options = &operations[1]["SwapAdvanced"]["options"];
         assert_eq!(options.as_array().unwrap().len(), 2);
         assert_eq!(options[0]["dex_id"], "slimedragon.near/amp");
         assert_eq!(options[1]["dex_id"], "slimedragon.near/xyk");
         // The deposit is held while the operations wait for the oracle
-        let oracle_request_and_held_deposit = NearGas::from_tgas(4 + 15);
+        let oracle_request_and_held_deposit = NearGas::from_ggas(14_700 + 10_000);
         // Qoq's option has a fixed margin of its own besides the other options'
         let qoq_swap_margin = NearGas::from_tgas(4);
         assert_eq!(
@@ -892,6 +909,56 @@ mod tests {
                 .unwrap()
                 .checked_add(qoq_swap_margin)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_out_deposits_the_oracle_fee_on_top_of_what_the_swap_takes() {
+        let request = SwapRequest {
+            trader_account_id: None,
+            ..request(TokenId::Near, ft_output(), Amount::AmountOut(80))
+        };
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request).unwrap();
+        let swap = IntearDexSwap::of_quote(oracle_quote(
+            "slimedragon.near/amp",
+            100,
+            101,
+            25,
+            b"near,usdc",
+        ));
+        let route = route(DexId::IntearDex, &request, &trade, swap).unwrap();
+        assert_eq!(route.estimated_amount, Amount::AmountIn(103));
+        assert_eq!(route.worst_case_amount, Amount::AmountIn(104));
+        let Some(RouteStep::Call(CallBlueprint::IntearDexDepositNear { amount, .. })) =
+            route.steps.last()
+        else {
+            panic!("The route doesn't end with a deposit of NEAR");
+        };
+        assert_eq!(*amount, NearToken::from_yoctonear(104));
+        let (args, _) = last_call(&route);
+        let swap = &args["operations"]["operations"][1]["SwapSimple"];
+        assert_eq!(
+            swap["amount"],
+            serde_json::json!({ "Amount": { "ExactOut": "80" } })
+        );
+        assert_eq!(swap["constraint"], "101");
+    }
+
+    #[test]
+    fn exact_out_ranks_quotes_with_the_oracle_fee_on_top() {
+        let (operations, _) = swap_operations(
+            Amount::AmountOut(80),
+            vec![
+                // Takes 102 with the oracle's fee
+                oracle_quote("slimedragon.near/amp", 99, 99, 25, b"near,usdc"),
+                quote("slimedragon.near/otc", 100, 100, 27),
+            ],
+        );
+        assert_eq!(operations.as_array().unwrap().len(), 3);
+        assert_eq!(
+            operations[0]["SwapSimple"]["dex_id"],
+            "slimedragon.near/otc"
         );
     }
 

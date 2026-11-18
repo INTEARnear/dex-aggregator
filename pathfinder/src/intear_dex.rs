@@ -1,13 +1,21 @@
 use std::collections::HashMap;
 
 use borsh::BorshDeserialize;
+use intear_dex_common::{AssetId, TokenAmount};
+use near_sdk::PublicKeyHandle;
 use swap_router_types::indexed::{AccountState, Watch};
 
 pub const INTEAR_DEX_CONTRACT_ID: &str = "dex.intear.near";
 /// `dex_storage: LookupMap<(DexId, Vec<u8>), Vec<u8>>` of the DEX engine
 const DEX_STORAGE_PREFIX: u8 = 1;
+/// `oracle_fees: LookupMap<PublicKeyHandle, HashMap<AssetId, TokenAmount>>` of the DEX engine
+const ORACLE_FEES_PREFIX: u8 = 14;
 /// `pools: Vector<Pool>` of the xyk and amp DEXes, keys are the prefix and u32 index
 const POOLS_PREFIX: u8 = 0;
+const HASHED_KEY_BYTES: usize = 32;
+
+/// What each oracle takes for a request, in each asset that it takes fees in
+pub type OracleFees = HashMap<PublicKeyHandle, HashMap<AssetId, TokenAmount>>;
 
 /// Keys of the DEX in the engine's storage
 fn storage_prefix(dex_id: &str) -> Vec<u8> {
@@ -22,6 +30,28 @@ pub fn watch(dex_id: &str) -> Watch {
         account_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
         prefixes: vec![storage_prefix(dex_id)],
     }
+}
+
+/// The DEX with the fees of the oracles that swaps on it ask
+pub fn watch_with_oracle_fees(dex_id: &str) -> Watch {
+    Watch {
+        account_id: INTEAR_DEX_CONTRACT_ID.parse().unwrap(),
+        prefixes: vec![storage_prefix(dex_id), vec![ORACLE_FEES_PREFIX]],
+    }
+}
+
+pub fn oracle_fees(state: &AccountState) -> Result<OracleFees, anyhow::Error> {
+    state
+        .with_prefix(&[ORACLE_FEES_PREFIX])
+        .filter(|(key, _)| key.len() != HASHED_KEY_BYTES)
+        .map(|(key, value)| {
+            let oracle_key = borsh::from_slice::<PublicKeyHandle>(&key[1..])
+                .map_err(|e| anyhow::anyhow!("Invalid oracle key {key:02x?}: {e}"))?;
+            let fees = borsh::from_slice(value)
+                .map_err(|e| anyhow::anyhow!("Invalid fees of oracle {oracle_key}: {e}"))?;
+            Ok((oracle_key, fees))
+        })
+        .collect()
 }
 
 /// The pools of a DEX whose state starts with `pools: Vector<Pool>`, as the xyk and amp DEXes'
@@ -109,5 +139,42 @@ mod tests {
         assert_eq!(pools::<u8>(&state, "owner.near/dex").unwrap(), vec![10, 11]);
         assert_eq!(pools::<u8>(&state, "owner.near/other").unwrap(), vec![20]);
         assert!(pools::<u8>(&state, "owner.near/missing").is_err());
+    }
+
+    #[test]
+    fn reads_the_fees_of_oracles_from_the_engine() {
+        let oracle_key: PublicKeyHandle = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp"
+            .parse()
+            .unwrap();
+        let fees = HashMap::from([(AssetId::Near, TokenAmount::new(10u128.pow(21)))]);
+        let state = AccountState {
+            block: BlockInfo {
+                height: 1,
+                hash: Default::default(),
+                timestamp_nanosec: 0,
+            },
+            entries: [
+                engine_entry("owner.near/dex", b"STATE".to_vec(), vec![0; 4]),
+                (
+                    [
+                        vec![ORACLE_FEES_PREFIX],
+                        borsh::to_vec(&oracle_key).unwrap(),
+                    ]
+                    .concat(),
+                    borsh::to_vec(&fees).unwrap(),
+                ),
+                // A balance of another map, under a hash that starts with the prefix
+                (
+                    [vec![ORACLE_FEES_PREFIX], vec![0x0c; HASHED_KEY_BYTES - 1]].concat(),
+                    vec![0; 20],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            oracle_fees(&state).unwrap(),
+            HashMap::from([(oracle_key, fees)])
+        );
     }
 }

@@ -23,7 +23,10 @@ pub struct LastLook {
 pub struct SwapEstimate {
     pub estimated_amount: u128,
     pub gas: Gas,
-    pub asks_oracle: bool,
+    /// Of the oracle that the swap's operations ask first, as in an `OracleRequest`. Already
+    /// taken out of the input that an exact-in swap gives `estimated_amount` for, and on top of
+    /// the `estimated_amount` that an exact-out swap takes.
+    pub oracle_fee: Option<u128>,
 }
 
 impl LastLook {
@@ -68,16 +71,16 @@ impl LastLook {
         let route_amount = match self.best_other_amount {
             // The referral fees come out of the input of both
             Amount::AmountOut(_) => Amount::AmountOut(swap.estimated_amount),
-            // The engine takes the referral fees on top of what the hook's DEX takes
-            Amount::AmountIn(_) => Amount::AmountIn(amount_in_with_referral_fees(
-                &self.referral_fees,
-                swap.estimated_amount,
-            )),
+            // The engine takes the referral fees and the oracle's fee on top of what the hook's
+            // DEX takes
+            Amount::AmountIn(_) => Amount::AmountIn(
+                amount_in_with_referral_fees(&self.referral_fees, swap.estimated_amount)
+                    + swap.oracle_fee.unwrap_or_default(),
+            ),
         };
-        let route_cost = if swap.asks_oracle {
-            self.route_costs.with_oracle_request
-        } else {
-            self.route_costs.without_oracle_request
+        let route_cost = match swap.oracle_fee {
+            Some(_) => self.route_costs.with_oracle_request,
+            None => self.route_costs.without_oracle_request,
         };
         let swap_gas_cost = self
             .route_costs
@@ -144,7 +147,7 @@ mod tests {
         SwapEstimate {
             estimated_amount: 1_000 + percent_of(fee_discount),
             gas: Gas::from_ggas(5, 5),
-            asks_oracle,
+            oracle_fee: asks_oracle.then_some(0),
         }
     }
 
@@ -178,7 +181,7 @@ mod tests {
                     Some(SwapEstimate {
                         estimated_amount: 1_100 - percent_of(fee_discount),
                         gas: Gas::from_ggas(5, 5),
-                        asks_oracle: false,
+                        oracle_fee: None,
                     })
                 })
                 .map(FeeDiscountFraction::get)

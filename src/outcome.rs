@@ -604,7 +604,7 @@ fn traded_amounts(
                 receipt_id: *receipt_id,
                 receipt: ReceiptEnumView::Action {
                     signer_id: transaction.signer_id.clone(),
-                    signer_public_key: transaction.public_key.clone(),
+                    signer_public_key: Some(transaction.public_key.clone()),
                     gas_price: transaction_outcome.tokens_burnt
                         / Balance::from(transaction_outcome.gas_burnt.as_gas()),
                     output_data_receivers: Vec::new(),
@@ -612,6 +612,7 @@ fn traded_amounts(
                     actions: transaction.actions.clone(),
                     is_promise_yield: false,
                     refund_to: None,
+                    authorization_context: None,
                 },
                 priority: 0,
             });

@@ -75,22 +75,42 @@ impl Hook for Qoq {
         if pools.check_fresh().is_err() {
             return Ok(vec![]);
         }
-        // Without fresh prices of the oracle, only the pools with a fixed price swap
-        let oracle_prices = self.oracle_prices.fresh();
-        let quote = self.quote(
+        let last_look = LastLook::of(&input);
+        // Through pools with a fixed price alone, which ask no oracle
+        let fixed_price_quote = self.quote(
             &input.trade,
+            None,
             input.block_height,
-            LastLook::of(&input).as_ref(),
-            |request| qoq::find_path_in(&pools, oracle_prices.as_deref(), request),
+            last_look.as_ref(),
+            |request| qoq::find_path_in(&pools, None, request),
         );
-        Ok(quote.into_iter().collect())
+        // The oracle takes its fee for its prices, so it's only asked by routes that need them
+        let oracle_quote = self.oracle_prices.fresh().and_then(|oracle_prices| {
+            let oracle_fee = pools.oracle_fee(&oracle_prices.oracle_key, &input.trade.asset_in)?;
+            let trade = input.trade_after_oracle_fee(oracle_fee)?;
+            self.quote(
+                &trade,
+                Some(oracle_fee),
+                input.block_height,
+                last_look.as_ref(),
+                |request| {
+                    let quote = qoq::find_path_in(&pools, Some(&oracle_prices), request)?;
+                    anyhow::ensure!(quote.oracle_request.is_some(), "The route asks no oracle");
+                    Ok(quote)
+                },
+            )
+        });
+        Ok(fixed_price_quote.into_iter().chain(oracle_quote).collect())
     }
 }
 
 impl Qoq {
+    /// Of `trade`, which is after the `oracle_fee` that the oracle takes for the prices of the
+    /// route, if the route asks it
     fn quote(
         &self,
         trade: &IntearDexTrade,
+        oracle_fee: Option<u128>,
         block_height: BlockHeight,
         last_look: Option<&LastLook>,
         find_path: impl Fn(&qoq::Request) -> Result<qoq::Quote, anyhow::Error>,
@@ -135,7 +155,7 @@ impl Qoq {
                     .map(|quote| SwapEstimate {
                         estimated_amount: quote.estimated_amount,
                         gas: quote.swap_gas,
-                        asks_oracle: quote.oracle_request.is_some(),
+                        oracle_fee,
                     })
             })
         });
@@ -176,10 +196,13 @@ impl Qoq {
             worst_case_amount: U128(quote.worst_case_amount),
             gas: quote.swap_gas,
             discount: tear_fee_discount.map(|_| U128(quote.discount)),
-            oracle_request: quote.oracle_request.map(|oracle_request| OracleRequest {
-                oracle_key: oracle_request.oracle_key,
-                request: Base64VecU8(borsh::to_vec(&oracle_request.prices_request).unwrap()),
-            }),
+            oracle_request: quote.oracle_request.zip(oracle_fee).map(
+                |(oracle_request, oracle_fee)| OracleRequest {
+                    oracle_key: oracle_request.oracle_key,
+                    request: Base64VecU8(borsh::to_vec(&oracle_request.prices_request).unwrap()),
+                    fee: U128(oracle_fee),
+                },
+            ),
         })
     }
 }
@@ -203,6 +226,8 @@ mod tests {
     use super::*;
 
     const ONE_TEAR: u128 = 10u128.pow(24);
+    /// 0.001 NEAR, which the trades are after
+    const ORACLE_FEE: u128 = 10u128.pow(21);
 
     const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
     const USDC_TOKEN_ID: &str = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
@@ -283,8 +308,14 @@ mod tests {
         let (qoq, _traders_to_fetch) = qoq([]);
         for trader_id in [Some("slimedragon.near"), Some("trader.near"), None] {
             assert!(
-                qoq.quote(&trade(trader_id), 1_000_000, None, find_path_at(24))
-                    .is_some()
+                qoq.quote(
+                    &trade(trader_id),
+                    Some(ORACLE_FEE),
+                    1_000_000,
+                    None,
+                    find_path_at(24)
+                )
+                .is_some()
             );
         }
     }
@@ -293,7 +324,13 @@ mod tests {
     fn swaps_after_asking_the_oracle_for_the_prices_of_the_route() {
         let (qoq, _) = qoq([]);
         let quote = qoq
-            .quote(&trade(None), 1_000_000, None, find_path_at(24))
+            .quote(
+                &trade(None),
+                Some(ORACLE_FEE),
+                1_000_000,
+                None,
+                find_path_at(24),
+            )
             .unwrap();
         assert_eq!(quote.dex_id, QOQ_DEX_ID.parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(2_400_000));
@@ -304,6 +341,7 @@ mod tests {
         assert!(swap_args.fee_discount.is_none());
         let oracle_request = quote.oracle_request.unwrap();
         assert_eq!(oracle_request.oracle_key, ORACLE_KEY.parse().unwrap());
+        assert_eq!(oracle_request.fee, U128(ORACLE_FEE));
         let prices_request: PricesRequest = borsh::from_slice(&oracle_request.request.0).unwrap();
         assert_eq!(prices_request.asset_ids, vec![AssetId::Near, usdc()]);
     }
@@ -314,6 +352,7 @@ mod tests {
         let quote = qoq
             .quote(
                 &trade(Some("trader.near")),
+                Some(ORACLE_FEE),
                 1_000_000,
                 None,
                 find_path_at(24),
@@ -410,6 +449,7 @@ mod tests {
         let quote_for = |trader_id| {
             qoq.quote(
                 &trade(trader_id),
+                Some(ORACLE_FEE),
                 1_000_000,
                 Some(&last_look),
                 find_path_gaining_a_unit_per_discount_percent,
@@ -449,6 +489,7 @@ mod tests {
         let quote = qoq
             .quote(
                 &trade(Some("trader.near")),
+                Some(ORACLE_FEE),
                 1_000_000,
                 Some(&last_look),
                 find_path_gaining_a_unit_per_discount_percent,
