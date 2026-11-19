@@ -32,6 +32,7 @@ use crate::{
     hooks::inteardex::INTEAR_DEX_CONTRACT_ID,
     providers::rhea::RHEA_CONTRACT_ID,
     route::RouteStep,
+    token_infos,
     types::{IntearAssetId, QuoteFees, Slippage, TokenId},
 };
 
@@ -336,7 +337,7 @@ impl NetworkView for Mainnet {
     }
 
     fn token_infos(&self) -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
-        TOKEN_INFOS.read().unwrap().clone()
+        token_infos::latest()
     }
 
     fn current_block_height(&self) -> Result<BlockHeight, String> {
@@ -883,8 +884,6 @@ lazy_static! {
         .collect();
     pub static ref RPC_CLIENT: RpcClient = RpcClient::new(RPC_URLS.iter());
 
-    static ref TOKEN_INFOS: RwLock<Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String>> =
-        RwLock::new(Err("Token infos are not loaded yet".to_string()));
     static ref BLOCK_HEIGHT: RwLock<Result<BlockHeight, String>> =
         RwLock::new(Err("Block height is not loaded yet".to_string()));
     static ref FINAL_BLOCK_HASH: RwLock<Result<CryptoHash, String>> =
@@ -908,15 +907,10 @@ pub fn final_block_hash() -> Result<CryptoHash, String> {
 /// them in the background, so requests never wait for them.
 pub async fn start_background_refresh() {
     tokio::join!(
-        refresh(&TOKEN_INFOS, fetch_token_infos),
+        token_infos::start_following(),
         refresh(&BLOCK_HEIGHT, fetch_current_block_height),
         refresh(&FINAL_BLOCK_HASH, fetch_final_block_hash),
     );
-    tokio::spawn(refresh_loop(
-        &TOKEN_INFOS,
-        fetch_token_infos,
-        TOKEN_INFOS_REFRESH_INTERVAL,
-    ));
     tokio::spawn(refresh_loop(
         &BLOCK_HEIGHT,
         fetch_current_block_height,
@@ -1085,25 +1079,6 @@ where
         }
         _ => Err(serde::de::Error::custom("expected number or string")),
     }
-}
-
-async fn fetch_token_infos() -> Result<Arc<HashMap<BaseTokenId, TokenInfo>>, String> {
-    let endpoint = std::env::var("INTEAR_PRICES_API_ENDPOINT")
-        .unwrap_or_else(|_| "https://prices.intear.tech".to_string());
-    let url = format!("{endpoint}/tokens");
-    let mut tokens = REQWEST_CLIENT
-        .get(url)
-        .send()
-        .await
-        .and_then(|response| response.error_for_status())
-        .map_err(|err| format!("Failed to get all tokens: {err}"))?
-        .json::<HashMap<BaseTokenId, TokenInfo>>()
-        .await
-        .map_err(|err| format!("Failed to parse all tokens: {err}"))?;
-    if let Some(wnear_info) = tokens.get(&BaseTokenId::Nep141(WRAP_NEAR.parse().unwrap())) {
-        tokens.insert(BaseTokenId::Near, wnear_info.clone());
-    }
-    Ok(Arc::new(tokens))
 }
 
 #[cached(time = 3600, result = true)]

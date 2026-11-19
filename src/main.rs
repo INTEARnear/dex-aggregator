@@ -56,6 +56,7 @@ mod route;
 mod shared_utils;
 mod stats;
 mod subscription;
+mod token_infos;
 
 pub trait Provider: Sync {
     fn route(
@@ -591,6 +592,11 @@ async fn main() {
         .init();
 
     info!("Starting swap-router HTTP server...");
+
+    // Dependencies enable both of rustls's crypto providers, so it can't pick one by itself
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("No crypto provider is installed yet");
 
     hooks::load();
     let rate_limiter = RateLimiter::from_env().await;
