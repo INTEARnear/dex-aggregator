@@ -10,8 +10,8 @@ use swap_router_types::{
 
 use crate::{
     calls::{
-        CallBlueprint, IntearDexOperations, IntearDexOracleRequest, IntearDexSwapOperation,
-        IntearDexSwapOption, IntearDexWithdrawAmount, IntearDexWithdrawal,
+        CallBlueprint, IntearDexOperations, IntearDexOracleRequest, IntearDexQuoteImprovementFee,
+        IntearDexSwapOperation, IntearDexSwapOption, IntearDexWithdrawAmount, IntearDexWithdrawal,
     },
     route::{RouteBlueprint, RouteStep},
     shared_utils::{
@@ -302,6 +302,12 @@ pub fn route(
     } else {
         vec![token_out.clone()]
     };
+    // The quote improvement fee is paid out of the output of an exact-in swap, and on top of the
+    // input of an exact-out one
+    let quote_improvement_fee_asset = match request.amount {
+        Amount::AmountIn(_) => &token_out,
+        Amount::AmountOut(_) => &token_in,
+    };
     let registration = match &request.trader_account_id {
         Some(trader_account_id) => vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader_account_id.clone(),
@@ -310,6 +316,14 @@ pub fn route(
                 .0
                 .iter()
                 .map(|(receiver_id, _)| (receiver_id.clone(), token_in.clone()))
+                .chain(
+                    request
+                        .quote_improvement_receiver
+                        .iter()
+                        .map(|receiver_id| {
+                            (receiver_id.clone(), quote_improvement_fee_asset.clone())
+                        }),
+                )
                 .collect(),
         }],
         None => vec![],
@@ -319,6 +333,18 @@ pub fn route(
         Amount::AmountIn(amount_in) => amount_in,
         Amount::AmountOut(_) => constraint + oracle_fee,
     };
+    let quote_expected_amount = match estimated_amount {
+        Amount::AmountOut(amount_out) => amount_out,
+        Amount::AmountIn(amount_in) => amount_in - oracle_fee,
+    };
+    let quote_improvement_fee =
+        request
+            .quote_improvement_receiver
+            .clone()
+            .map(|quote_improvement_receiver| IntearDexQuoteImprovementFee {
+                quote_expected_amount,
+                quote_improvement_receiver,
+            });
     let operations = IntearDexOperations {
         swap: IntearDexSwapOperation {
             asset_in: token_in.clone(),
@@ -327,6 +353,7 @@ pub fn route(
             constraint,
             options: swap.options,
             oracle_request: swap.oracle_request.map(Box::new),
+            quote_improvement_fee,
         },
         withdrawals,
         referrer: request
@@ -409,7 +436,7 @@ pub fn route(
 
 #[cfg(test)]
 mod tests {
-    use near_min_api::types::{Action, NearGas};
+    use near_min_api::types::{AccountId, Action, NearGas};
     use near_sdk::json_types::Base64VecU8;
     use pathfinder::plach::{self, SplitRouteApiResponse};
     use swap_router_types::{fees::AGGREGATOR_FEE_RECEIVER_ID, hook::OracleRequest};
@@ -654,6 +681,7 @@ mod tests {
             signing_public_key: None,
             referrer_id: None,
             fees: Default::default(),
+            quote_improvement_receiver: None,
         }
     }
 
@@ -676,6 +704,7 @@ mod tests {
                     gas: PLACH_SWAP_GAS,
                 }],
                 oracle_request: None,
+                quote_improvement_fee: None,
             },
             withdrawals,
             referrer: account(DEFAULT_REFERRER_ID),
@@ -801,6 +830,7 @@ mod tests {
                     // The least of the worst cases, so the fallback fills it when the best fails,
                     // but no less than 1% slippage from the best quote
                     "constraint": "81",
+                    "quote_improvement_fee": null,
                     "options": [
                         { "dex_id": "slimedragon.near/otc", "message": "c2xpbWVkcmFnb24ubmVhci9vdGM=" },
                         { "dex_id": "slimedragon.near/xyk", "message": "c2xpbWVkcmFnb24ubmVhci94eWs=" },
@@ -1020,6 +1050,7 @@ mod tests {
                                 "asset_out": "nep141:ft",
                                 "amount": { "Amount": { "ExactIn": "100" } },
                                 "constraint": "79",
+                                "quote_improvement_fee": null,
                             },
                         },
                         {
@@ -1480,5 +1511,64 @@ mod tests {
         assert_eq!(route.estimated_amount, Amount::AmountIn(100 + 5 + 2));
         // And of the most the DEX can take: 4.25 -> 5 and 1.06 -> 2
         assert_eq!(route.worst_case_amount, Amount::AmountIn(101 + 5 + 2));
+    }
+
+    #[test]
+    fn quote_improvement_receiver_takes_what_beats_the_estimate() {
+        let exact_in = test_route(SwapRequest {
+            quote_improvement_receiver: Some(account("improvement.near")),
+            ..request(TokenId::Near, ft_output(), Amount::AmountIn(1_000_000))
+        })
+        .unwrap();
+        let Amount::AmountOut(estimated_amount_out) = exact_in.estimated_amount else {
+            panic!("An exact-in route estimates its output");
+        };
+        let (args, _) = last_call(&exact_in);
+        assert_eq!(
+            args["operations"]["operations"][0]["SwapSimple"]["quote_improvement_fee"],
+            serde_json::json!({
+                "quote_expected_amount": estimated_amount_out.to_string(),
+                "quote_improvement_receiver": "improvement.near",
+            })
+        );
+        // The trader registers the receiver for the output, which it's paid in
+        assert_eq!(
+            exact_in.steps[0],
+            RouteStep::RegisterOnIntearDexIfNeeded {
+                trader_account_id: trader(),
+                asset_ids: vec![ft()],
+                fee_receivers: vec![(account("improvement.near"), ft())],
+            }
+        );
+
+        // Of an exact output, the estimated input with the referral fees
+        let exact_out = test_route(SwapRequest {
+            fees: r#"{"ref.near":0.05}"#.parse().unwrap(),
+            quote_improvement_receiver: Some(account("improvement.near")),
+            ..request(TokenId::Near, ft_output(), Amount::AmountOut(80))
+        })
+        .unwrap();
+        assert_eq!(exact_out.estimated_amount, Amount::AmountIn(100 + 5 + 2));
+        // And for the input, along with the referrers
+        assert_eq!(
+            exact_out.steps[0],
+            RouteStep::RegisterOnIntearDexIfNeeded {
+                trader_account_id: trader(),
+                asset_ids: vec![IntearAssetId::Near, ft()],
+                fee_receivers: vec![
+                    (account("ref.near"), IntearAssetId::Near),
+                    (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), IntearAssetId::Near),
+                    (account("improvement.near"), IntearAssetId::Near),
+                ],
+            }
+        );
+        let (args, _) = last_call(&exact_out);
+        assert_eq!(
+            args["operations"]["operations"][0]["SwapSimple"]["quote_improvement_fee"],
+            serde_json::json!({
+                "quote_expected_amount": "107",
+                "quote_improvement_receiver": "improvement.near",
+            })
+        );
     }
 }

@@ -1,7 +1,7 @@
 use intear_dex_common::{AssetId, DexId, SwapRequestAmount, TokenAmount};
 use intear_dex_types::{
-    DirectWithdrawAmount, Operation, SwapAdvancedMode, SwapOperationAmount, SwapOption,
-    WithdrawAmount,
+    DirectWithdrawAmount, Operation, QuoteImprovementFee, SwapAdvancedMode, SwapOperationAmount,
+    SwapOption, WithdrawAmount,
 };
 use near_min_api::types::{
     near_account_id::AccountType, AccountId, Action, Balance, FunctionCallAction, NearGas,
@@ -193,6 +193,13 @@ pub struct IntearDexSwapOperation {
     /// oracle's fee in the asset in, which `amount` and `constraint` are after. Boxed, as it's
     /// most of the size of a call that has one.
     pub oracle_request: Option<Box<IntearDexOracleRequest>>,
+    pub quote_improvement_fee: Option<IntearDexQuoteImprovementFee>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntearDexQuoteImprovementFee {
+    pub quote_expected_amount: Balance,
+    pub quote_improvement_receiver: AccountId,
 }
 
 /// An oracle request that `dex_id` reads the response to
@@ -773,7 +780,9 @@ impl IntearDexOperations {
             Some(_) => ORACLE_REQUEST_GAS,
             None => Gas::from_ggas(0, 0),
         };
-        Gas::from_ggas(600, 600) * self.referral_fees.0.len() as u64
+        let fee_receiver_count =
+            self.referral_fees.0.len() + usize::from(self.swap.quote_improvement_fee.is_some());
+        Gas::from_ggas(600, 600) * fee_receiver_count as u64
             + oracle_request_gas
             + swap_gas
             + withdrawals_gas
@@ -797,6 +806,13 @@ impl IntearDexOperations {
             Amount::AmountOut(amount) => SwapRequestAmount::ExactOut(TokenAmount::new(amount)),
         });
         let constraint = Some(TokenAmount::new(swap.constraint));
+        let quote_improvement_fee =
+            swap.quote_improvement_fee
+                .as_ref()
+                .map(|fee| QuoteImprovementFee {
+                    quote_expected_amount: TokenAmount::new(fee.quote_expected_amount),
+                    quote_improvement_receiver: fee.quote_improvement_receiver.clone(),
+                });
         let swap_operation = match swap.options.as_slice() {
             [option] => Operation::SwapSimple {
                 dex_id: option.dex_id.clone(),
@@ -805,12 +821,14 @@ impl IntearDexOperations {
                 asset_out,
                 amount,
                 constraint,
+                quote_improvement_fee,
             },
             options => Operation::SwapAdvanced {
                 asset_in,
                 asset_out,
                 amount,
                 constraint,
+                quote_improvement_fee,
                 options: options
                     .iter()
                     .map(|option| SwapOption {
@@ -978,6 +996,7 @@ mod tests {
                     gas: Gas::from_ggas(34_000, 34_000),
                 }],
                 oracle_request: None,
+                quote_improvement_fee: None,
             },
             withdrawals,
             referrer: account("ref.near"),

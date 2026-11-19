@@ -321,6 +321,7 @@ mod tests {
             signing_public_key: None,
             referrer_id: None,
             fees: Default::default(),
+            quote_improvement_receiver: None,
         }
     }
 

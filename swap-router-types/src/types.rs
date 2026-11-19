@@ -217,6 +217,11 @@ pub struct SwapRequest {
     /// them, so the first swap on a new token for a referrer can be slower.
     #[serde(default)]
     pub fees: QuoteFees,
+    /// Takes what swaps on Intear DEX improve on the quote's estimated amount: the output above it
+    /// of exact-in swaps, in the output token, or the input below it of exact-out swaps, in the
+    /// input token. Routes register it for that token on Intear DEX like the referrers, without
+    /// `trader_account_id` the trader keeps it if it hasn't. Other routes don't pay it.
+    pub quote_improvement_receiver: Option<AccountId>,
 }
 
 const MAX_REFERRAL_FEE_FRACTION: FeeFraction = FeeFraction::new(FULL_FEE_FRACTION.get() / 20); // 5%
