@@ -546,7 +546,7 @@ mod tests {
     use near_min_api::types::{AccountId, Action, NearGas};
     use near_sdk::json_types::Base64VecU8;
     use swap_router_types::{fees::AGGREGATOR_FEE_RECEIVER_ID, hook::OracleRequest};
-    use xyk_dex_types::{PoolId, SwapArgs, SwapRoute, FULL_ROUTE_FRACTION};
+    use xyk_dex_types::{PoolId, SwapArgs, SwapFeeDiscount, SwapRoute, FULL_ROUTE_FRACTION};
 
     use super::*;
     use crate::calls::RheaOutput;
@@ -567,7 +567,7 @@ mod tests {
                     fraction: FULL_ROUTE_FRACTION,
                     pool_ids: vec![PoolId::new(1)],
                 }],
-                fee_discount: None,
+                fee_discount: SwapFeeDiscount::None,
             })
             .unwrap(),
         )

@@ -28,6 +28,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use swap_router_types::{
+    fee_discount::FeeDiscounter,
     hook::{IntearDexRouteCosts, IntearDexTrade, RequestDetails},
     last_look::LastLook,
     types,
@@ -63,8 +64,9 @@ mod route;
 mod shared_utils;
 mod stats;
 mod subscription;
-mod tear_holdings;
+mod tear_stakes;
 mod token_infos;
+mod trader_fee_discount;
 
 pub trait Provider: Sync {
     fn route(
@@ -473,7 +475,7 @@ async fn pool_routes(
     let tear_fee_discount = trade
         .trader_account_id
         .as_ref()
-        .and_then(tear_holdings::fee_discount_of);
+        .and_then(tear_stakes::fee_discount_of);
     pool_routes::find_in_background(
         pools,
         snapshot,
@@ -696,7 +698,10 @@ async fn main() {
         .expect("No crypto provider is installed yet");
 
     hooks::load();
-    tear_holdings::start_fetching();
+    tear_stakes::start_fetching();
+    let fee_discounter = Arc::new(
+        FeeDiscounter::from_env().unwrap_or_else(|err| panic!("No fee discount signer: {err}")),
+    );
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;
 
@@ -712,7 +717,12 @@ async fn main() {
         .route("/route", get(route_handler))
         .route("/route/subscribe", get(subscription::subscribe_handler))
         .route("/route/outcome", get(outcome_handler))
+        .route(
+            "/fee-discount",
+            get(trader_fee_discount::fee_discount_handler),
+        )
         .with_state(stats)
+        .layer(Extension(fee_discounter))
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),
             rate_limit::limit_unauthorized,

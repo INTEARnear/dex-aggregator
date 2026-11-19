@@ -123,7 +123,7 @@ impl PoolsSnapshot for QoqPools {
         let fee_discount = self
             .fee_discounter
             .sign_swap(&dex_id, routes.clone(), &request)?;
-        let gas = qoq::swap_gas(&routes, fee_discount.is_some());
+        let gas = qoq::swap_gas(&routes, request.fee_discount.is_some());
         Ok(HookSwap {
             dex_id,
             message: Base64VecU8(

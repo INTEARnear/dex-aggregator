@@ -1,4 +1,3 @@
-#[cfg(feature = "hook")]
 pub mod fee_discount;
 pub mod fees;
 pub mod hook;
