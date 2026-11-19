@@ -1,20 +1,21 @@
 use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
-use intear_dex_common::AssetId;
-use near_min_api::types::{AccountId, BlockHeight, NearToken};
+#[cfg(feature = "hook")]
+use intear_dex_common::FeeDiscountFraction;
+use intear_dex_common::{AssetId, DexId};
+use near_min_api::types::{AccountId, BlockHeight, NearGas, NearToken};
 use near_sdk::{
     json_types::{Base64VecU8, U128},
     PublicKeyHandle,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::fees::amount_in_after_referral_fees;
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
 use crate::types::{Amount, CostPrices, Gas, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 8;
+pub const HOOK_ABI_VERSION: u32 = 9;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -43,7 +44,8 @@ pub struct IntearDexTrade {
     pub trader_account_id: Option<AccountId>,
 }
 
-/// What a hook is called with. The aggregator lends its data, and a hook gets it owned.
+/// What a hook's [`Hook::run`] is called with. The aggregator lends its data, and a hook gets it
+/// owned.
 #[derive(Serialize, Deserialize)]
 pub struct HookInput<'a> {
     pub request: Cow<'a, RequestDetails>,
@@ -55,33 +57,8 @@ pub struct HookInput<'a> {
     pub route_costs: Cow<'a, IntearDexRouteCosts>,
 }
 
-impl HookInput<'_> {
-    /// The trade of a swap whose operations start with a request to an oracle that takes
-    /// `oracle_fee` of the asset in: the engine takes it out of the input of an exact-in swap
-    /// before the app fees, and on top of the input of an exact-out one. None if the fee leaves
-    /// nothing of the input.
-    pub fn trade_after_oracle_fee(&self, oracle_fee: u128) -> Option<IntearDexTrade> {
-        let amount = match self.swap_request.amount {
-            Amount::AmountIn(amount_in) => {
-                let amount_in_after_oracle_fee = amount_in
-                    .checked_sub(oracle_fee)
-                    .filter(|amount_in| *amount_in > 0)?;
-                Amount::AmountIn(amount_in_after_referral_fees(
-                    &self.swap_request.fees,
-                    amount_in_after_oracle_fee,
-                ))
-            }
-            Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
-        };
-        Some(IntearDexTrade {
-            amount,
-            ..self.trade.clone().into_owned()
-        })
-    }
-}
-
-/// What the route of a hook's quote costs besides the gas its swap burns, which the aggregator
-/// ranks it with against the other quotes, as [`crate::types::net_amount`] does
+/// What the route of a swap on Intear DEX costs besides the gas its swap burns, which the
+/// aggregator ranks it with against the other quotes, as [`crate::types::net_amount`] does
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntearDexRouteCosts {
     /// The gas fee and storage deposits of the route
@@ -94,11 +71,11 @@ pub struct IntearDexRouteCosts {
     pub prices: Option<CostPrices>,
 }
 
-/// A swap on Intear DEX that a hook quotes for the [`IntearDexTrade`]. The aggregator builds its
-/// route.
+/// A swap on Intear DEX that a hook quotes for the whole [`IntearDexTrade`], like a market maker
+/// does. The aggregator builds its route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookQuote {
-    pub dex_id: intear_dex_common::DexId,
+    pub dex_id: DexId,
     /// The swap's message to the DEX
     pub message: Base64VecU8,
     /// What the DEX gives for an exact-in trade, or takes for an exact-out one, without the app
@@ -122,17 +99,129 @@ pub struct OracleRequest {
     pub oracle_key: PublicKeyHandle,
     pub request: Base64VecU8,
     /// What the oracle takes for the request in the trade's asset in, which the engine takes from
-    /// the input before the swap. The quote is of a trade after it, as
-    /// [`HookInput::trade_after_oracle_fee`] makes it.
+    /// the input before the swap. The quote is of a trade after it.
     pub fee: U128,
+}
+
+/// Bytes of the state of a pool that its swaps change. The aggregator keeps a copy of it for each
+/// simulation of a swap, so it's small and copied without allocating.
+pub const POOL_STATE_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct PoolState(pub [u8; POOL_STATE_BYTES]);
+
+impl PoolState {
+    /// Of a pool whose swaps only change its balances
+    pub fn of_balances<const N: usize>(balances: [u128; N]) -> Self {
+        const { assert!(N * 16 <= POOL_STATE_BYTES) };
+        let mut state = [0; POOL_STATE_BYTES];
+        for (bytes, balance) in state.chunks_exact_mut(16).zip(balances) {
+            bytes.copy_from_slice(&balance.to_le_bytes());
+        }
+        Self(state)
+    }
+
+    /// The balances that [`PoolState::of_balances`] made it of
+    pub fn balances<const N: usize>(&self) -> [u128; N] {
+        const { assert!(N * 16 <= POOL_STATE_BYTES) };
+        std::array::from_fn(|index| {
+            u128::from_le_bytes(self.0[index * 16..][..16].try_into().unwrap())
+        })
+    }
+}
+
+impl Serialize for PoolState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Base64VecU8(self.0.to_vec()).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Base64VecU8::deserialize(deserializer)?.0;
+        let length = bytes.len();
+        bytes.try_into().map(Self).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "A pool state is {POOL_STATE_BYTES} bytes, not {length}"
+            ))
+        })
+    }
+}
+
+/// The pools of a [`PoolsSnapshot`], which the aggregator routes through and refers to by their
+/// index in `pools`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookPools {
+    pub pools: Vec<HookPool>,
+    /// Of the oracles that pools read
+    pub oracle_fees: Vec<OracleFees>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookPool {
+    /// A swap refers to them by position
+    pub tokens: [AssetId; 2],
+    pub state: PoolState,
+    /// What a swap burns for a hop through the pool, which routes weigh against what it gains
+    pub hop_gas: NearGas,
+    /// The oracle whose prices swaps through the pool read, which the operations ask first
+    pub oracle_key: Option<PublicKeyHandle>,
+}
+
+/// What the oracle that has `oracle_key` takes for a request, in each asset it takes fees in
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OracleFees {
+    pub oracle_key: PublicKeyHandle,
+    pub fees: HashMap<AssetId, U128>,
+}
+
+/// A swap through pools of a [`PoolsSnapshot`] on its DEX, which the hook makes the message of
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookSwapRequest {
+    pub asset_in: AssetId,
+    pub asset_out: AssetId,
+    pub routes: Vec<HookSwapRoute>,
+    /// `None` for a swap that swaps what the swap before it gave, which isn't known in advance,
+    /// so it doesn't have a fee discount
+    pub amount: Option<Amount>,
+    /// Millionths of the pool and protocol fees that the swap doesn't pay
+    pub fee_discount: Option<u32>,
+    pub trader_account_id: Option<AccountId>,
+    /// The fee discount is valid for some blocks after it
+    pub block_height: BlockHeight,
+}
+
+/// A part of a swap through pools one after another, by their index in [`HookPools::pools`]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookSwapRoute {
+    /// Of `intear_dex_common::FULL_ROUTE_FRACTION` that the route swaps. The fractions of a swap's
+    /// routes add up to it, and the DEX gives the first route what rounding leaves.
+    pub fraction: u32,
+    pub pools: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookSwap {
+    pub dex_id: DexId,
+    /// The swap's message to the DEX
+    pub message: Base64VecU8,
+    pub gas: Gas,
+    /// The request to the oracle of the swap's pools, whose response the swap reads
+    pub oracle_request: Option<Base64VecU8>,
 }
 
 /// Prices of the smallest units of tokens in the smallest unit of USDt
 pub type Prices = HashMap<AssetId, BigDecimal>;
 
-/// A hook, for [`export_hook!`](crate::export_hook) to make the ABI of
+/// A hook, for [`export_hook!`](crate::export_hook) to make the ABI of. It quotes trades with
+/// [`Hook::run`], or gives pools with [`Hook::pools`] that the aggregator routes through together
+/// with the pools of the other hooks.
 #[cfg(feature = "hook")]
 pub trait Hook: Sized + Send + Sync + 'static {
+    /// [`NoPools`] for a hook that only quotes
+    type Pools: PoolsSnapshot;
+
     /// Called once when the aggregator loads the hook, to check its configuration and start keeping
     /// what it needs up to date. An error stops the aggregator from starting.
     fn init() -> Result<Self, String>;
@@ -153,7 +242,65 @@ pub trait Hook: Sized + Send + Sync + 'static {
 
     /// The quotes to add on top of `input.quotes`. Ignored if it doesn't answer within
     /// [`HOOK_ANSWER_TIMEOUT`].
-    fn run(&self, input: HookInput<'static>) -> Result<Vec<HookQuote>, String>;
+    fn run(&self, _input: HookInput<'static>) -> Result<Vec<HookQuote>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The pools to route through now, the same snapshot while they don't change. None while
+    /// there are none, like when they're outdated.
+    fn pools(&self) -> Option<std::sync::Arc<Self::Pools>> {
+        None
+    }
+}
+
+/// The pools of a hook at one moment, which the aggregator simulates swaps in while it searches
+/// for routes, and then asks the messages of the swaps of the route it found
+#[cfg(feature = "hook")]
+pub trait PoolsSnapshot: Send + Sync + 'static {
+    fn pools(&self) -> HookPools;
+
+    /// Swaps between the tokens at the positions `token_in` and `token_out` of the pool at `pool`
+    /// in [`HookPools::pools`], whose state is `state`, and changes `state` like the swap would.
+    /// Gives the output for `AmountIn`, and the input for `AmountOut`, or None if the DEX fails the
+    /// swap. A route search calls it tens of thousands of times, so it doesn't allocate.
+    fn swap(
+        &self,
+        pool: u32,
+        state: &mut PoolState,
+        token_in: usize,
+        token_out: usize,
+        amount: Amount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<u128>;
+
+    fn build_swap(&self, request: HookSwapRequest) -> Result<HookSwap, String>;
+}
+
+/// The pools of a hook that has none
+#[cfg(feature = "hook")]
+pub enum NoPools {}
+
+#[cfg(feature = "hook")]
+impl PoolsSnapshot for NoPools {
+    fn pools(&self) -> HookPools {
+        match *self {}
+    }
+
+    fn swap(
+        &self,
+        _pool: u32,
+        _state: &mut PoolState,
+        _token_in: usize,
+        _token_out: usize,
+        _amount: Amount,
+        _fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<u128> {
+        match *self {}
+    }
+
+    fn build_swap(&self, _request: HookSwapRequest) -> Result<HookSwap, String> {
+        match *self {}
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,6 +386,76 @@ macro_rules! export_hook {
                 unsafe { $crate::hook::__private::run(&HOOK, input) }
             }
 
+            /// The current snapshot of the hook's pools, null without one. The aggregator releases
+            /// it with `hook_release_pools_snapshot`, and it's the same pointer while the pools
+            /// don't change.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn hook_pools_snapshot() -> *const ::std::ffi::c_void {
+                $crate::hook::__private::pools_snapshot(&HOOK)
+            }
+
+            /// # Safety
+            /// `snapshot` was returned by `hook_pools_snapshot`, and isn't used after this
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn hook_release_pools_snapshot(
+                snapshot: *const ::std::ffi::c_void,
+            ) {
+                unsafe { $crate::hook::__private::release_pools_snapshot::<$hook>(snapshot) }
+            }
+
+            /// # Safety
+            /// `snapshot` was returned by `hook_pools_snapshot` and isn't released yet
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn hook_snapshot_pools(
+                snapshot: *const ::std::ffi::c_void,
+            ) -> *mut ::std::ffi::c_char {
+                unsafe { $crate::hook::__private::snapshot_pools::<$hook>(snapshot) }
+            }
+
+            /// Writes the output of an exact-in swap, or the input of an exact-out one, to
+            /// `result`, and returns whether the swap succeeded. A `fee_discount` of 0 is none.
+            ///
+            /// # Safety
+            /// `snapshot` was returned by `hook_pools_snapshot` and isn't released yet, and
+            /// `state` and `result` are valid for the call
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn hook_swap(
+                snapshot: *const ::std::ffi::c_void,
+                pool: u32,
+                state: *mut $crate::hook::PoolState,
+                token_in: u8,
+                token_out: u8,
+                amount: u128,
+                exact_in: bool,
+                fee_discount: u32,
+                result: *mut u128,
+            ) -> bool {
+                unsafe {
+                    $crate::hook::__private::swap::<$hook>(
+                        snapshot,
+                        pool,
+                        state,
+                        token_in,
+                        token_out,
+                        amount,
+                        exact_in,
+                        fee_discount,
+                        result,
+                    )
+                }
+            }
+
+            /// # Safety
+            /// `snapshot` was returned by `hook_pools_snapshot` and isn't released yet, and
+            /// `request` is a NUL-terminated CStr that outlives the call
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn hook_build_swap(
+                snapshot: *const ::std::ffi::c_void,
+                request: *const ::std::ffi::c_char,
+            ) -> *mut ::std::ffi::c_char {
+                unsafe { $crate::hook::__private::build_swap::<$hook>(snapshot, request) }
+            }
+
             /// # Safety
             /// `output` was returned by another function of the hook, and isn't used after this
             #[unsafe(no_mangle)]
@@ -253,14 +470,16 @@ macro_rules! export_hook {
 #[doc(hidden)]
 pub mod __private {
     use std::{
-        ffi::{c_char, CStr, CString},
+        ffi::{c_char, c_void, CStr, CString},
         panic::AssertUnwindSafe,
-        sync::OnceLock,
+        sync::{Arc, OnceLock},
     };
 
+    use intear_dex_common::FeeDiscountFraction;
     use serde::Serialize;
 
-    use super::{Hook, Prices, PricesJson};
+    use super::{Hook, PoolState, PoolsSnapshot, Prices, PricesJson};
+    use crate::types::Amount;
 
     pub fn init<H: Hook>(hook: &OnceLock<H>) -> *mut c_char {
         output(catch_panic(|| {
@@ -316,6 +535,91 @@ pub mod __private {
             let input = serde_json::from_str(input)
                 .map_err(|err| format!("Input isn't a hook input: {err}"))?;
             hook.run(input)
+        }))
+    }
+
+    pub fn pools_snapshot<H: Hook>(hook: &OnceLock<H>) -> *const c_void {
+        let snapshot = catch_panic(|| Ok(initialized(hook)?.pools()));
+        match snapshot {
+            Ok(Some(snapshot)) => Arc::into_raw(snapshot).cast(),
+            Ok(None) => std::ptr::null(),
+            Err(err) => {
+                eprintln!("Failed to get the pools snapshot: {err}");
+                std::ptr::null()
+            }
+        }
+    }
+
+    /// # Safety
+    /// `snapshot` was returned by [`pools_snapshot`] of `H`, and isn't used after this
+    pub unsafe fn release_pools_snapshot<H: Hook>(snapshot: *const c_void) {
+        drop(unsafe { Arc::from_raw(snapshot.cast::<H::Pools>()) });
+    }
+
+    /// # Safety
+    /// `snapshot` was returned by [`pools_snapshot`] of `H` and isn't released yet
+    pub unsafe fn snapshot_pools<H: Hook>(snapshot: *const c_void) -> *mut c_char {
+        let snapshot = unsafe { &*snapshot.cast::<H::Pools>() };
+        output(catch_panic(|| Ok(snapshot.pools())))
+    }
+
+    /// # Safety
+    /// `snapshot` was returned by [`pools_snapshot`] of `H` and isn't released yet, and `state`
+    /// and `result` are valid for the call
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn swap<H: Hook>(
+        snapshot: *const c_void,
+        pool: u32,
+        state: *mut PoolState,
+        token_in: u8,
+        token_out: u8,
+        amount: u128,
+        exact_in: bool,
+        fee_discount: u32,
+        result: *mut u128,
+    ) -> bool {
+        let snapshot = unsafe { &*snapshot.cast::<H::Pools>() };
+        let state = unsafe { &mut *state };
+        let amount = match exact_in {
+            true => Amount::AmountIn(amount),
+            false => Amount::AmountOut(amount),
+        };
+        let fee_discount = (fee_discount != 0).then(|| FeeDiscountFraction::new(fee_discount));
+        let swapped = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            snapshot.swap(
+                pool,
+                state,
+                usize::from(token_in),
+                usize::from(token_out),
+                amount,
+                fee_discount,
+            )
+        }));
+        match swapped {
+            Ok(Some(swapped)) => {
+                unsafe { *result = swapped };
+                true
+            }
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    /// # Safety
+    /// `snapshot` was returned by [`pools_snapshot`] of `H` and isn't released yet, and `request`
+    /// is a NUL-terminated CStr that outlives the call
+    pub unsafe fn build_swap<H: Hook>(
+        snapshot: *const c_void,
+        request: *const c_char,
+    ) -> *mut c_char {
+        let snapshot = unsafe { &*snapshot.cast::<H::Pools>() };
+        let request = unsafe { CStr::from_ptr(request) };
+        output(catch_panic(|| {
+            let request = request
+                .to_str()
+                .map_err(|err| format!("Swap request isn't UTF-8: {err}"))?;
+            let request = serde_json::from_str(request)
+                .map_err(|err| format!("Swap request isn't a hook swap request: {err}"))?;
+            snapshot.build_swap(request)
         }))
     }
 
@@ -419,22 +723,12 @@ mod tests {
     }
 
     #[test]
-    fn oracle_fee_comes_out_of_an_exact_input_before_the_app_fees() {
-        let mut input: HookInput<'static> = serde_json::from_str(&input_json()).unwrap();
-        input.swap_request.to_mut().amount = Amount::AmountIn(1_000_000);
-        // 0.5% of the 800,000 that the oracle's fee leaves goes to the app and the aggregator
-        assert_eq!(
-            input.trade_after_oracle_fee(200_000).unwrap().amount,
-            Amount::AmountIn(796_000)
-        );
-        assert!(input.trade_after_oracle_fee(1_000_000).is_none());
-
-        input.swap_request.to_mut().amount = Amount::AmountOut(1_000_000);
-        input.trade.to_mut().amount = Amount::AmountOut(1_000_000);
-        assert_eq!(
-            input.trade_after_oracle_fee(200_000).unwrap().amount,
-            Amount::AmountOut(1_000_000)
-        );
+    fn pool_state_keeps_balances() {
+        let state = PoolState::of_balances([1, u128::MAX]);
+        assert_eq!(state.balances(), [1, u128::MAX]);
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<PoolState>(&json).unwrap(), state);
+        assert!(serde_json::from_str::<PoolState>(r#""AAAA""#).is_err());
     }
 
     #[test]
@@ -451,7 +745,8 @@ mod tests {
 
 #[cfg(all(test, feature = "hook"))]
 mod export_tests {
-    use std::ffi::{CStr, CString};
+    use std::ffi::{c_void, CStr, CString};
+    use std::sync::Arc;
 
     use super::*;
     use crate::indexed::BlockInfo;
@@ -459,13 +754,69 @@ mod export_tests {
     struct TestHook {
         last_price: std::sync::Mutex<Option<BigDecimal>>,
         indexed_keys: std::sync::Mutex<usize>,
+        pools: Arc<TestPools>,
+    }
+
+    /// One pool of NEAR and USDC that gives twice the input, less with a fee discount
+    struct TestPools;
+
+    impl PoolsSnapshot for TestPools {
+        fn pools(&self) -> HookPools {
+            HookPools {
+                pools: vec![HookPool {
+                    tokens: [AssetId::Near, AssetId::Nep141("usdc.near".parse().unwrap())],
+                    state: PoolState::of_balances([1_000, 2_000]),
+                    hop_gas: NearGas::from_tgas(2),
+                    oracle_key: None,
+                }],
+                oracle_fees: vec![],
+            }
+        }
+
+        fn swap(
+            &self,
+            _pool: u32,
+            state: &mut PoolState,
+            token_in: usize,
+            token_out: usize,
+            amount: Amount,
+            fee_discount: Option<FeeDiscountFraction>,
+        ) -> Option<u128> {
+            let Amount::AmountIn(amount_in) = amount else {
+                return None;
+            };
+            let amount_out = 2 * amount_in + u128::from(fee_discount.map_or(0, |d| d.get()));
+            let mut balances = state.balances::<2>();
+            balances[token_in] += amount_in;
+            balances[token_out] = balances[token_out].checked_sub(amount_out)?;
+            *state = PoolState::of_balances(balances);
+            Some(amount_out)
+        }
+
+        fn build_swap(&self, request: HookSwapRequest) -> Result<HookSwap, String> {
+            Ok(HookSwap {
+                dex_id: "owner.near/dex".parse().unwrap(),
+                message: Base64VecU8(
+                    request.routes[0]
+                        .pools
+                        .iter()
+                        .map(|&pool| pool as u8)
+                        .collect(),
+                ),
+                gas: Gas::from_ggas(5_000, 5_000),
+                oracle_request: None,
+            })
+        }
     }
 
     impl Hook for TestHook {
+        type Pools = TestPools;
+
         fn init() -> Result<Self, String> {
             Ok(TestHook {
                 last_price: Default::default(),
                 indexed_keys: Default::default(),
+                pools: Arc::new(TestPools),
             })
         }
 
@@ -502,6 +853,10 @@ mod export_tests {
                 oracle_request: None,
             }])
         }
+
+        fn pools(&self) -> Option<Arc<TestPools>> {
+            Some(Arc::clone(&self.pools))
+        }
     }
 
     crate::export_hook!(TestHook);
@@ -514,6 +869,25 @@ mod export_tests {
         fn hook_on_indexed_state(states: *const u8, len: usize) -> *mut std::ffi::c_char;
         fn hook_on_prices(prices: *const std::ffi::c_char) -> *mut std::ffi::c_char;
         fn hook_run(input: *const std::ffi::c_char) -> *mut std::ffi::c_char;
+        fn hook_pools_snapshot() -> *const c_void;
+        fn hook_release_pools_snapshot(snapshot: *const c_void);
+        fn hook_snapshot_pools(snapshot: *const c_void) -> *mut std::ffi::c_char;
+        #[allow(improper_ctypes)]
+        fn hook_swap(
+            snapshot: *const c_void,
+            pool: u32,
+            state: *mut PoolState,
+            token_in: u8,
+            token_out: u8,
+            amount: u128,
+            exact_in: bool,
+            fee_discount: u32,
+            result: *mut u128,
+        ) -> bool;
+        fn hook_build_swap(
+            snapshot: *const c_void,
+            request: *const std::ffi::c_char,
+        ) -> *mut std::ffi::c_char;
         fn hook_free(output: *mut std::ffi::c_char);
     }
 
@@ -531,6 +905,7 @@ mod export_tests {
             answer(unsafe { hook_run(input.as_ptr()) }),
             serde_json::json!({ "Err": "The hook isn't initialized" })
         );
+        assert!(unsafe { hook_pools_snapshot() }.is_null());
         assert_eq!(
             answer(unsafe { hook_init() }),
             serde_json::json!({ "Ok": null })
@@ -583,5 +958,64 @@ mod export_tests {
             answer(unsafe { hook_run(without_quotes.as_ptr()) }),
             serde_json::json!({ "Err": "No quotes to beat" })
         );
+
+        simulates_swaps_in_the_pools_of_a_snapshot();
+    }
+
+    /// Of the initialized hook
+    fn simulates_swaps_in_the_pools_of_a_snapshot() {
+        let snapshot = unsafe { hook_pools_snapshot() };
+        assert!(!snapshot.is_null());
+        let same_snapshot = unsafe { hook_pools_snapshot() };
+        assert_eq!(snapshot, same_snapshot);
+        unsafe { hook_release_pools_snapshot(same_snapshot) };
+
+        let pools = answer(unsafe { hook_snapshot_pools(snapshot) });
+        let pools: HookPools = serde_json::from_value(pools["Ok"].clone()).unwrap();
+        let mut state = pools.pools[0].state;
+        let mut result = 0;
+        let swap = |state: &mut PoolState, amount, exact_in, fee_discount, result: &mut u128| unsafe {
+            hook_swap(
+                snapshot,
+                0,
+                state,
+                0,
+                1,
+                amount,
+                exact_in,
+                fee_discount,
+                result,
+            )
+        };
+        assert!(swap(&mut state, 100, true, 0, &mut result));
+        assert_eq!(result, 200);
+        assert_eq!(state.balances(), [1_100, 1_800]);
+        assert!(swap(&mut state, 100, true, 7, &mut result));
+        assert_eq!(result, 207);
+        // Fails without changing the state
+        assert!(!swap(&mut state, 100, false, 0, &mut result));
+        assert!(!swap(&mut state, 1_000, true, 0, &mut result));
+        assert_eq!(state.balances(), [1_200, 1_593]);
+
+        let request = CString::new(
+            serde_json::to_string(&HookSwapRequest {
+                asset_in: AssetId::Near,
+                asset_out: AssetId::Nep141("usdc.near".parse().unwrap()),
+                routes: vec![HookSwapRoute {
+                    fraction: 1_000_000,
+                    pools: vec![0],
+                }],
+                amount: Some(Amount::AmountIn(100)),
+                fee_discount: None,
+                trader_account_id: None,
+                block_height: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let swap = answer(unsafe { hook_build_swap(snapshot, request.as_ptr()) });
+        let swap: HookSwap = serde_json::from_value(swap["Ok"].clone()).unwrap();
+        assert_eq!(swap.message.0, vec![0]);
+        unsafe { hook_release_pools_snapshot(snapshot) };
     }
 }

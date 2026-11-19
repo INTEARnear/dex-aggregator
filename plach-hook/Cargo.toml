@@ -18,9 +18,3 @@ xyk-dex-types = { git = "https://github.com/INTEARnear/dex" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
 borsh = "1.6.0"
-bigdecimal = "0.4.8"
-anyhow = "1"
-
-[dev-dependencies]
-sha2 = "0.10.9"
-tokio = { version = "1.45.1", features = ["sync"] }

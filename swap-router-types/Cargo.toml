@@ -17,8 +17,7 @@ intear-dex-common = { git = "https://github.com/INTEARnear/dex" }
 otc-dex-types = { git = "https://github.com/INTEARnear/dex" }
 # Native builds of the dex's types crates need this feature
 near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
-tokio = { version = "1.45.1", features = ["rt", "sync", "macros"], optional = true }
 
 [features]
 # For usage in hooks
-hook = ["dep:tokio"]
+hook = []

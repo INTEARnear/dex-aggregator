@@ -3,14 +3,14 @@ use near_min_api::types::NearToken;
 
 use crate::{
     fees::amount_in_with_referral_fees,
-    hook::{HookInput, IntearDexRouteCosts},
-    types::{net_amount, Amount, DexId, Gas, QuoteFees},
+    hook::IntearDexRouteCosts,
+    types::{net_amount, Amount, DexId, Gas, Quote, QuoteFees},
 };
 
 const MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT: u32 = 99;
 
-/// The best quote of the DEXes outside of Intear DEX, which a hook that gives less matches with a
-/// fee discount, net of costs as the aggregator ranks them. Hooks don't compete with each other.
+/// The best quote of the DEXes outside of Intear DEX, which a route on Intear DEX that gives less
+/// matches with a fee discount, net of costs as the aggregator ranks them
 pub struct LastLook {
     pub best_other_amount: Amount,
     /// The gas fee and storage deposits of the best other quote
@@ -19,7 +19,7 @@ pub struct LastLook {
     pub route_costs: IntearDexRouteCosts,
 }
 
-/// What a hook's swap gives for the trade, as in a `HookQuote`
+/// What a swap on Intear DEX gives for the trade, as in a `HookQuote`
 pub struct SwapEstimate {
     pub estimated_amount: u128,
     pub gas: Gas,
@@ -30,10 +30,13 @@ pub struct SwapEstimate {
 }
 
 impl LastLook {
-    /// None when no other DEX quotes the request
-    pub fn of(input: &HookInput) -> Option<Self> {
-        let best_other_quote = input
-            .quotes
+    /// Of `quotes`, best first. None when no other DEX quotes the request.
+    pub fn of(
+        quotes: &[Quote],
+        referral_fees: &QuoteFees,
+        route_costs: &IntearDexRouteCosts,
+    ) -> Option<Self> {
+        let best_other_quote = quotes
             .iter()
             .find(|quote| !matches!(quote.route.dex_id, DexId::IntearDex | DexId::Hook(_)))?;
         Some(Self {
@@ -41,12 +44,12 @@ impl LastLook {
             best_other_cost: best_other_quote
                 .estimated_gas_usage
                 .saturating_add(best_other_quote.storage_deposits),
-            referral_fees: input.swap_request.fees.clone(),
-            route_costs: input.route_costs.clone().into_owned(),
+            referral_fees: referral_fees.clone(),
+            route_costs: route_costs.clone(),
         })
     }
 
-    /// The smallest fee discount, in whole percents up to 99%, with which the hook's swap matches
+    /// The smallest fee discount, in whole percents up to 99%, with which the swap matches
     /// the best other quote. None when it matches without one, or no discount makes it match.
     pub fn fee_discount(
         &self,
@@ -65,13 +68,13 @@ impl LastLook {
         Some(percent(percents[first_matching]))
     }
 
-    /// Whether the route of the hook's swap gets at least as much net of its costs as the best
+    /// Whether the route of the swap gets at least as much net of its costs as the best
     /// other quote
     fn is_matched_by(&self, swap: &SwapEstimate) -> bool {
         let route_amount = match self.best_other_amount {
             // The referral fees come out of the input of both
             Amount::AmountOut(_) => Amount::AmountOut(swap.estimated_amount),
-            // The engine takes the referral fees and the oracle's fee on top of what the hook's
+            // The engine takes the referral fees and the oracle's fee on top of what the
             // DEX takes
             Amount::AmountIn(_) => Amount::AmountIn(
                 amount_in_with_referral_fees(&self.referral_fees, swap.estimated_amount)

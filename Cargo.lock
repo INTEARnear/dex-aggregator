@@ -3258,16 +3258,12 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "plach-hook"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bigdecimal",
  "borsh",
  "intear-dex-common",
  "near-min-api",
  "near-sdk",
  "pathfinder",
- "sha2 0.10.9",
  "swap-router-types",
- "tokio",
  "xyk-dex-types",
 ]
 
@@ -3441,8 +3437,6 @@ name = "qoq-hook"
 version = "0.1.0"
 dependencies = [
  "amp-dex-types",
- "anyhow",
- "bigdecimal",
  "borsh",
  "intear-dex-common",
  "near-min-api",
@@ -3451,7 +3445,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "swap-router-types",
  "tokio",
 ]
@@ -4802,7 +4795,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tokio",
 ]
 
 [[package]]

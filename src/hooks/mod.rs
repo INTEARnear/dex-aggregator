@@ -1,8 +1,12 @@
 pub mod inteardex;
+pub mod pool_routes;
+mod pools;
+
+pub use pools::{routing_pools, RoutingPools};
 
 use std::{
     borrow::Cow,
-    ffi::{c_char, CStr, CString},
+    ffi::{c_char, c_void, CStr, CString},
     fs::{File, OpenOptions},
     io::{ErrorKind, Write},
     net::IpAddr,
@@ -19,7 +23,7 @@ use near_min_api::types::{AccountId, BlockHeight};
 use pathfinder::IndexedHook;
 use swap_router_types::{
     hook::{
-        HookInput, HookQuote, IntearDexRouteCosts, IntearDexTrade, Prices, PricesJson,
+        HookInput, HookQuote, IntearDexRouteCosts, IntearDexTrade, PoolState, Prices, PricesJson,
         RequestDetails, HOOK_ABI_VERSION, HOOK_ANSWER_TIMEOUT,
     },
     indexed::{AccountState, Watch},
@@ -45,6 +49,21 @@ type OnIndexedStateFunction = unsafe extern "C" fn(*const u8, usize) -> *mut c_c
 type OnPricesFunction = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type RunFunction = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type FreeFunction = unsafe extern "C" fn(*mut c_char);
+type PoolsSnapshotFunction = unsafe extern "C" fn() -> *const c_void;
+type ReleasePoolsSnapshotFunction = unsafe extern "C" fn(*const c_void);
+type SnapshotPoolsFunction = unsafe extern "C" fn(*const c_void) -> *mut c_char;
+type SwapFunction = unsafe extern "C" fn(
+    *const c_void,
+    u32,
+    *mut PoolState,
+    u8,
+    u8,
+    u128,
+    bool,
+    u32,
+    *mut u128,
+) -> bool;
+type BuildSwapFunction = unsafe extern "C" fn(*const c_void, *const c_char) -> *mut c_char;
 
 #[derive(Clone)]
 struct HookPlugin {
@@ -53,6 +72,11 @@ struct HookPlugin {
     on_prices: OnPricesFunction,
     run: RunFunction,
     free: FreeFunction,
+    pools_snapshot: PoolsSnapshotFunction,
+    release_pools_snapshot: ReleasePoolsSnapshotFunction,
+    snapshot_pools: SnapshotPoolsFunction,
+    swap: SwapFunction,
+    build_swap: BuildSwapFunction,
 }
 
 pub struct Hook {
@@ -155,6 +179,14 @@ fn load_hook(path: &Path) -> Hook {
             on_prices: function!("hook_on_prices", OnPricesFunction),
             run: function!("hook_run", RunFunction),
             free: function!("hook_free", FreeFunction),
+            pools_snapshot: function!("hook_pools_snapshot", PoolsSnapshotFunction),
+            release_pools_snapshot: function!(
+                "hook_release_pools_snapshot",
+                ReleasePoolsSnapshotFunction
+            ),
+            snapshot_pools: function!("hook_snapshot_pools", SnapshotPoolsFunction),
+            swap: function!("hook_swap", SwapFunction),
+            build_swap: function!("hook_build_swap", BuildSwapFunction),
         };
         if let Err(err) = answer::<()>(&plugin, "init", init()) {
             panic!("{} failed to start: {err}", path.display());

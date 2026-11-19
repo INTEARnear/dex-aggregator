@@ -180,15 +180,13 @@ pub struct IntearDexOperations {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntearDexSwapOperation {
-    pub asset_in: IntearAssetId,
-    pub asset_out: IntearAssetId,
     /// `AmountIn` swaps an exact input, `AmountOut` gets an exact output
     pub amount: Amount,
     /// The least output of an exact-in swap, or the most input of an exact-out one
     pub constraint: Balance,
-    /// Best first. One is swapped on alone, the engine falls back through more of them when one
-    /// fails or doesn't meet the constraint.
-    pub options: Vec<IntearDexSwapOption>,
+    /// In order, each after the first swapping what the one before it gave. Only exact-in swaps
+    /// have more than one.
+    pub steps: Vec<IntearDexSwapStep>,
     /// What the operations ask before the swap, for the options that read the response, for the
     /// oracle's fee in the asset in, which `amount` and `constraint` are after. Boxed, as it's
     /// most of the size of a call that has one.
@@ -200,6 +198,25 @@ pub struct IntearDexSwapOperation {
 pub struct IntearDexQuoteImprovementFee {
     pub quote_expected_amount: Balance,
     pub quote_improvement_receiver: AccountId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntearDexSwapStep {
+    pub asset_in: IntearAssetId,
+    pub asset_out: IntearAssetId,
+    /// Best first. One is swapped on alone, the engine falls back through more of them when one
+    /// fails or, in the last step, doesn't meet the constraint.
+    pub options: Vec<IntearDexSwapOption>,
+}
+
+impl IntearDexSwapOperation {
+    pub fn asset_in(&self) -> &IntearAssetId {
+        &self.steps.first().expect("A swap has steps").asset_in
+    }
+
+    pub fn asset_out(&self) -> &IntearAssetId {
+        &self.steps.last().expect("A swap has steps").asset_out
+    }
 }
 
 /// An oracle request that `dex_id` reads the response to
@@ -746,28 +763,12 @@ impl CallBlueprint {
 
 impl IntearDexOperations {
     fn gas(&self) -> Gas {
-        let swap_options = &self.swap.options;
-        let qoq_dex_id: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
-        let options_gas = |of_qoq: bool| {
-            swap_options
-                .iter()
-                .filter(|option| (option.dex_id == qoq_dex_id) == of_qoq)
-                .map(|option| option.gas)
-                .reduce(|total, gas| total + gas)
-        };
-        // The first option usually fills the swap, the engine tries the others until one does
-        let all_options_gas = [
-            options_gas(true).map(|gas| gas.with_margin(QOQ_SWAP_MARGIN, QOQ_SWAP_MARGIN_PERCENT)),
-            options_gas(false)
-                .map(|gas| gas.with_margin(INTEAR_DEX_SWAP_MARGIN, INTEAR_DEX_SWAP_MARGIN_PERCENT)),
-        ]
-        .into_iter()
-        .flatten()
-        .sum::<Gas>();
-        let swap_gas = Gas {
-            estimated_burn: swap_options[0].gas.estimated_burn,
-            needs_attached: all_options_gas.needs_attached,
-        };
+        let swap_gas = self
+            .swap
+            .steps
+            .iter()
+            .map(IntearDexSwapStep::gas)
+            .sum::<Gas>();
         let withdrawals_gas = self
             .withdrawals
             .iter()
@@ -799,13 +800,7 @@ impl IntearDexOperations {
 
     fn engine_args(&self) -> serde_json::Value {
         let swap = &self.swap;
-        let asset_in = AssetId::from(&swap.asset_in);
-        let asset_out = AssetId::from(&swap.asset_out);
-        let amount = SwapOperationAmount::Amount(match swap.amount {
-            Amount::AmountIn(amount) => SwapRequestAmount::ExactIn(TokenAmount::new(amount)),
-            Amount::AmountOut(amount) => SwapRequestAmount::ExactOut(TokenAmount::new(amount)),
-        });
-        let constraint = Some(TokenAmount::new(swap.constraint));
+        let last_step = swap.steps.len() - 1;
         let quote_improvement_fee =
             swap.quote_improvement_fee
                 .as_ref()
@@ -813,32 +808,51 @@ impl IntearDexOperations {
                     quote_expected_amount: TokenAmount::new(fee.quote_expected_amount),
                     quote_improvement_receiver: fee.quote_improvement_receiver.clone(),
                 });
-        let swap_operation = match swap.options.as_slice() {
-            [option] => Operation::SwapSimple {
-                dex_id: option.dex_id.clone(),
-                message: option.message.clone(),
-                asset_in,
-                asset_out,
-                amount,
-                constraint,
-                quote_improvement_fee,
-            },
-            options => Operation::SwapAdvanced {
-                asset_in,
-                asset_out,
-                amount,
-                constraint,
-                quote_improvement_fee,
-                options: options
-                    .iter()
-                    .map(|option| SwapOption {
-                        dex_id: option.dex_id.clone(),
-                        message: option.message.clone(),
-                    })
-                    .collect(),
-                mode: SwapAdvancedMode::FallbackQueue,
-            },
-        };
+        let swap_operations = swap.steps.iter().enumerate().map(|(index, step)| {
+            let asset_in = AssetId::from(&step.asset_in);
+            let asset_out = AssetId::from(&step.asset_out);
+            let amount = match index {
+                0 => SwapOperationAmount::Amount(match swap.amount {
+                    Amount::AmountIn(amount) => {
+                        SwapRequestAmount::ExactIn(TokenAmount::new(amount))
+                    }
+                    Amount::AmountOut(amount) => {
+                        SwapRequestAmount::ExactOut(TokenAmount::new(amount))
+                    }
+                }),
+                _ => SwapOperationAmount::OutputOfLastIn,
+            };
+            // Of the output of the last step, which the quote estimates
+            let constraint = (index == last_step).then(|| TokenAmount::new(swap.constraint));
+            let quote_improvement_fee =
+                quote_improvement_fee.clone().filter(|_| index == last_step);
+            match step.options.as_slice() {
+                [option] => Operation::SwapSimple {
+                    dex_id: option.dex_id.clone(),
+                    message: option.message.clone(),
+                    asset_in,
+                    asset_out,
+                    amount,
+                    constraint,
+                    quote_improvement_fee,
+                },
+                options => Operation::SwapAdvanced {
+                    asset_in,
+                    asset_out,
+                    amount,
+                    constraint,
+                    quote_improvement_fee,
+                    options: options
+                        .iter()
+                        .map(|option| SwapOption {
+                            dex_id: option.dex_id.clone(),
+                            message: option.message.clone(),
+                        })
+                        .collect(),
+                    mode: SwapAdvancedMode::FallbackQueue,
+                },
+            }
+        });
         let withdrawals = self
             .withdrawals
             .iter()
@@ -863,12 +877,12 @@ impl IntearDexOperations {
                     dex_id: oracle_request.dex_id.clone(),
                     request: oracle_request.request.request.clone(),
                     fee: (
-                        AssetId::from(&swap.asset_in),
+                        AssetId::from(swap.asset_in()),
                         TokenAmount::new(oracle_request.request.fee.0),
                     ),
                 });
         let operations = oracle_request
-            .chain([swap_operation])
+            .chain(swap_operations)
             .chain(withdrawals)
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -876,6 +890,32 @@ impl IntearDexOperations {
             "referrer": self.referrer,
             "referral_fees": intear_dex_types::ReferralFees::from(&self.referral_fees),
         })
+    }
+}
+
+impl IntearDexSwapStep {
+    fn gas(&self) -> Gas {
+        let qoq_dex_id: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
+        let options_gas = |of_qoq: bool| {
+            self.options
+                .iter()
+                .filter(|option| (option.dex_id == qoq_dex_id) == of_qoq)
+                .map(|option| option.gas)
+                .reduce(|total, gas| total + gas)
+        };
+        // The first option usually fills the swap, the engine tries the others until one does
+        let all_options_gas = [
+            options_gas(true).map(|gas| gas.with_margin(QOQ_SWAP_MARGIN, QOQ_SWAP_MARGIN_PERCENT)),
+            options_gas(false)
+                .map(|gas| gas.with_margin(INTEAR_DEX_SWAP_MARGIN, INTEAR_DEX_SWAP_MARGIN_PERCENT)),
+        ]
+        .into_iter()
+        .flatten()
+        .sum::<Gas>();
+        Gas {
+            estimated_burn: self.options[0].gas.estimated_burn,
+            needs_attached: all_options_gas.needs_attached,
+        }
     }
 }
 
@@ -986,14 +1026,16 @@ mod tests {
     fn intear_operations(withdrawals: Vec<IntearDexWithdrawal>) -> IntearDexOperations {
         IntearDexOperations {
             swap: IntearDexSwapOperation {
-                asset_in: IntearAssetId::Near,
-                asset_out: IntearAssetId::Nep141(account("ft")),
                 amount: Amount::AmountIn(100),
                 constraint: 79,
-                options: vec![IntearDexSwapOption {
-                    dex_id: "slimedragon.near/xyk".parse().unwrap(),
-                    message: Base64VecU8(vec![1, 0, 0, 0]),
-                    gas: Gas::from_ggas(34_000, 34_000),
+                steps: vec![IntearDexSwapStep {
+                    asset_in: IntearAssetId::Near,
+                    asset_out: IntearAssetId::Nep141(account("ft")),
+                    options: vec![IntearDexSwapOption {
+                        dex_id: "slimedragon.near/xyk".parse().unwrap(),
+                        message: Base64VecU8(vec![1, 0, 0, 0]),
+                        gas: Gas::from_ggas(34_000, 34_000),
+                    }],
                 }],
                 oracle_request: None,
                 quote_improvement_fee: None,
@@ -1158,7 +1200,7 @@ mod tests {
     fn qoq_swap_options_get_their_own_margin() {
         let plach_only = intear_operations(vec![]);
         let mut with_qoq = intear_operations(vec![]);
-        with_qoq.swap.options.push(IntearDexSwapOption {
+        with_qoq.swap.steps[0].options.push(IntearDexSwapOption {
             dex_id: pathfinder::qoq::QOQ_DEX_ID.parse().unwrap(),
             message: Base64VecU8(vec![2, 0, 0, 0]),
             gas: Gas::from_ggas(24_800, 24_800),

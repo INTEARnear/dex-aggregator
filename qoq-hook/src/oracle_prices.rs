@@ -72,15 +72,6 @@ impl OraclePricesFeed {
         *self.pools.write().unwrap() = pools;
     }
 
-    /// Without prices, which it doesn't fetch
-    #[cfg(test)]
-    pub fn without_prices() -> Self {
-        Self {
-            pools: Arc::default(),
-            latest: Arc::default(),
-        }
-    }
-
     /// The latest prices, unless they're older than [`MAX_PRICES_AGE`]
     pub fn fresh(&self) -> Option<Arc<OraclePrices>> {
         let latest = self.latest.read().unwrap();

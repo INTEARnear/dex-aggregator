@@ -11,7 +11,8 @@ use swap_router_types::{
 use crate::{
     calls::{
         CallBlueprint, IntearDexOperations, IntearDexOracleRequest, IntearDexQuoteImprovementFee,
-        IntearDexSwapOperation, IntearDexSwapOption, IntearDexWithdrawAmount, IntearDexWithdrawal,
+        IntearDexSwapOperation, IntearDexSwapOption, IntearDexSwapStep, IntearDexWithdrawAmount,
+        IntearDexWithdrawal,
     },
     route::{RouteBlueprint, RouteStep},
     shared_utils::{
@@ -59,6 +60,32 @@ pub fn trade_of_request(
     })
 }
 
+/// The trade of a swap whose operations start with a request to an oracle that takes `oracle_fee`
+/// of the asset in: the engine takes it out of the input of an exact-in swap before the app fees,
+/// and on top of the input of an exact-out one. None if the fee leaves nothing of the input.
+pub fn trade_after_oracle_fee(
+    request: &SwapRequest,
+    trade: &IntearDexTrade,
+    oracle_fee: u128,
+) -> Option<IntearDexTrade> {
+    let amount = match request.amount {
+        Amount::AmountIn(amount_in) => {
+            let amount_in_after_oracle_fee = amount_in
+                .checked_sub(oracle_fee)
+                .filter(|amount_in| *amount_in > 0)?;
+            Amount::AmountIn(amount_in_after_referral_fees(
+                &request.fees,
+                amount_in_after_oracle_fee,
+            ))
+        }
+        Amount::AmountOut(amount_out) => Amount::AmountOut(amount_out),
+    };
+    Some(IntearDexTrade {
+        amount,
+        ..trade.clone()
+    })
+}
+
 /// The asset the token is swapped as on Intear DEX: NEAR and wNEAR as NEAR, a token outside of it
 /// as the NEP-141 that the route converts it to
 fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
@@ -72,11 +99,11 @@ fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
     }
 }
 
-/// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, or on the first of several that
-/// fills it
+/// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, on the first of several that
+/// fills it, or on DEXes one after another
 pub struct IntearDexSwap {
-    /// Best first
-    options: Vec<IntearDexSwapOption>,
+    /// Each after the first swaps what the one before it gave
+    steps: Vec<IntearDexSwapStep>,
     /// Of the first option, as in [`HookQuote`]
     estimated_amount: u128,
     /// The least the swap gives, or the most it takes, as in [`HookQuote`]
@@ -87,19 +114,44 @@ pub struct IntearDexSwap {
 }
 
 impl IntearDexSwap {
-    pub fn of_quote(quote: HookQuote) -> Self {
+    pub fn of_quote(trade: &IntearDexTrade, quote: HookQuote) -> Self {
         Self {
             estimated_amount: quote.estimated_amount.0,
             worst_case_amount: quote.worst_case_amount.0,
             discount: quote.discount,
             oracle_request: oracle_request_of(&quote),
-            options: vec![swap_option(quote)],
+            steps: vec![single_step(trade, vec![swap_option(quote)])],
+        }
+    }
+
+    /// Swaps on `steps` one after another, each of an asset in and out and the option it swaps
+    /// on. Amounts are as in [`HookQuote`], of the whole swap.
+    pub fn chain(
+        steps: Vec<(AssetId, AssetId, IntearDexSwapOption)>,
+        estimated_amount: u128,
+        worst_case_amount: u128,
+        discount: Option<U128>,
+        oracle_request: Option<IntearDexOracleRequest>,
+    ) -> Self {
+        Self {
+            steps: steps
+                .into_iter()
+                .map(|(asset_in, asset_out, option)| IntearDexSwapStep {
+                    asset_in: intear_asset(asset_in),
+                    asset_out: intear_asset(asset_out),
+                    options: vec![option],
+                })
+                .collect(),
+            estimated_amount,
+            worst_case_amount,
+            discount,
+            oracle_request,
         }
     }
 
     /// A swap whose costs are only those of its route: it burns no gas and asks the oracle, if it
-    /// does, for nothing and without a fee. Its quote gives less in the worst case when the trade has slippage, as
-    /// the hooks' quotes do, so the route converts the output the same way.
+    /// does, for nothing and without a fee. Its quote gives less in the worst case when the trade
+    /// has slippage, as the other quotes do, so the route converts the output the same way.
     pub fn burning_no_gas(trade: &IntearDexTrade, asks_oracle: bool) -> Self {
         let trade_amount = match trade.amount {
             Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
@@ -109,19 +161,22 @@ impl IntearDexSwap {
             Amount::AmountIn(_) => trade_amount - 1,
             Amount::AmountOut(_) => trade_amount + 1,
         };
-        Self::of_quote(HookQuote {
-            dex_id: "placeholder.near/burning-no-gas".parse().unwrap(),
-            message: Base64VecU8(vec![]),
-            estimated_amount: U128(trade_amount),
-            worst_case_amount: U128(worst_case_amount),
-            gas: Gas::from_ggas(0, 0),
-            discount: None,
-            oracle_request: asks_oracle.then(|| OracleRequest {
-                oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
-                request: Base64VecU8(vec![]),
-                fee: U128(0),
-            }),
-        })
+        Self::of_quote(
+            trade,
+            HookQuote {
+                dex_id: "placeholder.near/burning-no-gas".parse().unwrap(),
+                message: Base64VecU8(vec![]),
+                estimated_amount: U128(trade_amount),
+                worst_case_amount: U128(worst_case_amount),
+                gas: Gas::from_ggas(0, 0),
+                discount: None,
+                oracle_request: asks_oracle.then(|| OracleRequest {
+                    oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
+                    request: Base64VecU8(vec![]),
+                    fee: U128(0),
+                }),
+            },
+        )
     }
 
     /// The quotes, best first, as options that the engine falls back through when one fails. The
@@ -168,7 +223,10 @@ impl IntearDexSwap {
             within_slippage && (oracle_request.is_none() || oracle_request == best_oracle_request)
         });
         if quotes.len() < 2 {
-            return quotes.into_iter().next().map(Self::of_quote);
+            return quotes
+                .into_iter()
+                .next()
+                .map(|quote| Self::of_quote(trade, quote));
         }
         let best = &quotes[0];
         let worst_case_amounts = quotes.iter().map(|quote| quote.worst_case_amount.0);
@@ -187,9 +245,55 @@ impl IntearDexSwap {
             worst_case_amount,
             discount: best.discount,
             oracle_request: best_oracle_request,
-            options: quotes.into_iter().map(swap_option).collect(),
+            steps: vec![single_step(
+                trade,
+                quotes.into_iter().map(swap_option).collect(),
+            )],
         })
     }
+
+    /// The assets that the swap goes through between its input and output
+    fn intermediate_assets(&self) -> impl Iterator<Item = &IntearAssetId> {
+        self.steps[1..].iter().map(|step| &step.asset_in)
+    }
+}
+
+#[cfg(test)]
+impl IntearDexSwap {
+    pub fn estimated_amount(&self) -> u128 {
+        self.estimated_amount
+    }
+
+    pub fn worst_case_amount(&self) -> u128 {
+        self.worst_case_amount
+    }
+
+    pub fn discount(&self) -> Option<U128> {
+        self.discount
+    }
+
+    pub fn oracle_request(&self) -> Option<&IntearDexOracleRequest> {
+        self.oracle_request.as_ref()
+    }
+
+    /// Of the steps, in order
+    pub fn options(&self) -> impl Iterator<Item = &IntearDexSwapOption> {
+        self.steps.iter().flat_map(|step| &step.options)
+    }
+}
+
+/// The only step of a swap of the trade
+fn single_step(trade: &IntearDexTrade, options: Vec<IntearDexSwapOption>) -> IntearDexSwapStep {
+    IntearDexSwapStep {
+        asset_in: intear_asset(trade.asset_in.clone()),
+        asset_out: intear_asset(trade.asset_out.clone()),
+        options,
+    }
+}
+
+/// Trades and pools that routes go through are only of NEAR and NEP-141s
+fn intear_asset(asset_id: AssetId) -> IntearAssetId {
+    IntearAssetId::try_from(asset_id).expect("Swaps are only of NEAR and NEP-141s")
 }
 
 fn swap_option(quote: HookQuote) -> IntearDexSwapOption {
@@ -217,10 +321,8 @@ pub fn route(
     trade: &IntearDexTrade,
     swap: IntearDexSwap,
 ) -> Option<RouteBlueprint> {
-    let token_in = IntearAssetId::try_from(trade.asset_in.clone())
-        .expect("Trades are only of NEAR and NEP-141s");
-    let token_out = IntearAssetId::try_from(trade.asset_out.clone())
-        .expect("Trades are only of NEAR and NEP-141s");
+    let token_in = intear_asset(trade.asset_in.clone());
+    let token_out = intear_asset(trade.asset_out.clone());
     let referral_fees = payable_referral_fees(&request.fees);
     let discount = swap.discount.map(|discount| match request.amount {
         Amount::AmountIn(_) => Amount::AmountOut(discount.0),
@@ -296,8 +398,15 @@ pub fn route(
     let output_withdrawn = !withdrawals.is_empty();
 
     // The fast path swaps from the input's balance, and exact-out withdraws what's left of the
-    // input, so only exact-in deposits are swapped whole without a balance of the input
-    let registered_assets = if use_fast_path || matches!(request.amount, Amount::AmountOut(_)) {
+    // input, so only exact-in deposits are swapped whole without a balance of the input. The fast
+    // path also puts what each step gives into the trader's balance.
+    let registered_assets = if use_fast_path {
+        [token_in.clone()]
+            .into_iter()
+            .chain(swap.intermediate_assets().cloned())
+            .chain([token_out.clone()])
+            .collect()
+    } else if matches!(request.amount, Amount::AmountOut(_)) {
         vec![token_in.clone(), token_out.clone()]
     } else {
         vec![token_out.clone()]
@@ -347,11 +456,9 @@ pub fn route(
             });
     let operations = IntearDexOperations {
         swap: IntearDexSwapOperation {
-            asset_in: token_in.clone(),
-            asset_out: token_out.clone(),
             amount: swap_amount,
             constraint,
-            options: swap.options,
+            steps: swap.steps,
             oracle_request: swap.oracle_request.map(Box::new),
             quote_improvement_fee,
         },
@@ -438,7 +545,6 @@ pub fn route(
 mod tests {
     use near_min_api::types::{AccountId, Action, NearGas};
     use near_sdk::json_types::Base64VecU8;
-    use pathfinder::plach::{self, SplitRouteApiResponse};
     use swap_router_types::{fees::AGGREGATOR_FEE_RECEIVER_ID, hook::OracleRequest};
     use xyk_dex_types::{PoolId, SwapArgs, SwapRoute, FULL_ROUTE_FRACTION};
 
@@ -452,102 +558,6 @@ mod tests {
     const PLACH_SWAP_GAS: Gas = Gas::from_ggas(34_000, 34_000);
     const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
     const ORACLE_FEE: u128 = 3;
-
-    #[derive(Clone)]
-    struct TestPlachQuotes {
-        enabled: bool,
-        empty_routes: bool,
-    }
-
-    impl Default for TestPlachQuotes {
-        fn default() -> Self {
-            Self {
-                enabled: true,
-                empty_routes: false,
-            }
-        }
-    }
-
-    impl TestPlachQuotes {
-        fn none() -> Self {
-            Self {
-                enabled: false,
-                empty_routes: false,
-            }
-        }
-
-        fn empty_routes() -> Self {
-            Self {
-                enabled: true,
-                empty_routes: true,
-            }
-        }
-
-        fn find_path(&self, trade: &IntearDexTrade) -> Option<SplitRouteApiResponse> {
-            if !self.enabled {
-                return None;
-            }
-            let (token_in, token_out) = (&trade.asset_in, &trade.asset_out);
-            if self.empty_routes {
-                return Some(SplitRouteApiResponse::ExactIn {
-                    routes: vec![],
-                    contract_in: token_in.clone(),
-                    contract_out: token_out.clone(),
-                    amount_in: near_min_api::types::U128(100),
-                    amount_out: near_min_api::types::U128(80),
-                    discount: near_min_api::types::U128(0),
-                    swap_gas: PLACH_SWAP_GAS,
-                });
-            }
-            let discount = near_min_api::types::U128(0);
-            match trade.amount {
-                Amount::AmountIn(amount_in) => Some(SplitRouteApiResponse::ExactIn {
-                    routes: vec![plach::ExactInRoute {
-                        split_fraction: FULL_ROUTE_FRACTION.get(),
-                        pools: vec![plach::ExactInPoolStep {
-                            pool_id: 1,
-                            token_in: token_in.clone(),
-                            token_out: token_out.clone(),
-                            amount_in: near_min_api::types::U128(amount_in),
-                            min_amount_out: near_min_api::types::U128(79),
-                        }],
-                        amount_in: near_min_api::types::U128(amount_in),
-                        min_amount_out: near_min_api::types::U128(79),
-                        amount_out: near_min_api::types::U128(80),
-                    }],
-                    contract_in: token_in.clone(),
-                    contract_out: token_out.clone(),
-                    amount_in: near_min_api::types::U128(amount_in),
-                    amount_out: near_min_api::types::U128(80),
-                    discount,
-                    swap_gas: PLACH_SWAP_GAS,
-                }),
-                Amount::AmountOut(_) => Some(SplitRouteApiResponse::ExactOut {
-                    routes: vec![plach::ExactOutRoute {
-                        split_fraction: FULL_ROUTE_FRACTION.get(),
-                        pools: vec![plach::ExactOutPoolStep {
-                            pool_id: 1,
-                            token_in: token_in.clone(),
-                            token_out: token_out.clone(),
-                            amount_in: near_min_api::types::U128(100),
-                            amount_out: near_min_api::types::U128(80),
-                            max_amount_in: near_min_api::types::U128(101),
-                        }],
-                        amount_in: near_min_api::types::U128(100),
-                        max_amount_in: near_min_api::types::U128(101),
-                        amount_out: near_min_api::types::U128(80),
-                    }],
-                    contract_in: token_in.clone(),
-                    contract_out: token_out.clone(),
-                    amount_in: near_min_api::types::U128(100),
-                    max_amount_in: near_min_api::types::U128(101),
-                    amount_out: near_min_api::types::U128(80),
-                    discount,
-                    swap_gas: PLACH_SWAP_GAS,
-                }),
-            }
-        }
-    }
 
     /// The swap message of the test quotes, through pool 1 without a fee discount
     fn plach_message() -> Base64VecU8 {
@@ -563,43 +573,21 @@ mod tests {
         )
     }
 
-    /// The route of the quote that the Plach hook makes of the test quotes, without a fee discount
-    fn plach_route(
-        request: SwapRequest,
-        network: &impl NetworkView,
-        quotes: &TestPlachQuotes,
-    ) -> Option<RouteBlueprint> {
-        let trade = trade_of_request(network, &request)?;
-        let (route_count, estimated_amount, worst_case_amount, swap_gas) =
-            match quotes.find_path(&trade)? {
-                SplitRouteApiResponse::ExactIn {
-                    routes,
-                    amount_out,
-                    swap_gas,
-                    ..
-                } => (
-                    routes.len(),
-                    amount_out.0,
-                    routes.iter().map(|route| route.min_amount_out.0).sum(),
-                    swap_gas,
-                ),
-                SplitRouteApiResponse::ExactOut {
-                    routes,
-                    amount_in,
-                    max_amount_in,
-                    swap_gas,
-                    ..
-                } => (routes.len(), amount_in.0, max_amount_in.0, swap_gas),
-            };
-        if route_count == 0 {
-            return None;
-        }
+    /// The route of a Plach quote through pool 1 without a fee discount: 80 out of 100 in, or 100
+    /// in for 80 out, with 1 of slippage
+    fn test_route(request: SwapRequest) -> Option<RouteBlueprint> {
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request)?;
+        let (estimated_amount, worst_case_amount) = match trade.amount {
+            Amount::AmountIn(_) => (80, 79),
+            Amount::AmountOut(_) => (100, 101),
+        };
         let quote = HookQuote {
             dex_id: PLACH_DEX_ID.parse().unwrap(),
             message: plach_message(),
             estimated_amount: U128(estimated_amount),
             worst_case_amount: U128(worst_case_amount),
-            gas: swap_gas,
+            gas: PLACH_SWAP_GAS,
             discount: None,
             oracle_request: None,
         };
@@ -607,15 +595,7 @@ mod tests {
             DexId::Hook("Plach".into()),
             &request,
             &trade,
-            IntearDexSwap::of_quote(quote),
-        )
-    }
-
-    fn test_route(request: SwapRequest) -> Option<RouteBlueprint> {
-        plach_route(
-            request,
-            &TestNetworkView::default().with_test_prices(),
-            &TestPlachQuotes::default(),
+            IntearDexSwap::of_quote(&trade, quote),
         )
     }
 
@@ -694,14 +674,16 @@ mod tests {
     ) -> IntearDexOperations {
         IntearDexOperations {
             swap: IntearDexSwapOperation {
-                asset_in,
-                asset_out,
                 amount,
                 constraint,
-                options: vec![IntearDexSwapOption {
-                    dex_id: PLACH_DEX_ID.parse().unwrap(),
-                    message: plach_message(),
-                    gas: PLACH_SWAP_GAS,
+                steps: vec![IntearDexSwapStep {
+                    asset_in,
+                    asset_out,
+                    options: vec![IntearDexSwapOption {
+                        dex_id: PLACH_DEX_ID.parse().unwrap(),
+                        message: plach_message(),
+                        gas: PLACH_SWAP_GAS,
+                    }],
                 }],
                 oracle_request: None,
                 quote_improvement_fee: None,
@@ -950,13 +932,10 @@ mod tests {
         };
         let network = TestNetworkView::default().with_test_prices();
         let trade = trade_of_request(&network, &request).unwrap();
-        let swap = IntearDexSwap::of_quote(oracle_quote(
-            "slimedragon.near/amp",
-            100,
-            101,
-            25,
-            b"near,usdc",
-        ));
+        let swap = IntearDexSwap::of_quote(
+            &trade,
+            oracle_quote("slimedragon.near/amp", 100, 101, 25, b"near,usdc"),
+        );
         let route = route(DexId::IntearDex, &request, &trade, swap).unwrap();
         assert_eq!(route.estimated_amount, Amount::AmountIn(103));
         assert_eq!(route.worst_case_amount, Amount::AmountIn(104));
@@ -1026,6 +1005,120 @@ mod tests {
         assert_eq!(
             gas,
             attached_gas(NearGas::from_tgas(37), NearGas::from_tgas(27))
+        );
+    }
+
+    fn usdc() -> AssetId {
+        AssetId::Nep141(account("usdc.near"))
+    }
+
+    /// NEAR to USDC on `first_dex`, then USDC to FT on `second_dex`, swaps that burn 34 and 27 TGas
+    fn chain(first_dex: &str, second_dex: &str) -> IntearDexSwap {
+        let option = |dex_id: &str, tgas: u64| IntearDexSwapOption {
+            dex_id: dex_id.parse().unwrap(),
+            message: Base64VecU8(dex_id.as_bytes().to_vec()),
+            gas: Gas::from_ggas(tgas * 1_000, (tgas + 10) * 1_000),
+        };
+        IntearDexSwap::chain(
+            vec![
+                (AssetId::Near, usdc(), option(first_dex, 34)),
+                (
+                    usdc(),
+                    AssetId::Nep141(account("ft")),
+                    option(second_dex, 27),
+                ),
+            ],
+            80,
+            79,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_chain_swaps_each_step_on_what_the_step_before_gave() {
+        let request = SwapRequest {
+            trader_account_id: None,
+            quote_improvement_receiver: Some(account("improvement.near")),
+            ..request(TokenId::Near, ft_output(), Amount::AmountIn(100))
+        };
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request).unwrap();
+        let swap = chain("slimedragon.near/xyk", "slimedragon.near/otc");
+        let route = route(DexId::IntearDex, &request, &trade, swap).unwrap();
+        let (args, gas) = last_call(&route);
+        assert_eq!(
+            args["operations"]["operations"],
+            serde_json::json!([
+                {
+                    "SwapSimple": {
+                        "dex_id": "slimedragon.near/xyk",
+                        "message": "c2xpbWVkcmFnb24ubmVhci94eWs=",
+                        "asset_in": "near",
+                        "asset_out": "nep141:usdc.near",
+                        "amount": { "Amount": { "ExactIn": "100" } },
+                        // Only the output of the last step is constrained, and improves on the
+                        // quote
+                        "constraint": null,
+                        "quote_improvement_fee": null,
+                    },
+                },
+                {
+                    "SwapSimple": {
+                        "dex_id": "slimedragon.near/otc",
+                        "message": "c2xpbWVkcmFnb24ubmVhci9vdGM=",
+                        "asset_in": "nep141:usdc.near",
+                        "asset_out": "nep141:ft",
+                        "amount": "OutputOfLastIn",
+                        "constraint": "79",
+                        "quote_improvement_fee": {
+                            "quote_expected_amount": "80",
+                            "quote_improvement_receiver": "improvement.near",
+                        },
+                    },
+                },
+                {
+                    "Withdraw": {
+                        "asset_id": "nep141:ft",
+                        "amount": { "Full": { "at_least": "79" } },
+                        "to": null,
+                        "rescue_address": null,
+                    },
+                },
+            ])
+        );
+        // Each step with its own margin
+        let second_step_margin =
+            NearGas::from_tgas(4).as_gas() + NearGas::from_tgas(27).as_gas() * 15 / 100;
+        assert_eq!(
+            gas,
+            NearGas::from_gas(
+                attached_gas(NearGas::from_tgas(44 + 37), NearGas::from_tgas(34)).as_gas()
+                    + second_step_margin
+                    // Paying the quote improvement
+                    + NearGas::from_ggas(600).as_gas()
+            )
+        );
+    }
+
+    #[test]
+    fn a_chain_on_the_fast_path_registers_what_each_step_gives() {
+        let request = request(
+            TokenId::TokenOnIntearDex(IntearAssetId::Near),
+            ft_output(),
+            Amount::AmountIn(100),
+        );
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request).unwrap();
+        let swap = chain("slimedragon.near/xyk", "slimedragon.near/otc");
+        let route = route(DexId::IntearDex, &request, &trade, swap).unwrap();
+        assert_eq!(
+            route.steps[0],
+            registration(vec![
+                IntearAssetId::Near,
+                IntearAssetId::Nep141(account("usdc.near")),
+                ft(),
+            ])
         );
     }
 
@@ -1332,30 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_quote_returns_none() {
-        assert_eq!(
-            plach_route(
-                request(TokenId::Near, ft_output(), Amount::AmountIn(100)),
-                &TestNetworkView::default().with_test_prices(),
-                &TestPlachQuotes::none(),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn empty_routes_returns_none() {
-        assert_eq!(
-            plach_route(
-                request(TokenId::Near, ft_output(), Amount::AmountIn(100)),
-                &TestNetworkView::default().with_test_prices(),
-                &TestPlachQuotes::empty_routes(),
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn no_trader_omits_registration_and_storage() {
         assert_eq!(
             test_route(SwapRequest {
@@ -1394,9 +1463,7 @@ mod tests {
         let request = request(TokenId::Near, ft_output(), Amount::AmountIn(10u128.pow(24)));
         let trade = trade_of_request(&network, &request).unwrap();
         let resolved = |route| async { resolve(&network, route).await.unwrap() };
-        let plach =
-            resolved(plach_route(request.clone(), &network, &TestPlachQuotes::default()).unwrap())
-                .await;
+        let plach = resolved(test_route(request.clone()).unwrap()).await;
         let burning_no_gas = |asks_oracle| {
             route(
                 DexId::IntearDex,
@@ -1421,6 +1488,33 @@ mod tests {
         assert_eq!(plach.token_output, without_oracle_request.token_output);
         assert!(
             with_oracle_request.gas().estimated_burn > without_oracle_request.gas().estimated_burn
+        );
+    }
+
+    #[test]
+    fn oracle_fee_comes_out_of_an_exact_input_before_the_app_fees() {
+        let network = TestNetworkView::default().with_test_prices();
+        let exact_in = SwapRequest {
+            fees: r#"{"app.near":0.005}"#.parse().unwrap(),
+            ..request(TokenId::Near, ft_output(), Amount::AmountIn(1_000_000))
+        };
+        let trade = trade_of_request(&network, &exact_in).unwrap();
+        // 0.5% of the 800,000 that the oracle's fee leaves goes to the app and the aggregator
+        assert_eq!(
+            trade_after_oracle_fee(&exact_in, &trade, 200_000)
+                .unwrap()
+                .amount,
+            Amount::AmountIn(796_000)
+        );
+        assert!(trade_after_oracle_fee(&exact_in, &trade, 1_000_000).is_none());
+
+        let exact_out = request(TokenId::Near, ft_output(), Amount::AmountOut(1_000_000));
+        let trade = trade_of_request(&network, &exact_out).unwrap();
+        assert_eq!(
+            trade_after_oracle_fee(&exact_out, &trade, 200_000)
+                .unwrap()
+                .amount,
+            Amount::AmountOut(1_000_000)
         );
     }
 

@@ -28,7 +28,7 @@ mod intear_dex;
 pub mod plach;
 pub mod qoq;
 pub mod rhea;
-mod search;
+pub mod search;
 
 pub use search::{MaxHops, QuoteAmount};
 
@@ -204,7 +204,7 @@ pub fn slippage_bp(slippage: &BigDecimal) -> Result<u128, anyhow::Error> {
 }
 
 /// What `gas` costs in raw units of a token
-fn gas_cost(
+pub fn gas_cost(
     gas: NearGas,
     near_price_raw: &BigDecimal,
     token_price_raw: &BigDecimal,

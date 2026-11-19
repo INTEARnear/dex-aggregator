@@ -3,114 +3,42 @@ mod storage;
 use self::storage::StoredPool;
 pub use self::storage::watch;
 
-use bigdecimal::BigDecimal;
-use near_min_api::types::{Balance, BlockHeight, U128};
-use near_min_api::utils::dec_format;
+use near_min_api::types::{Balance, BlockHeight};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
 pub use intear_dex_common::AssetId;
 use near_sdk::Timestamp;
-use swap_router_types::{indexed::AccountState, types::Gas};
+use swap_router_types::{
+    hook::{HookPool, HookPools, HookSwapRoute, PoolState},
+    indexed::AccountState,
+    types::{Amount, Gas},
+};
 use xyk_dex_types::math::{exact_in_amount_out, exact_out_amount_in};
 use xyk_dex_types::{
-    AssetIndex, CurrentFees, FULL_ROUTE_FRACTION, FeeDiscountFraction, FeePayoutType, FeeReceiver,
-    PayoutGroups, PoolAssets, SwapReserves, TokenAmount, TotalShares, protocol_fee_payout,
+    AssetIndex, CurrentFees, FeeDiscountFraction, FeePayoutType, FeeReceiver, PayoutGroups,
+    PoolAssets, PoolId, RouteFraction, SwapReserves, SwapRoute, TokenAmount, TotalShares,
+    protocol_fee_payout,
 };
 
-use crate::search::{
-    self, Graph, MaxHops, PoolsDelta, QuoteAmount, Settings, SplitRoute, split_exactly,
-};
-use serde::Serialize;
-use tracing::{info, warn};
+use crate::search::QuoteAmount;
+use tracing::warn;
 
-#[derive(Serialize, Debug, Clone)]
-#[serde(tag = "quote_type", rename_all = "snake_case")]
-pub enum SplitRouteApiResponse {
-    ExactIn {
-        routes: Vec<ExactInRoute>,
-        contract_in: AssetId,
-        contract_out: AssetId,
-        amount_in: U128,
-        amount_out: U128,
-        /// Added to `amount_out` by the fee discount on top of the one it's counted from, 0
-        /// without one
-        discount: U128,
-        swap_gas: Gas,
-    },
-    ExactOut {
-        routes: Vec<ExactOutRoute>,
-        contract_in: AssetId,
-        contract_out: AssetId,
-        amount_in: U128,
-        max_amount_in: U128,
-        amount_out: U128,
-        /// Taken off `amount_in` by the fee discount on top of the one it's counted from, 0
-        /// without one
-        discount: U128,
-        swap_gas: Gas,
-    },
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct ExactInRoute {
-    pub pools: Vec<ExactInPoolStep>,
-    /// [`xyk_dex_types::RouteFraction`] of the route
-    pub split_fraction: u32,
-    pub amount_in: U128,
-    pub min_amount_out: U128,
-    pub amount_out: U128,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct ExactOutRoute {
-    pub pools: Vec<ExactOutPoolStep>,
-    /// [`xyk_dex_types::RouteFraction`] of the route
-    pub split_fraction: u32,
-    pub amount_in: U128,
-    pub max_amount_in: U128,
-    pub amount_out: U128,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct ExactInPoolStep {
-    #[serde(with = "dec_format")]
-    pub pool_id: u32,
-    pub token_in: AssetId,
-    pub token_out: AssetId,
-    pub amount_in: U128,
-    pub min_amount_out: U128,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct ExactOutPoolStep {
-    #[serde(with = "dec_format")]
-    pub pool_id: u32,
-    pub token_in: AssetId,
-    pub token_out: AssetId,
-    pub amount_in: U128,
-    pub amount_out: U128,
-    pub max_amount_in: U128,
-}
-
-const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
+pub const PLACH_DEX_ID: &str = "slimedragon.near/xyk";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
-#[derive(Clone)]
 pub struct Pool {
     id: u32,
+    tokens: [AssetId; 2],
     reserves: PoolAssets<TokenAmount>,
-    /// What swaps don't change, shared so simulations clone pools without allocating
-    info: Arc<PoolInfo>,
+    info: PoolInfo,
 }
 
-#[derive(Clone)]
+/// What swaps don't change
 struct PoolInfo {
-    tokens: [AssetId; 2],
     /// Pool and protocol fees at the block time
     fees: CurrentFees,
     /// Swaps fail if they leave less than this of a token. Launch pools keep their phantom
@@ -121,7 +49,6 @@ struct PoolInfo {
 }
 
 /// How a public pool pays its fee out to its liquidity providers
-#[derive(Clone)]
 struct LiquidityProviderPayouts {
     total_shares: TotalShares,
     groups: PayoutGroups,
@@ -170,39 +97,59 @@ impl Pool {
         }
         Some(Self {
             id,
+            tokens,
             reserves: PoolAssets([assets.0.balance, assets.1.balance]),
-            info: Arc::new(PoolInfo {
-                tokens,
+            info: PoolInfo {
                 fees: fee_configuration.with_protocol_fee(timestamp),
                 min_reserves,
                 liquidity_provider_payouts,
-            }),
+            },
         })
     }
 
-    /// The pool with its pool and protocol fees discounted, as a signed fee discount makes the
-    /// xyk DEX charge them
-    fn with_fee_discount(&self, fee_discount: FeeDiscountFraction) -> Self {
-        let fees = self.info.fees.clone().discounted(fee_discount);
-        Self {
-            info: Arc::new(PoolInfo {
-                fees,
-                ..(*self.info).clone()
-            }),
-            ..self.clone()
-        }
+    /// Swaps the token at `in_index` like the contract's `swap_in_pool` in the pool with
+    /// `reserves`, which it changes like the swap would, and returns the amounts in and out.
+    /// `None` for a swap the contract fails.
+    fn swap(
+        &self,
+        reserves: &mut PoolAssets<TokenAmount>,
+        in_index: AssetIndex,
+        amount: QuoteAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<(Balance, Balance)> {
+        let id = self.id;
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.swap_unless_panicked(reserves, in_index, amount, fee_discount)
+        }))
+        .unwrap_or_else(|_| {
+            warn!("Panicked while emulating a swap in pool {id}");
+            None
+        })
     }
 
-    /// Swaps the token at `in_index` like the contract's `swap_in_pool`, and returns the amounts
-    /// in and out. `None` for a swap the contract fails, which panics like the contract on
-    /// overflows.
-    fn swap(&mut self, in_index: AssetIndex, amount: QuoteAmount) -> Option<(Balance, Balance)> {
+    /// Panics on overflows like the contract
+    fn swap_unless_panicked(
+        &self,
+        reserves: &mut PoolAssets<TokenAmount>,
+        in_index: AssetIndex,
+        amount: QuoteAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<(Balance, Balance)> {
         let out_index = match in_index {
             AssetIndex::First => AssetIndex::Second,
             AssetIndex::Second => AssetIndex::First,
         };
-        let info = &*self.info;
-        let mut balances = self.reserves;
+        let info = &self.info;
+        // As a signed fee discount makes the xyk DEX charge them
+        let discounted_fees;
+        let fees = match fee_discount {
+            Some(fee_discount) => {
+                discounted_fees = info.fees.clone().discounted(fee_discount);
+                &discounted_fees
+            }
+            None => &info.fees,
+        };
+        let mut balances = *reserves;
         if balances.0.iter().any(|balance| balance.is_zero()) {
             return None;
         }
@@ -217,17 +164,12 @@ impl Pool {
                 if amount_out >= balances[out_index].get() {
                     return None;
                 }
-                exact_out_amount_in(
-                    TokenAmount::new(amount_out),
-                    swap_reserves(&balances),
-                    &info.fees,
-                )
+                exact_out_amount_in(TokenAmount::new(amount_out), swap_reserves(&balances), fees)
             }
         };
         // The parts of each receiver's fee that are paid out, and with which payout type. The
         // rest of the pool's fee goes into its liquidity.
-        let receiver_fees = info
-            .fees
+        let receiver_fees = fees
             .amounts(amount_in)
             .map(|(receiver, fee_amount)| {
                 let paid_out_fees: Vec<(FeePayoutType, TokenAmount)> =
@@ -243,7 +185,7 @@ impl Pool {
                             vec![(*payout_type, fee_amount)]
                         }
                         (FeeReceiver::Protocol, _) => vec![(
-                            protocol_fee_payout((&info.tokens[0], &info.tokens[1])),
+                            protocol_fee_payout((&self.tokens[0], &self.tokens[1])),
                             fee_amount,
                         )],
                     };
@@ -320,87 +262,15 @@ impl Pool {
         {
             return None;
         }
-        self.reserves = balances;
+        *reserves = balances;
         Some((amount_in.get(), amount_out.get()))
-    }
-
-    /// Simulations panic on overflows like the contract
-    fn unless_panicked(
-        &mut self,
-        swap: impl FnOnce(&mut Self) -> Option<Balance>,
-    ) -> Option<Balance> {
-        let id = self.id;
-        std::panic::catch_unwind(AssertUnwindSafe(|| swap(self))).unwrap_or_else(|_| {
-            warn!("Panicked while emulating a swap in pool {id}");
-            None
-        })
-    }
-}
-
-impl search::Pool for Pool {
-    type Token = AssetId;
-
-    fn tokens(&self) -> Vec<AssetId> {
-        self.info.tokens.to_vec()
-    }
-
-    fn swap_exact_in(
-        &mut self,
-        token_in: usize,
-        _token_out: usize,
-        amount_in: Balance,
-    ) -> Option<Balance> {
-        self.unless_panicked(|pool| {
-            let (_, amount_out) =
-                pool.swap(AssetIndex::BOTH[token_in], QuoteAmount::ExactIn(amount_in))?;
-            Some(amount_out)
-        })
-    }
-
-    fn swap_exact_out(
-        &mut self,
-        token_in: usize,
-        _token_out: usize,
-        amount_out: Balance,
-    ) -> Option<Balance> {
-        self.unless_panicked(|pool| {
-            let (amount_in, _) = pool.swap(
-                AssetIndex::BOTH[token_in],
-                QuoteAmount::ExactOut(amount_out),
-            )?;
-            Some(amount_in)
-        })
     }
 }
 
 pub struct Pools {
     block_height: BlockHeight,
     updated_at: Instant,
-    /// Pools without a fee discount
-    graph: Arc<Graph<Pool>>,
-    /// Pools with a fee discount, made the first time it's asked for. A snapshot only lives for
-    /// a block, so this only holds the ones asked for in it.
-    discounted_graphs: Mutex<BTreeMap<FeeDiscountFraction, Arc<Graph<Pool>>>>,
-}
-
-impl Pools {
-    /// Pools as a swap with `fee_discount` goes through them
-    fn graph_for(&self, fee_discount: Option<FeeDiscountFraction>) -> Arc<Graph<Pool>> {
-        let Some(fee_discount) = fee_discount else {
-            return self.graph.clone();
-        };
-        self.discounted_graphs
-            .lock()
-            .unwrap()
-            .entry(fee_discount)
-            .or_insert_with(|| {
-                Arc::new(
-                    self.graph
-                        .map_pools(|pool| pool.with_fee_discount(fee_discount)),
-                )
-            })
-            .clone()
-    }
+    pools: Vec<Pool>,
 }
 
 /// Everything a pools snapshot is built from, as stored by the contract at one block
@@ -417,16 +287,14 @@ fn build_pools(source: PoolsSource) -> Pools {
         timestamp,
         pools,
     } = source;
-    let pools = pools
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, data)| Pool::new(i as u32, data, timestamp))
-        .collect::<Vec<_>>();
     Pools {
         block_height,
         updated_at: Instant::now(),
-        graph: Arc::new(Graph::new(pools)),
-        discounted_graphs: Mutex::default(),
+        pools: pools
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, data)| Pool::new(i as u32, data, timestamp))
+            .collect(),
     }
 }
 
@@ -434,6 +302,11 @@ fn build_pools(source: PoolsSource) -> Pools {
 pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error> {
     storage::pools_source(state).map(build_pools)
 }
+
+const SWAP_GAS: Gas = Gas::from_ggas(7_200, 7_200);
+const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
+const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
+const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 
 impl Pools {
     pub fn block_height(&self) -> BlockHeight {
@@ -451,249 +324,94 @@ impl Pools {
         }
         Ok(())
     }
+
+    /// The pools, which routes refer to by their position here
+    pub fn hook_pools(&self) -> HookPools {
+        HookPools {
+            pools: self
+                .pools
+                .iter()
+                .map(|pool| HookPool {
+                    tokens: pool.tokens.clone(),
+                    state: PoolState::of_balances(pool.reserves.0.map(TokenAmount::get)),
+                    hop_gas: HOP_GAS.estimated_burn,
+                    oracle_key: None,
+                })
+                .collect(),
+            oracle_fees: Vec::new(),
+        }
+    }
+
+    /// Swaps in the pool at `pool` of [`Pools::hook_pools`], whose reserves are in `state`
+    pub fn swap(
+        &self,
+        pool: u32,
+        state: &mut PoolState,
+        token_in: usize,
+        amount: Amount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<Balance> {
+        let pool = &self.pools[pool as usize];
+        let mut reserves = PoolAssets(state.balances().map(TokenAmount::new));
+        let (amount_in, amount_out) = pool.swap(
+            &mut reserves,
+            AssetIndex::BOTH[token_in],
+            match amount {
+                Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
+                Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
+            },
+            fee_discount,
+        )?;
+        *state = PoolState::of_balances(reserves.0.map(TokenAmount::get));
+        Some(match amount {
+            Amount::AmountIn(_) => amount_out,
+            Amount::AmountOut(_) => amount_in,
+        })
+    }
+
+    /// The routes of a swap through pools by their position in [`Pools::hook_pools`]
+    pub fn swap_routes(&self, routes: &[HookSwapRoute]) -> Result<Vec<SwapRoute>, String> {
+        routes
+            .iter()
+            .map(|route| {
+                let pool_ids = route
+                    .pools
+                    .iter()
+                    .map(|&pool| {
+                        let pool = self
+                            .pools
+                            .get(pool as usize)
+                            .ok_or_else(|| format!("No pool {pool} in the snapshot"))?;
+                        Ok(PoolId::new(pool.id))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Ok(SwapRoute {
+                    fraction: RouteFraction::new(route.fraction),
+                    pool_ids,
+                })
+            })
+            .collect()
+    }
 }
 
-const SETTINGS: Settings = Settings {
-    top_routes: 10,
-    max_splits: 8,
-    allow_unused_input: false,
-    keep_shorter_routes: true,
-};
-
-const SWAP_GAS: Gas = Gas::from_ggas(7_200, 7_200);
-const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
-const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
-const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
-
-fn swap_gas(split_route: &SplitRoute) -> Gas {
-    let hops = split_route
-        .parts
+/// What a swap on `routes` burns, more with a fee discount
+pub fn swap_gas(routes: &[SwapRoute], fee_discount: bool) -> Gas {
+    let hops = routes
         .iter()
-        .flat_map(|part| &part.route.hops)
-        .map(|hop| hop.pool)
+        .flat_map(|route| &route.pool_ids)
         .collect::<Vec<_>>();
     let pools = hops.iter().collect::<HashSet<_>>().len() as u64;
     let repeated_hops = hops.len() as u64 - pools;
-    SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops
-}
-
-fn to_api_response(
-    split_route: &SplitRoute,
-    graph: &Graph<Pool>,
-    token_in: &AssetId,
-    token_out: &AssetId,
-    amount: QuoteAmount,
-    slippage_bp: u128,
-) -> Result<SplitRouteApiResponse, anyhow::Error> {
-    match amount {
-        QuoteAmount::ExactIn(total_amount_in) => {
-            let mut routes_resp = Vec::new();
-            let mut total_estimated_out: Balance = 0;
-            let mut pools_delta = PoolsDelta::default();
-            let amount_parts = split_exactly(total_amount_in, &split_route.parts);
-
-            for (part, amount_part) in split_route.parts.iter().zip(amount_parts) {
-                let estimated_out = part
-                    .route
-                    .emulate_exact_in(graph, amount_part, &mut pools_delta)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let min_amount_out =
-                    crate::with_slippage(estimated_out, crate::BASIS_POINTS - slippage_bp);
-
-                let mut pools_resp = Vec::new();
-                let mut current_token = token_in.clone();
-                for (idx, hop) in part.route.hops.iter().enumerate() {
-                    let is_first = idx == 0;
-                    let is_last = idx + 1 == part.route.hops.len();
-
-                    pools_resp.push(ExactInPoolStep {
-                        pool_id: graph.pools()[hop.pool].id,
-                        token_in: current_token.clone(),
-                        token_out: graph.token(hop.token_out).clone(),
-                        amount_in: U128(if is_first { amount_part } else { 0 }),
-                        min_amount_out: U128(if is_last { min_amount_out } else { 0 }),
-                    });
-
-                    current_token = graph.token(hop.token_out).clone();
-                }
-
-                routes_resp.push(ExactInRoute {
-                    pools: pools_resp,
-                    split_fraction: part.weight_percentage * (FULL_ROUTE_FRACTION.get() / 100),
-                    amount_in: U128(amount_part),
-                    min_amount_out: U128(min_amount_out),
-                    amount_out: U128(estimated_out),
-                });
-                total_estimated_out = total_estimated_out
-                    .checked_add(estimated_out)
-                    .ok_or_else(|| anyhow::anyhow!("Total estimated out overflows u128"))?;
-            }
-            Ok(SplitRouteApiResponse::ExactIn {
-                routes: routes_resp,
-                contract_in: token_in.clone(),
-                contract_out: token_out.clone(),
-                amount_in: U128(total_amount_in),
-                amount_out: U128(total_estimated_out),
-                discount: U128(0),
-                swap_gas: swap_gas(split_route),
-            })
-        }
-        QuoteAmount::ExactOut(total_amount_out) => {
-            let mut routes_resp = Vec::new();
-            let mut total_estimated_in: Balance = 0;
-            let mut total_max_amount_in: Balance = 0;
-            let mut pools_delta = PoolsDelta::default();
-            for (part, amount_out_part) in split_route
-                .parts
-                .iter()
-                .zip(split_exactly(total_amount_out, &split_route.parts))
-            {
-                let (amount_in, step_amounts) = part
-                    .route
-                    .emulate_exact_out(graph, amount_out_part, &mut pools_delta)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
-                let max_amount_in =
-                    crate::with_slippage(amount_in, crate::BASIS_POINTS + slippage_bp);
-
-                let mut pools_resp = Vec::new();
-                let mut current_token = token_in.clone();
-                for (idx, hop) in part.route.hops.iter().enumerate() {
-                    let step_amount = step_amounts
-                        .get(idx)
-                        .ok_or_else(|| anyhow::anyhow!("Missing step amount"))?;
-
-                    pools_resp.push(ExactOutPoolStep {
-                        pool_id: graph.pools()[hop.pool].id,
-                        token_in: current_token.clone(),
-                        token_out: graph.token(hop.token_out).clone(),
-                        amount_in: U128(step_amount.0),
-                        amount_out: U128(step_amount.1),
-                        max_amount_in: U128(crate::with_slippage(
-                            step_amount.0,
-                            crate::BASIS_POINTS + slippage_bp,
-                        )),
-                    });
-
-                    current_token = graph.token(hop.token_out).clone();
-                }
-
-                routes_resp.push(ExactOutRoute {
-                    pools: pools_resp,
-                    split_fraction: part.weight_percentage * (FULL_ROUTE_FRACTION.get() / 100),
-                    amount_in: U128(amount_in),
-                    max_amount_in: U128(max_amount_in),
-                    amount_out: U128(amount_out_part),
-                });
-                total_estimated_in = total_estimated_in
-                    .checked_add(amount_in)
-                    .ok_or_else(|| anyhow::anyhow!("Total estimated in overflows u128"))?;
-                total_max_amount_in = total_max_amount_in
-                    .checked_add(max_amount_in)
-                    .ok_or_else(|| anyhow::anyhow!("Total max in overflows u128"))?;
-            }
-            Ok(SplitRouteApiResponse::ExactOut {
-                routes: routes_resp,
-                contract_in: token_in.clone(),
-                contract_out: token_out.clone(),
-                amount_in: U128(total_estimated_in),
-                max_amount_in: U128(total_max_amount_in),
-                amount_out: U128(total_amount_out),
-                discount: U128(0),
-                swap_gas: swap_gas(split_route),
-            })
-        }
+    let gas = SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops;
+    match fee_discount {
+        true => gas + FEE_DISCOUNT_GAS,
+        false => gas,
     }
-}
-
-pub struct Request {
-    pub token_in: AssetId,
-    pub token_out: AssetId,
-    pub amount: QuoteAmount,
-    pub max_hops: MaxHops,
-    /// 0.005 is 0.5%
-    pub slippage: BigDecimal,
-    pub near_price_raw: BigDecimal,
-    pub quoted_token_price_raw: BigDecimal,
-    /// Taken off the pool and protocol fees of every pool by a signed fee discount
-    pub fee_discount: Option<FeeDiscountFraction>,
-    /// The fee discount that the response's `discount` is counted from, on the same route
-    pub discount_counted_from: Option<FeeDiscountFraction>,
-}
-
-pub fn find_path_in(
-    pools: &Pools,
-    request: &Request,
-) -> Result<SplitRouteApiResponse, anyhow::Error> {
-    let slippage_bp = crate::slippage_bp(&request.slippage)?;
-    let graph = &*pools.graph_for(request.fee_discount);
-    let (Some(token_in), Some(token_out)) = (
-        graph.token_index(&request.token_in),
-        graph.token_index(&request.token_out),
-    ) else {
-        anyhow::bail!("No routes found");
-    };
-    let split_route = search::route(
-        graph,
-        token_in,
-        token_out,
-        request.amount,
-        request.max_hops,
-        SETTINGS,
-        crate::gas_cost(
-            HOP_GAS.estimated_burn,
-            &request.near_price_raw,
-            &request.quoted_token_price_raw,
-        )?,
-    )?;
-    let mut response = to_api_response(
-        &split_route,
-        graph,
-        &request.token_in,
-        &request.token_out,
-        request.amount,
-        slippage_bp,
-    )?;
-    if request.fee_discount.is_some() {
-        // Compared to the same route with the discount it's counted from
-        let counted_from = split_route.emulate_total(
-            &pools.graph_for(request.discount_counted_from),
-            request.amount,
-        )?;
-        let (saved, discount, swap_gas) = match &mut response {
-            SplitRouteApiResponse::ExactIn {
-                amount_out,
-                discount,
-                swap_gas,
-                ..
-            } => (amount_out.0.checked_sub(counted_from), discount, swap_gas),
-            SplitRouteApiResponse::ExactOut {
-                amount_in,
-                discount,
-                swap_gas,
-                ..
-            } => (counted_from.checked_sub(amount_in.0), discount, swap_gas),
-        };
-        *discount =
-            U128(saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?);
-        *swap_gas = *swap_gas + FEE_DISCOUNT_GAS;
-    }
-    match &response {
-        SplitRouteApiResponse::ExactIn { amount_out, .. } => info!(
-            "Plach route from {} to {}: {} out, block {}",
-            request.token_in, request.token_out, amount_out.0, pools.block_height
-        ),
-        SplitRouteApiResponse::ExactOut { amount_in, .. } => info!(
-            "Plach route from {} to {}: {} in, block {}",
-            request.token_in, request.token_out, amount_in.0, pools.block_height
-        ),
-    }
-    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::Pool as _;
 
     use xyk_dex_types::{
         AssetWithBalance, FeeAmount, FeeConfigurationV2, FeeFraction, PayoutGroupShares,
@@ -715,6 +433,73 @@ mod tests {
 
     fn fee(amount_in: Balance, fee_fraction: FeeFraction) -> Balance {
         fee_fraction.of(amount(amount_in)).get()
+    }
+
+    /// Swaps that change the pool's own reserves
+    impl Pool {
+        fn swap_exact_in(
+            &mut self,
+            token_in: usize,
+            _token_out: usize,
+            amount_in: Balance,
+        ) -> Option<Balance> {
+            let mut reserves = self.reserves;
+            let (_, amount_out) = self.swap(
+                &mut reserves,
+                AssetIndex::BOTH[token_in],
+                QuoteAmount::ExactIn(amount_in),
+                None,
+            )?;
+            self.reserves = reserves;
+            Some(amount_out)
+        }
+
+        fn swap_exact_out(
+            &mut self,
+            token_in: usize,
+            _token_out: usize,
+            amount_out: Balance,
+        ) -> Option<Balance> {
+            let mut reserves = self.reserves;
+            let (amount_in, _) = self.swap(
+                &mut reserves,
+                AssetIndex::BOTH[token_in],
+                QuoteAmount::ExactOut(amount_out),
+                None,
+            )?;
+            self.reserves = reserves;
+            Some(amount_in)
+        }
+
+        fn quote_exact_in(
+            &self,
+            token_in: usize,
+            _token_out: usize,
+            amount_in: Balance,
+        ) -> Option<Balance> {
+            let (_, amount_out) = self.swap(
+                &mut self.reserves.clone(),
+                AssetIndex::BOTH[token_in],
+                QuoteAmount::ExactIn(amount_in),
+                None,
+            )?;
+            Some(amount_out)
+        }
+
+        fn quote_exact_out(
+            &self,
+            token_in: usize,
+            _token_out: usize,
+            amount_out: Balance,
+        ) -> Option<Balance> {
+            let (amount_in, _) = self.swap(
+                &mut self.reserves.clone(),
+                AssetIndex::BOTH[token_in],
+                QuoteAmount::ExactOut(amount_out),
+                None,
+            )?;
+            Some(amount_in)
+        }
     }
 
     fn reserves(pool: &Pool) -> [Balance; 2] {
@@ -894,55 +679,63 @@ mod tests {
     }
 
     #[test]
-    fn each_fee_discount_gets_its_own_graph_once() {
+    fn swaps_in_the_state_the_aggregator_keeps() {
         let pools = build_pools(PoolsSource {
             block_height: 1,
             timestamp: 0,
             pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
         });
-        let fee_discount = FeeDiscountFraction::new(100_000);
-        assert!(Arc::ptr_eq(&pools.graph_for(None), &pools.graph));
-        let discounted = pools.graph_for(Some(fee_discount));
-        assert!(!Arc::ptr_eq(&discounted, &pools.graph));
-        assert!(Arc::ptr_eq(
-            &discounted,
-            &pools.graph_for(Some(fee_discount))
-        ));
-        assert!(
-            discounted.pools()[0].info.fees
-                == pools.graph.pools()[0]
-                    .info
-                    .fees
-                    .clone()
-                    .discounted(fee_discount)
+        let hook_pools = pools.hook_pools();
+        assert_eq!(
+            hook_pools.pools[0].tokens,
+            [nep141("a.near"), nep141("b.near")]
+        );
+        let mut state = hook_pools.pools[0].state;
+        let amount_in = 10u128.pow(22);
+        let amount_out = pools
+            .swap(0, &mut state, 0, Amount::AmountIn(amount_in), None)
+            .unwrap();
+        let mut pool = private_pool(nep141("a.near"), nep141("b.near"));
+        assert_eq!(pool.swap_exact_in(0, 1, amount_in), Some(amount_out));
+        assert_eq!(state.balances(), reserves(&pool));
+
+        let mut discounted_state = hook_pools.pools[0].state;
+        let discounted_amount_out = pools
+            .swap(
+                0,
+                &mut discounted_state,
+                0,
+                Amount::AmountIn(amount_in),
+                Some(FeeDiscountFraction::new(500_000)),
+            )
+            .unwrap();
+        assert!(discounted_amount_out > amount_out);
+        // Exact out gives the input
+        let mut state = hook_pools.pools[0].state;
+        assert_eq!(
+            pools.swap(0, &mut state, 0, Amount::AmountOut(amount_out), None),
+            Some(amount_in)
         );
     }
 
     #[test]
     fn swap_gas_counts_hops() {
-        let pools = build_pools(PoolsSource {
-            block_height: 1,
-            timestamp: 0,
-            pools: vec![stored_pool(nep141("a.near"), nep141("b.near"))],
-        });
-        let response = find_path_in(
-            &pools,
-            &Request {
-                token_in: nep141("a.near"),
-                token_out: nep141("b.near"),
-                amount: QuoteAmount::ExactIn(10u128.pow(21)),
-                max_hops: MaxHops::Four,
-                slippage: "0.01".parse().unwrap(),
-                near_price_raw: BigDecimal::from(1),
-                quoted_token_price_raw: BigDecimal::from(1),
-                fee_discount: None,
-                discount_counted_from: None,
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            response,
-            SplitRouteApiResponse::ExactIn { swap_gas, .. } if swap_gas == Gas::from_ggas(9_200, 9_200)
-        ));
+        let route = |pool_ids: &[u32]| SwapRoute {
+            fraction: RouteFraction::new(500_000),
+            pool_ids: pool_ids.iter().map(|&id| PoolId::new(id)).collect(),
+        };
+        assert_eq!(
+            swap_gas(&[route(&[1])], false),
+            Gas::from_ggas(9_200, 9_200)
+        );
+        assert_eq!(
+            swap_gas(&[route(&[1])], true),
+            Gas::from_ggas(10_200, 10_200)
+        );
+        // Another route through the same pool costs less than a new pool
+        assert_eq!(
+            swap_gas(&[route(&[1, 2]), route(&[1])], false),
+            Gas::from_ggas(12_000, 12_000)
+        );
     }
 }

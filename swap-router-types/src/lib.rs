@@ -3,11 +3,8 @@ pub mod fee_discount;
 pub mod fees;
 pub mod hook;
 pub mod indexed;
-#[cfg(feature = "hook")]
 pub mod last_look;
 pub mod otc;
-#[cfg(feature = "hook")]
-pub mod tear_holdings;
 pub mod types;
 
 pub use intear_dex_common;

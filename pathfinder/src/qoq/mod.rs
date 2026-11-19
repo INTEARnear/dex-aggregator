@@ -5,34 +5,28 @@ pub use self::storage::watch;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::time::Duration;
 
 use amp_dex_types::math::{RatedPool, SwapAmounts};
 use amp_dex_types::{
-    Amplification, AssetIndex, FULL_ROUTE_FRACTION, FeeDiscountFraction, PoolAssets, PoolId,
-    PoolRateSource, Price, PricesRequest, RouteFraction, SwapFees, SwapRoute, TokenAmount,
+    Amplification, AssetIndex, FeeDiscountFraction, PoolAssets, PoolId, PoolRateSource, Price,
+    PricesRequest, RouteFraction, SwapFees, SwapRoute, TokenAmount,
 };
-use bigdecimal::BigDecimal;
 use intear_dex_common::{AssetId, SwapRequestAmount};
 use near_min_api::types::{Balance, BlockHeight};
 use near_sdk::PublicKeyHandle;
-use swap_router_types::{indexed::AccountState, types::Gas};
+use swap_router_types::{
+    hook::{HookPool, HookPools, HookSwapRoute, OracleFees as HookOracleFees, PoolState},
+    indexed::AccountState,
+    types::{Amount, Gas},
+};
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::intear_dex::{self, OracleFees};
-use crate::search::{self, Graph, MaxHops, QuoteAmount, Settings};
 
 pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
-
-const SETTINGS: Settings = Settings {
-    top_routes: 10,
-    max_splits: 8,
-    allow_unused_input: false,
-    keep_shorter_routes: true,
-};
 
 const SWAP_GAS: Gas = Gas::from_ggas(10_000, 10_000);
 /// Measured as another route through the same pool, a hop through another pool also loads it
@@ -40,124 +34,91 @@ const HOP_GAS: Gas = Gas::from_ggas(5_600, 5_600);
 const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 
 /// A pool of the amp DEX, rated at its fixed price or the median of its oracle's prices
-#[derive(Clone)]
 pub struct Pool {
     id: PoolId,
-    balances: PoolAssets<TokenAmount>,
-    /// What swaps don't change, shared so simulations clone pools without allocating
-    info: Arc<PoolInfo>,
-}
-
-struct PoolInfo {
     tokens: [AssetId; 2],
+    balances: PoolAssets<TokenAmount>,
     decimals: PoolAssets<u8>,
     amplification: Amplification,
     /// Of a whole token of the first asset in the second, which swaps rate the pool at: its fixed
     /// price, or the median of its oracle's prices
     price: Price,
     fees: SwapFees,
+    /// `None` for a pool with a fixed price
+    oracle_key: Option<PublicKeyHandle>,
 }
 
 impl Pool {
-    fn new(
-        id: PoolId,
-        stored: &StoredPool,
-        price: Price,
-        fee_discount: Option<FeeDiscountFraction>,
-    ) -> Self {
-        let fees = SwapFees::of_pool_fee(stored.fee);
+    fn new(id: PoolId, stored: &StoredPool, price: Price) -> Self {
         Self {
             id,
+            tokens: [
+                stored.assets.0.asset_id.clone(),
+                stored.assets.1.asset_id.clone(),
+            ],
             balances: PoolAssets([stored.assets.0.balance, stored.assets.1.balance]),
-            info: Arc::new(PoolInfo {
-                tokens: [
-                    stored.assets.0.asset_id.clone(),
-                    stored.assets.1.asset_id.clone(),
-                ],
-                decimals: PoolAssets([stored.decimals.0, stored.decimals.1]),
-                amplification: stored.amplification,
-                price,
-                fees: match fee_discount {
-                    Some(fee_discount) => fees.discounted(fee_discount),
-                    None => fees,
-                },
-            }),
+            decimals: PoolAssets([stored.decimals.0, stored.decimals.1]),
+            amplification: stored.amplification,
+            price,
+            fees: SwapFees::of_pool_fee(stored.fee),
+            oracle_key: match &stored.rate_source {
+                PoolRateSource::Oracle { key, .. } => Some(key.clone()),
+                PoolRateSource::Fixed(_) => None,
+            },
         }
     }
 
-    /// Swaps the asset at `in_index` like the contract's `swap_in_pool`. `None` for a swap the
-    /// contract fails. The contract pays parts of the pool fee out to providers, converting some
-    /// of them into the other asset, where this leaves all of it in the pool's liquidity, so a
-    /// later swap on the pool in the same simulation is off by a fraction of the fee.
-    fn swap(&mut self, in_index: AssetIndex, amount: SwapRequestAmount) -> Option<SwapAmounts> {
-        if self.balances.0.iter().any(|balance| balance.is_zero()) {
-            return None;
-        }
-        let rated_pool = RatedPool {
-            balances: self.balances,
-            decimals: self.info.decimals,
-            price: self.info.price,
-            amplification: self.info.amplification,
-        };
-        let swap_amounts = rated_pool
-            .swap_amounts(in_index, amount, self.info.fees)
-            .ok()?;
-        let out_index = in_index.other();
-        self.balances[in_index] = self.balances[in_index]
-            .checked_add(swap_amounts.amount_in_after_fees())?
-            .checked_add(swap_amounts.pool_fee)?;
-        self.balances[out_index] = self.balances[out_index].checked_sub(swap_amounts.amount_out)?;
-        Some(swap_amounts)
-    }
-
-    /// Simulations panic on overflows like the contract
-    fn unless_panicked(
-        &mut self,
-        swap: impl FnOnce(&mut Self) -> Option<Balance>,
-    ) -> Option<Balance> {
-        let id = self.id;
-        std::panic::catch_unwind(AssertUnwindSafe(|| swap(self))).unwrap_or_else(|_| {
-            warn!("Panicked while emulating a swap in Qoq pool {id}");
+    /// Swaps the asset at `in_index` like the contract's `swap_in_pool` in the pool with
+    /// `balances`, which it changes like the swap would. `None` for a swap the contract fails. The
+    /// contract pays parts of the pool fee out to providers, converting some of them into the
+    /// other asset, where this leaves all of it in the pool's liquidity, so a later swap on the
+    /// pool in the same simulation is off by a fraction of the fee.
+    fn swap(
+        &self,
+        balances: &mut PoolAssets<TokenAmount>,
+        in_index: AssetIndex,
+        amount: SwapRequestAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<SwapAmounts> {
+        // Simulations panic on overflows like the contract
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.swap_unless_panicked(balances, in_index, amount, fee_discount)
+        }))
+        .unwrap_or_else(|_| {
+            warn!("Panicked while emulating a swap in Qoq pool {}", self.id);
             None
         })
     }
-}
 
-impl search::Pool for Pool {
-    type Token = AssetId;
-
-    fn tokens(&self) -> Vec<AssetId> {
-        self.info.tokens.to_vec()
-    }
-
-    fn swap_exact_in(
-        &mut self,
-        token_in: usize,
-        _token_out: usize,
-        amount_in: Balance,
-    ) -> Option<Balance> {
-        self.unless_panicked(|pool| {
-            let swap_amounts = pool.swap(
-                AssetIndex::BOTH[token_in],
-                SwapRequestAmount::ExactIn(TokenAmount::new(amount_in)),
-            )?;
-            Some(swap_amounts.amount_out.get())
-        })
-    }
-
-    fn swap_exact_out(
-        &mut self,
-        token_in: usize,
-        _token_out: usize,
-        amount_out: Balance,
-    ) -> Option<Balance> {
-        self.unless_panicked(|pool| {
-            let swap_amounts = pool.swap(
-                AssetIndex::BOTH[token_in],
-                SwapRequestAmount::ExactOut(TokenAmount::new(amount_out)),
-            )?;
-            Some(swap_amounts.amount_in.get())
-        })
+    fn swap_unless_panicked(
+        &self,
+        balances: &mut PoolAssets<TokenAmount>,
+        in_index: AssetIndex,
+        amount: SwapRequestAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<SwapAmounts> {
+        if balances.0.iter().any(|balance| balance.is_zero()) {
+            return None;
+        }
+        let rated_pool = RatedPool {
+            balances: *balances,
+            decimals: self.decimals,
+            price: self.price,
+            amplification: self.amplification,
+        };
+        let fees = match fee_discount {
+            Some(fee_discount) => self.fees.discounted(fee_discount),
+            None => self.fees,
+        };
+        let swap_amounts = rated_pool.swap_amounts(in_index, amount, fees).ok()?;
+        let out_index = in_index.other();
+        let mut swapped = *balances;
+        swapped[in_index] = swapped[in_index]
+            .checked_add(swap_amounts.amount_in_after_fees())?
+            .checked_add(swap_amounts.pool_fee)?;
+        swapped[out_index] = swapped[out_index].checked_sub(swap_amounts.amount_out)?;
+        *balances = swapped;
+        Some(swap_amounts)
     }
 }
 
@@ -196,12 +157,6 @@ impl Pools {
         Ok(())
     }
 
-    /// What the oracle takes in `asset_in` for the request that a swap starts with, which the
-    /// engine takes from the swap's input. None if it doesn't take requests paid in `asset_in`.
-    pub fn oracle_fee(&self, oracle_key: &PublicKeyHandle, asset_in: &AssetId) -> Option<u128> {
-        Some(self.oracle_fees.get(oracle_key)?.get(asset_in)?.get())
-    }
-
     /// The assets of each pool, which swaps ask its oracle for the prices of
     pub fn assets(&self) -> Vec<(PoolId, [AssetId; 2])> {
         self.pools
@@ -218,62 +173,11 @@ impl Pools {
             })
             .collect()
     }
-}
 
-/// The medians of an oracle's prices that swaps rate pools at now
-pub struct OraclePrices {
-    pub oracle_key: PublicKeyHandle,
-    /// Of the pools that ask the oracle, of a whole token of their first asset in their second
-    pub of_pools: HashMap<PoolId, Price>,
-}
-
-pub struct Request {
-    pub token_in: AssetId,
-    pub token_out: AssetId,
-    pub amount: QuoteAmount,
-    pub max_hops: MaxHops,
-    /// 0.005 is 0.5%
-    pub slippage: BigDecimal,
-    pub near_price_raw: BigDecimal,
-    pub quoted_token_price_raw: BigDecimal,
-    /// Taken off the pool and protocol fees of every pool by a signed fee discount
-    pub fee_discount: Option<FeeDiscountFraction>,
-    /// The fee discount that the quote's `discount` is counted from, on the same route
-    pub discount_counted_from: Option<FeeDiscountFraction>,
-}
-
-/// What a swap asks the oracle of its pools for before it swaps
-pub struct QuoteOracleRequest {
-    pub oracle_key: PublicKeyHandle,
-    /// As the contract asks for it, of the assets of the pools of the routes that the oracle
-    /// rates, in their order
-    pub prices_request: PricesRequest,
-}
-
-/// A swap on routes of pools that have a fixed price or ask one oracle
-pub struct Quote {
-    pub routes: Vec<SwapRoute>,
-    /// What the swap gives for exact in, or takes for exact out
-    pub estimated_amount: Balance,
-    /// The least it gives, or the most it takes, with the slippage
-    pub worst_case_amount: Balance,
-    /// Added to the output for exact in, or taken off the input for exact out, by the fee
-    /// discount on top of the one it's counted from, 0 without one
-    pub discount: Balance,
-    /// `None` if every pool of the routes has a fixed price
-    pub oracle_request: Option<QuoteOracleRequest>,
-    pub swap_gas: Gas,
-}
-
-/// The pools that have a fixed price or ask the oracle of `oracle_prices`, as a swap with
-/// `fee_discount` goes through them
-fn rated_graph(
-    pools: &Pools,
-    oracle_prices: Option<&OraclePrices>,
-    fee_discount: Option<FeeDiscountFraction>,
-) -> Graph<Pool> {
-    Graph::new(
-        pools
+    /// The pools that have a fixed price or ask the oracle of `oracle_prices`, which only the
+    /// pools with a fixed price are without, at those prices
+    pub fn rated(&self, oracle_prices: Option<&OraclePrices>) -> RatedPools {
+        let pools = self
             .pools
             .iter()
             .enumerate()
@@ -287,130 +191,165 @@ fn rated_graph(
                     }
                     PoolRateSource::Fixed(price) => *price,
                 };
-                Some(Pool::new(id, stored, price, fee_discount))
+                Some(Pool::new(id, stored, price))
             })
-            .collect(),
-    )
+            .collect::<Vec<_>>();
+        let oracle_fees = oracle_prices
+            .filter(|oracle_prices| {
+                pools
+                    .iter()
+                    .any(|pool| pool.oracle_key.as_ref() == Some(&oracle_prices.oracle_key))
+            })
+            .and_then(|oracle_prices| {
+                let fees = self.oracle_fees.get(&oracle_prices.oracle_key)?;
+                Some(HookOracleFees {
+                    oracle_key: oracle_prices.oracle_key.clone(),
+                    fees: fees
+                        .iter()
+                        .map(|(asset_id, fee)| (asset_id.clone(), fee.get().into()))
+                        .collect(),
+                })
+            });
+        RatedPools {
+            pools,
+            oracle_fees: oracle_fees.into_iter().collect(),
+        }
+    }
 }
 
-/// The best route through the pools that have a fixed price or ask the oracle of `oracle_prices`,
-/// which only the pools with a fixed price are without
-pub fn find_path_in(
-    pools: &Pools,
-    oracle_prices: Option<&OraclePrices>,
-    request: &Request,
-) -> Result<Quote, anyhow::Error> {
-    let slippage_bp = crate::slippage_bp(&request.slippage)?;
-    let graph = rated_graph(pools, oracle_prices, request.fee_discount);
-    let (Some(token_in), Some(token_out)) = (
-        graph.token_index(&request.token_in),
-        graph.token_index(&request.token_out),
-    ) else {
-        anyhow::bail!("No routes found");
-    };
-    let split_route = search::route(
-        &graph,
-        token_in,
-        token_out,
-        request.amount,
-        request.max_hops,
-        SETTINGS,
-        crate::gas_cost(
-            HOP_GAS.estimated_burn,
-            &request.near_price_raw,
-            &request.quoted_token_price_raw,
-        )?,
-    )?;
-    let estimated_amount = split_route.emulate_total(&graph, request.amount)?;
-    let swap_gas = SWAP_GAS + HOP_GAS * split_route.hops() as u64;
-    let (discount, swap_gas) = match request.fee_discount {
-        Some(_) => {
-            // Compared to the same route with the discount it's counted from
-            let counted_from = split_route.emulate_total(
-                &rated_graph(pools, oracle_prices, request.discount_counted_from),
-                request.amount,
-            )?;
-            let saved = match request.amount {
-                QuoteAmount::ExactIn(_) => estimated_amount.checked_sub(counted_from),
-                QuoteAmount::ExactOut(_) => counted_from.checked_sub(estimated_amount),
-            };
-            (
-                saved.ok_or_else(|| anyhow::anyhow!("Fee discount made the route worse"))?,
-                swap_gas + FEE_DISCOUNT_GAS,
-            )
+/// The medians of an oracle's prices that swaps rate pools at now
+pub struct OraclePrices {
+    pub oracle_key: PublicKeyHandle,
+    /// Of the pools that ask the oracle, of a whole token of their first asset in their second
+    pub of_pools: HashMap<PoolId, Price>,
+}
+
+/// Pools at the prices that swaps rate them at
+pub struct RatedPools {
+    pools: Vec<Pool>,
+    oracle_fees: Vec<HookOracleFees>,
+}
+
+impl RatedPools {
+    /// The pools, which routes refer to by their position here
+    pub fn hook_pools(&self) -> HookPools {
+        HookPools {
+            pools: self
+                .pools
+                .iter()
+                .map(|pool| HookPool {
+                    tokens: pool.tokens.clone(),
+                    state: PoolState::of_balances(pool.balances.0.map(TokenAmount::get)),
+                    hop_gas: HOP_GAS.estimated_burn,
+                    oracle_key: pool.oracle_key.clone(),
+                })
+                .collect(),
+            oracle_fees: self.oracle_fees.clone(),
         }
-        None => (0, swap_gas),
-    };
-    let worst_case_amount = match request.amount {
-        QuoteAmount::ExactIn(_) => {
-            crate::with_slippage(estimated_amount, crate::BASIS_POINTS - slippage_bp)
-        }
-        QuoteAmount::ExactOut(_) => {
-            crate::with_slippage(estimated_amount, crate::BASIS_POINTS + slippage_bp)
-        }
-    };
-    let route_pools = |part: &search::SplitRoutePart| {
-        part.route
-            .hops
+    }
+
+    /// Swaps in the pool at `pool` of [`RatedPools::hook_pools`], whose balances are in `state`
+    pub fn swap(
+        &self,
+        pool: u32,
+        state: &mut PoolState,
+        token_in: usize,
+        amount: Amount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<Balance> {
+        let pool = &self.pools[pool as usize];
+        let mut balances = PoolAssets(state.balances().map(TokenAmount::new));
+        let swap_amounts = pool.swap(
+            &mut balances,
+            AssetIndex::BOTH[token_in],
+            match amount {
+                Amount::AmountIn(amount_in) => {
+                    SwapRequestAmount::ExactIn(TokenAmount::new(amount_in))
+                }
+                Amount::AmountOut(amount_out) => {
+                    SwapRequestAmount::ExactOut(TokenAmount::new(amount_out))
+                }
+            },
+            fee_discount,
+        )?;
+        *state = PoolState::of_balances(balances.0.map(TokenAmount::get));
+        Some(match amount {
+            Amount::AmountIn(_) => swap_amounts.amount_out.get(),
+            Amount::AmountOut(_) => swap_amounts.amount_in.get(),
+        })
+    }
+
+    fn pools_of(&self, routes: &[HookSwapRoute]) -> Result<Vec<Vec<&Pool>>, String> {
+        routes
             .iter()
-            .map(|hop| &graph.pools()[hop.pool])
-            .collect::<Vec<_>>()
-    };
-    let routes = split_route
-        .parts
-        .iter()
-        .map(|part| SwapRoute {
-            fraction: RouteFraction::new(
-                part.weight_percentage * (FULL_ROUTE_FRACTION.get() / 100),
-            ),
-            pool_ids: route_pools(part).iter().map(|pool| pool.id).collect(),
-        })
-        .collect();
-    let oracle_rated_route_pools = split_route
-        .parts
-        .iter()
-        .flat_map(route_pools)
-        .filter(|pool| {
-            matches!(
-                pools.pools[pool.id.get() as usize].rate_source,
-                PoolRateSource::Oracle { .. }
-            )
-        })
-        .collect::<Vec<_>>();
-    let oracle_request = match oracle_prices {
-        Some(oracle_prices) if !oracle_rated_route_pools.is_empty() => Some(QuoteOracleRequest {
-            oracle_key: oracle_prices.oracle_key.clone(),
-            prices_request: PricesRequest::of_pools(
-                oracle_rated_route_pools
+            .map(|route| {
+                route
+                    .pools
                     .iter()
-                    .map(|pool| (&pool.info.tokens[0], &pool.info.tokens[1])),
-            ),
-        }),
-        _ => None,
-    };
-    info!(
-        "Qoq route from {} to {}: {estimated_amount} {}, block {}",
-        request.token_in,
-        request.token_out,
-        match request.amount {
-            QuoteAmount::ExactIn(_) => "out",
-            QuoteAmount::ExactOut(_) => "in",
-        },
-        pools.block_height
-    );
-    Ok(Quote {
-        routes,
-        estimated_amount,
-        worst_case_amount,
-        discount,
-        oracle_request,
-        swap_gas,
-    })
+                    .map(|&pool| {
+                        self.pools
+                            .get(pool as usize)
+                            .ok_or_else(|| format!("No pool {pool} in the snapshot"))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The routes of a swap through pools by their position in [`RatedPools::hook_pools`]
+    pub fn swap_routes(&self, routes: &[HookSwapRoute]) -> Result<Vec<SwapRoute>, String> {
+        Ok(self
+            .pools_of(routes)?
+            .into_iter()
+            .zip(routes)
+            .map(|(pools, route)| SwapRoute {
+                fraction: RouteFraction::new(route.fraction),
+                pool_ids: pools.iter().map(|pool| pool.id).collect(),
+            })
+            .collect())
+    }
+
+    /// What a swap on `routes` asks their oracle for before it swaps: the prices of the assets
+    /// of the pools that the oracle rates, in their order. `None` if every pool of the routes has
+    /// a fixed price.
+    pub fn prices_request(
+        &self,
+        routes: &[HookSwapRoute],
+    ) -> Result<Option<PricesRequest>, String> {
+        let oracle_rated_pools = self
+            .pools_of(routes)?
+            .into_iter()
+            .flatten()
+            .filter(|pool| pool.oracle_key.is_some())
+            .collect::<Vec<_>>();
+        Ok((!oracle_rated_pools.is_empty()).then(|| {
+            PricesRequest::of_pools(
+                oracle_rated_pools
+                    .iter()
+                    .map(|pool| (&pool.tokens[0], &pool.tokens[1])),
+            )
+        }))
+    }
+}
+
+/// What a swap on `routes` burns, more with a fee discount
+pub fn swap_gas(routes: &[SwapRoute], fee_discount: bool) -> Gas {
+    let hops = routes
+        .iter()
+        .map(|route| route.pool_ids.len())
+        .sum::<usize>();
+    let gas = SWAP_GAS + HOP_GAS * hops as u64;
+    match fee_discount {
+        true => gas + FEE_DISCOUNT_GAS,
+        false => gas,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use amp_dex_types::{AssetWithBalance, FeeFraction, PayoutGroups, TotalShares};
+    use amp_dex_types::{
+        AssetWithBalance, FULL_ROUTE_FRACTION, FeeFraction, PayoutGroups, TotalShares,
+    };
 
     use super::*;
 
@@ -508,20 +447,6 @@ mod tests {
         }
     }
 
-    fn request(amount: QuoteAmount) -> Request {
-        Request {
-            token_in: near(),
-            token_out: xaut(),
-            amount,
-            max_hops: MaxHops::Four,
-            slippage: "0.01".parse().unwrap(),
-            near_price_raw: "0.000000000000000000000002".parse().unwrap(),
-            quoted_token_price_raw: "0.004".parse().unwrap(),
-            fee_discount: None,
-            discount_counted_from: None,
-        }
-    }
-
     /// What the contract swaps in pool `pool_id` of `pools` at the price of [`oracle_prices`]
     fn contract_swap(
         pools: &Pools,
@@ -545,116 +470,112 @@ mod tests {
         .unwrap()
     }
 
+    fn route(pools: &[u32]) -> HookSwapRoute {
+        HookSwapRoute {
+            fraction: FULL_ROUTE_FRACTION.get(),
+            pools: pools.to_vec(),
+        }
+    }
+
     #[test]
-    fn routes_only_through_the_pools_of_the_oracle() {
-        let near_in = 10u128.pow(26);
-        let quote = find_path_in(
-            &pools(),
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactIn(near_in)),
-        )
-        .unwrap();
-        let [route] = quote.routes.as_slice() else {
-            panic!("Not one route");
+    fn rates_only_the_pools_of_the_oracle() {
+        let rated = pools().rated(Some(&oracle_prices()));
+        let hook_pools = rated.hook_pools();
+        // NEAR/XAUT asks another oracle
+        assert_eq!(
+            hook_pools
+                .pools
+                .iter()
+                .map(|pool| pool.tokens.clone())
+                .collect::<Vec<_>>(),
+            vec![[near(), usdc()], [usdc(), xaut()]]
+        );
+        let oracle_key: PublicKeyHandle = ORACLE_KEY.parse().unwrap();
+        assert!(
+            hook_pools
+                .pools
+                .iter()
+                .all(|pool| pool.oracle_key.as_ref() == Some(&oracle_key))
+        );
+        // The oracle takes its fee in the assets it set it in
+        let [oracle_fees] = hook_pools.oracle_fees.as_slice() else {
+            panic!("Not the fees of one oracle");
         };
-        assert_eq!(route.fraction, FULL_ROUTE_FRACTION);
-        assert_eq!(route.pool_ids, vec![PoolId::new(0), PoolId::new(1)]);
-        let usdc_between = contract_swap(
-            &pools(),
+        assert_eq!(oracle_fees.oracle_key, oracle_key);
+        assert_eq!(oracle_fees.fees[&near()], 10u128.pow(21).into());
+        assert_eq!(oracle_fees.fees[&usdc()], 3_000.into());
+        assert!(!oracle_fees.fees.contains_key(&xaut()));
+    }
+
+    #[test]
+    fn swaps_like_the_contract_in_the_state_the_aggregator_keeps() {
+        let pools = pools();
+        let rated = pools.rated(Some(&oracle_prices()));
+        let near_in = 10u128.pow(26);
+        let mut state = rated.hook_pools().pools[0].state;
+        let usdc_out = rated
+            .swap(0, &mut state, 0, Amount::AmountIn(near_in), None)
+            .unwrap();
+        let contract = contract_swap(
+            &pools,
             0,
             SwapRequestAmount::ExactIn(TokenAmount::new(near_in)),
             None,
         );
-        let xaut_out = contract_swap(
-            &pools(),
-            1,
-            SwapRequestAmount::ExactIn(usdc_between.amount_out),
-            None,
-        );
-        assert_eq!(quote.estimated_amount, xaut_out.amount_out.get());
-        assert_eq!(quote.worst_case_amount, quote.estimated_amount * 99 / 100);
-        let oracle_request = quote.oracle_request.unwrap();
-        assert_eq!(oracle_request.oracle_key, oracle_prices().oracle_key);
-        // One request of the prices of every asset of the route
+        assert_eq!(usdc_out, contract.amount_out.get());
+        let [near_balance, usdc_balance] = state.balances();
         assert_eq!(
-            oracle_request.prices_request.asset_ids,
-            vec![near(), usdc(), xaut()]
+            near_balance,
+            10u128.pow(30) + contract.amount_in_after_fees().get() + contract.pool_fee.get()
         );
-        assert_eq!(quote.swap_gas, SWAP_GAS + HOP_GAS * 2);
-    }
+        assert_eq!(usdc_balance, 2_400_000 * 10u128.pow(6) - usdc_out);
 
-    #[test]
-    fn exact_out_takes_what_each_pool_needs_from_the_last_back() {
-        let xaut_out = 10u128.pow(6) / 100;
-        let quote = find_path_in(
-            &pools(),
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactOut(xaut_out)),
-        )
-        .unwrap();
-        let usdc_between = contract_swap(
-            &pools(),
-            1,
-            SwapRequestAmount::ExactOut(TokenAmount::new(xaut_out)),
-            None,
-        );
-        let near_in = contract_swap(
-            &pools(),
-            0,
-            SwapRequestAmount::ExactOut(usdc_between.amount_in),
-            None,
-        );
-        assert_eq!(quote.estimated_amount, near_in.amount_in.get());
-        assert_eq!(quote.worst_case_amount, quote.estimated_amount * 101 / 100);
-    }
-
-    #[test]
-    fn oracles_take_their_fee_in_the_assets_they_set_it_in() {
-        let pools = pools();
-        let oracle_key = ORACLE_KEY.parse().unwrap();
-        assert_eq!(pools.oracle_fee(&oracle_key, &near()), Some(10u128.pow(21)));
-        assert_eq!(pools.oracle_fee(&oracle_key, &usdc()), Some(3_000));
-        assert_eq!(pools.oracle_fee(&oracle_key, &xaut()), None);
+        let usdc_wanted = 10u128.pow(6) * 100;
+        let mut state = rated.hook_pools().pools[0].state;
         assert_eq!(
-            pools.oracle_fee(&OTHER_ORACLE_KEY.parse().unwrap(), &near()),
-            None
+            rated.swap(0, &mut state, 0, Amount::AmountOut(usdc_wanted), None),
+            Some(
+                contract_swap(
+                    &pools,
+                    0,
+                    SwapRequestAmount::ExactOut(TokenAmount::new(usdc_wanted)),
+                    None
+                )
+                .amount_in
+                .get()
+            )
         );
     }
 
     #[test]
     fn fee_discount_takes_off_pool_and_protocol_fees() {
+        let pools = pools();
+        let rated = pools.rated(Some(&oracle_prices()));
         let near_in = 10u128.pow(26);
         let fee_discount = FeeDiscountFraction::new(250_000);
-        let quote = |fee_discount| {
-            find_path_in(
-                &pools(),
-                Some(&oracle_prices()),
-                &Request {
-                    token_out: usdc(),
-                    fee_discount,
-                    ..request(QuoteAmount::ExactIn(near_in))
-                },
+        let mut state = rated.hook_pools().pools[0].state;
+        let discounted = rated
+            .swap(
+                0,
+                &mut state,
+                0,
+                Amount::AmountIn(near_in),
+                Some(fee_discount),
             )
-            .unwrap()
-        };
-        let discounted = quote(Some(fee_discount));
-        let undiscounted = quote(None);
-        let usdc_out = contract_swap(
-            &pools(),
+            .unwrap();
+        let contract = contract_swap(
+            &pools,
             0,
             SwapRequestAmount::ExactIn(TokenAmount::new(near_in)),
             Some(fee_discount),
         );
-        assert_eq!(discounted.estimated_amount, usdc_out.amount_out.get());
-        assert_eq!(undiscounted.discount, 0);
-        assert_eq!(
-            discounted.discount,
-            discounted.estimated_amount - undiscounted.estimated_amount
-        );
-        assert!(discounted.discount > 0);
-        assert_eq!(
-            discounted.swap_gas,
-            undiscounted.swap_gas + FEE_DISCOUNT_GAS
+        assert_eq!(discounted, contract.amount_out.get());
+        let mut state = rated.hook_pools().pools[0].state;
+        assert!(
+            rated
+                .swap(0, &mut state, 0, Amount::AmountIn(near_in), None)
+                .unwrap()
+                < discounted
         );
     }
 
@@ -662,14 +583,13 @@ mod tests {
     fn pools_without_a_price_are_left_out() {
         let mut oracle_prices = oracle_prices();
         oracle_prices.of_pools.remove(&PoolId::new(1));
-        assert!(
-            find_path_in(
-                &pools(),
-                Some(&oracle_prices),
-                &request(QuoteAmount::ExactIn(10u128.pow(26)))
-            )
-            .is_err()
-        );
+        let hook_pools = pools().rated(Some(&oracle_prices)).hook_pools();
+        assert_eq!(hook_pools.pools.len(), 1);
+        assert_eq!(hook_pools.pools[0].tokens, [near(), usdc()]);
+        // Without the oracle's prices, neither it nor its fees
+        let hook_pools = pools().rated(None).hook_pools();
+        assert!(hook_pools.pools.is_empty());
+        assert!(hook_pools.oracle_fees.is_empty());
     }
 
     /// [`pools`] with the USDC/XAUT pool at a fixed price, the one that the oracle has for it
@@ -682,68 +602,45 @@ mod tests {
 
     #[test]
     fn asks_the_oracle_only_for_the_pools_it_rates() {
-        let with_a_fixed_price = pools_with_a_fixed_price();
-        let near_in = 10u128.pow(26);
-        let quote = find_path_in(
-            &with_a_fixed_price,
-            Some(&oracle_prices()),
-            &request(QuoteAmount::ExactIn(near_in)),
-        )
-        .unwrap();
+        let rated = pools_with_a_fixed_price().rated(Some(&oracle_prices()));
+        let request = rated.prices_request(&[route(&[0, 1])]).unwrap().unwrap();
+        assert_eq!(request.asset_ids, vec![near(), usdc()]);
+        assert_eq!(rated.prices_request(&[route(&[1])]).unwrap(), None);
+        assert!(rated.prices_request(&[route(&[2])]).is_err());
         assert_eq!(
-            quote.routes[0].pool_ids,
-            vec![PoolId::new(0), PoolId::new(1)]
-        );
-        let usdc_between = contract_swap(
-            &with_a_fixed_price,
-            0,
-            SwapRequestAmount::ExactIn(TokenAmount::new(near_in)),
-            None,
-        );
-        let xaut_out = contract_swap(
-            &with_a_fixed_price,
-            1,
-            SwapRequestAmount::ExactIn(usdc_between.amount_out),
-            None,
-        );
-        assert_eq!(quote.estimated_amount, xaut_out.amount_out.get());
-        let oracle_request = quote.oracle_request.unwrap();
-        assert_eq!(oracle_request.oracle_key, oracle_prices().oracle_key);
-        assert_eq!(
-            oracle_request.prices_request.asset_ids,
-            vec![near(), usdc()]
+            rated.swap_routes(&[route(&[0, 1])]).unwrap(),
+            vec![SwapRoute {
+                fraction: FULL_ROUTE_FRACTION,
+                pool_ids: vec![PoolId::new(0), PoolId::new(1)],
+            }]
         );
     }
 
     #[test]
     fn pools_with_a_fixed_price_need_no_oracle() {
-        let with_a_fixed_price = pools_with_a_fixed_price();
-        let usdc_in = 1_000 * 10u128.pow(6);
-        let usdc_to_xaut = Request {
-            token_in: usdc(),
-            ..request(QuoteAmount::ExactIn(usdc_in))
-        };
-        let xaut_out = contract_swap(
-            &with_a_fixed_price,
-            1,
-            SwapRequestAmount::ExactIn(TokenAmount::new(usdc_in)),
-            None,
-        );
-        for oracle_prices in [None, Some(oracle_prices())] {
-            let quote =
-                find_path_in(&with_a_fixed_price, oracle_prices.as_ref(), &usdc_to_xaut).unwrap();
-            assert_eq!(quote.routes[0].pool_ids, vec![PoolId::new(1)]);
-            assert_eq!(quote.estimated_amount, xaut_out.amount_out.get());
-            assert!(quote.oracle_request.is_none());
-        }
-        // The pools that an oracle rates are left out without its prices
-        assert!(
-            find_path_in(
-                &with_a_fixed_price,
-                None,
-                &request(QuoteAmount::ExactIn(10u128.pow(26)))
-            )
-            .is_err()
+        let hook_pools = pools_with_a_fixed_price().rated(None).hook_pools();
+        assert_eq!(hook_pools.pools.len(), 1);
+        assert_eq!(hook_pools.pools[0].tokens, [usdc(), xaut()]);
+        assert_eq!(hook_pools.pools[0].oracle_key, None);
+        assert!(hook_pools.oracle_fees.is_empty());
+    }
+
+    #[test]
+    fn swap_gas_counts_hops() {
+        let routes = [
+            SwapRoute {
+                fraction: RouteFraction::new(500_000),
+                pool_ids: vec![PoolId::new(0), PoolId::new(1)],
+            },
+            SwapRoute {
+                fraction: RouteFraction::new(500_000),
+                pool_ids: vec![PoolId::new(1)],
+            },
+        ];
+        assert_eq!(swap_gas(&routes, false), SWAP_GAS + HOP_GAS * 3);
+        assert_eq!(
+            swap_gas(&routes, true),
+            SWAP_GAS + HOP_GAS * 3 + FEE_DISCOUNT_GAS
         );
     }
 }
