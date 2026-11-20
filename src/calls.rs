@@ -1,7 +1,7 @@
 use intear_dex_common::{AssetId, DexId, SwapRequestAmount, TokenAmount};
 use intear_dex_types::{
-    DirectWithdrawAmount, Operation, QuoteImprovementFee, SwapAdvancedMode, SwapOperationAmount,
-    SwapOption, WithdrawAmount,
+    DirectWithdrawAmount, Operation, OracleFeeSwap, QuoteImprovementFee, SwapAdvancedMode,
+    SwapOperationAmount, SwapOption, WithdrawAmount,
 };
 use near_min_api::types::{
     near_account_id::AccountType, AccountId, Action, Balance, FunctionCallAction, NearGas,
@@ -299,6 +299,9 @@ const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(7_400, 14_700);
 /// What Intear DEX attaches to the last call after the operations of a deposit that waited for
 /// an oracle, which keeps the deposit if refunding it failed. It burnt 2 Tgas in sandbox.
 const HELD_DEPOSIT_GAS: Gas = Gas::from_ggas(2_000, 10_000);
+/// What Intear DEX attaches on top of that to refund an oracle's fee that a swap of a deposit
+/// bought, which only burns when the oracle doesn't respond
+const SWAPPED_ORACLE_FEE_REFUND_GAS: Gas = Gas::from_ggas(0, 15_000);
 /// Under what a transaction can attach, with room for the other calls in it
 const MAX_CALL_GAS: NearGas = NearGas::from_tgas(900);
 
@@ -777,8 +780,11 @@ impl IntearDexOperations {
                     + intear_dex_sending_out_gas(&withdrawal.asset, self.trader_account_id.as_ref())
             })
             .sum::<Gas>();
-        let oracle_request_gas = match self.swap.oracle_request {
-            Some(_) => ORACLE_REQUEST_GAS,
+        let oracle_request_gas = match &self.swap.oracle_request {
+            Some(oracle_request) => match &oracle_request.request.fee_swap {
+                Some(fee_swap) => ORACLE_REQUEST_GAS + fee_swap.gas,
+                None => ORACLE_REQUEST_GAS,
+            },
             None => Gas::from_ggas(0, 0),
         };
         let fee_receiver_count =
@@ -792,8 +798,11 @@ impl IntearDexOperations {
 
     /// Of the operations of a deposit, which Intear DEX holds while they wait for an oracle
     fn gas_with_deposit(&self) -> Gas {
-        match self.swap.oracle_request {
-            Some(_) => self.gas() + HELD_DEPOSIT_GAS,
+        match &self.swap.oracle_request {
+            Some(oracle_request) => match oracle_request.request.fee_swap {
+                Some(_) => self.gas() + HELD_DEPOSIT_GAS + SWAPPED_ORACLE_FEE_REFUND_GAS,
+                None => self.gas() + HELD_DEPOSIT_GAS,
+            },
             None => self.gas(),
         }
     }
@@ -869,18 +878,37 @@ impl IntearDexOperations {
                 to: None,
                 rescue_address: None,
             });
-        let oracle_request =
-            swap.oracle_request
-                .iter()
-                .map(|oracle_request| Operation::OracleRequest {
-                    oracle_key: oracle_request.request.oracle_key.clone(),
-                    dex_id: oracle_request.dex_id.clone(),
-                    request: oracle_request.request.request.clone(),
-                    fee: (
-                        AssetId::from(swap.asset_in()),
-                        TokenAmount::new(oracle_request.request.fee.0),
-                    ),
-                });
+        let oracle_request = swap.oracle_request.iter().map(|oracle_request| {
+            let OracleRequest {
+                oracle_key,
+                request,
+                fee,
+                fee_swap,
+            } = &oracle_request.request;
+            let asset_in = AssetId::from(swap.asset_in());
+            let (fee, swap) = match fee_swap {
+                Some(fee_swap) => {
+                    let (fee_asset, oracle_fee) = &fee_swap.fee;
+                    (
+                        (fee_asset.clone(), TokenAmount::new(oracle_fee.0)),
+                        Some(OracleFeeSwap {
+                            dex_id: fee_swap.dex_id.clone(),
+                            message: fee_swap.message.clone(),
+                            asset_in,
+                            constraint: Some(TokenAmount::new(fee.0)),
+                        }),
+                    )
+                }
+                None => ((asset_in, TokenAmount::new(fee.0)), None),
+            };
+            Operation::OracleRequest {
+                oracle_key: oracle_key.clone(),
+                dex_id: oracle_request.dex_id.clone(),
+                request: request.clone(),
+                fee,
+                swap,
+            }
+        });
         let operations = oracle_request
             .chain(swap_operations)
             .chain(withdrawals)

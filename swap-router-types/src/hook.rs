@@ -98,9 +98,25 @@ pub struct HookQuote {
 pub struct OracleRequest {
     pub oracle_key: PublicKeyHandle,
     pub request: Base64VecU8,
-    /// What the oracle takes for the request in the trade's asset in, which the engine takes from
-    /// the input before the swap. The quote is of a trade after it.
+    /// What the request costs in the trade's asset in, which the engine takes from the input
+    /// before the swap: the oracle's fee, or the most that `fee_swap` swaps for it. The quote is
+    /// of a trade after it.
     pub fee: U128,
+    /// The swap of the trade's asset in that buys the oracle's fee, when the oracle doesn't take
+    /// its fee in it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_swap: Option<OracleFeeSwap>,
+}
+
+/// A swap on `dex_id` that buys exactly the fee of an oracle with the trade's asset in
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OracleFeeSwap {
+    pub dex_id: DexId,
+    /// The swap's message to the DEX
+    pub message: Base64VecU8,
+    pub gas: Gas,
+    /// The asset that the oracle takes its fee in, and what it takes
+    pub fee: (AssetId, U128),
 }
 
 /// Bytes of the state of a pool that its swaps change. The aggregator keeps a copy of it for each

@@ -48,7 +48,7 @@ use crate::{
     stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
         Amount, CostPrices, DexId, OutcomeRequest, Quote, Route, SigningContext, Slippage,
-        SwapOutcome, SwapRequest,
+        SwapOutcome, SwapRequest, TokenId,
     },
 };
 
@@ -484,6 +484,7 @@ async fn pool_routes(
             trade: trade.clone(),
             block_height,
             prices,
+            asset_in_prices: cost_prices_of(&request.token_in),
             last_look,
             tear_fee_discount,
         },
@@ -632,10 +633,14 @@ fn sort_quotes(request: &SwapRequest, quotes: &mut [Quote]) {
 
 /// Costs are in NEAR, the amounts in the token whose amount is quoted
 fn cost_prices(request: &SwapRequest) -> Option<CostPrices> {
-    let quoted_token = match request.amount {
+    cost_prices_of(match request.amount {
         Amount::AmountIn(_) => &request.token_out,
         Amount::AmountOut(_) => &request.token_in,
-    };
+    })
+}
+
+/// Costs are in NEAR, the amounts in `quoted_token`
+fn cost_prices_of(quoted_token: &TokenId) -> Option<CostPrices> {
     let (near_price_raw, quoted_token_price_raw) = price_raw(&Mainnet, &BaseTokenId::Near)
         .zip(price_raw(&Mainnet, &base_token(quoted_token)))?;
     Some(CostPrices {

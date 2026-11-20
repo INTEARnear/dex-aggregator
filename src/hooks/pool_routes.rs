@@ -12,8 +12,8 @@ use pathfinder::{
 };
 use swap_router_types::{
     hook::{
-        HookQuote, HookSwap, HookSwapRequest, HookSwapRoute, IntearDexTrade, OracleRequest,
-        HOOK_ANSWER_TIMEOUT,
+        HookQuote, HookSwap, HookSwapRequest, HookSwapRoute, IntearDexTrade, OracleFeeSwap,
+        OracleFees, OracleRequest, HOOK_ANSWER_TIMEOUT,
     },
     last_look::{with_tear_fee_discount, LastLook, SwapEstimate},
     types::{CostPrices, Gas},
@@ -48,6 +48,9 @@ pub struct PoolRoutesRequest {
     pub block_height: BlockHeight,
     /// Of the NEAR that hops cost and of the quoted token
     pub prices: CostPrices,
+    /// The same with the trade's asset in, which swaps that buy an oracle's fee are quoted in.
+    /// None for no such swaps.
+    pub asset_in_prices: Option<CostPrices>,
     /// None for no last look discount
     pub last_look: Option<LastLook>,
     pub tear_fee_discount: Option<FeeDiscountFraction>,
@@ -88,7 +91,7 @@ pub async fn find_in_background(
 
 /// Routes through the pools of the hook of `snapshot`, an index in [`RoutingPools::snapshots`],
 /// or of every hook: the best one through pools that ask no oracle, and the best one through the
-/// pools of each oracle that takes its fee in the asset in
+/// pools of each oracle, which the route pays in the asset in or in what a swap of it buys
 pub fn find(
     pools: &RoutingPools,
     snapshot: Option<usize>,
@@ -99,15 +102,17 @@ pub fn find(
         oracle_key: None,
     };
     let with_oracles = pools
-        .oracle_fees_in(snapshot, &request.trade.asset_in)
+        .oracle_fees(snapshot)
         .into_iter()
-        .filter_map(|(oracle_key, oracle_fee)| {
-            let trade = trade_after_oracle_fee(&request.request, &request.trade, oracle_fee)?;
+        .filter_map(|oracle_fees| {
+            let payment = oracle_fee_payment(pools, oracle_fees, request)?;
+            let trade = trade_after_oracle_fee(&request.request, &request.trade, payment.cost)?;
+            let oracle_key = oracle_fees.oracle_key.clone();
             let scope = PoolsScope {
                 snapshot,
                 oracle_key: Some(oracle_key.clone()),
             };
-            Some((scope, trade, Some((oracle_key, oracle_fee))))
+            Some((scope, trade, Some((oracle_key, payment))))
         });
     let mut routes = PoolRoutes::default();
     for (scope, trade, oracle) in [(without_oracle, request.trade.clone(), None)]
@@ -158,6 +163,82 @@ pub fn find(
     routes
 }
 
+/// How a route pays an oracle: with `cost` of the trade's asset in, the oracle's fee or the most
+/// that `swap` swaps to buy it
+struct OracleFeePayment {
+    cost: Balance,
+    swap: Option<OracleFeeSwap>,
+}
+
+/// How a route pays the oracle that takes `oracle_fees`: in the trade's asset in, or with the swap
+/// of it that buys one of its fees for the least, with the gas of the swap. A fee in NEAR is
+/// bought when the oracle takes one, since the engine refunds a bought fee when the oracle doesn't
+/// respond, and a refund of a NEP-141 to a trader without its storage is lost. None if it can't.
+fn oracle_fee_payment(
+    pools: &RoutingPools,
+    oracle_fees: &OracleFees,
+    request: &PoolRoutesRequest,
+) -> Option<OracleFeePayment> {
+    if let Some(fee) = oracle_fees.fees.get(&request.trade.asset_in) {
+        return Some(OracleFeePayment {
+            cost: fee.0,
+            swap: None,
+        });
+    }
+    let prices = request.asset_in_prices.as_ref()?;
+    let takes_near = oracle_fees.fees.contains_key(&AssetId::Near);
+    oracle_fees
+        .fees
+        .iter()
+        .filter(|(fee_asset, _)| !takes_near || **fee_asset == AssetId::Near)
+        .filter_map(|(fee_asset, fee)| {
+            let fee_request = PoolRoutesRequest {
+                request: request.request.clone(),
+                trade: IntearDexTrade {
+                    asset_out: fee_asset.clone(),
+                    amount: Amount::AmountOut(fee.0),
+                    ..request.trade.clone()
+                },
+                block_height: request.block_height,
+                prices: prices.clone(),
+                asset_in_prices: None,
+                last_look: None,
+                tear_fee_discount: None,
+            };
+            let all_pools_without_oracles = PoolsScope {
+                snapshot: None,
+                oracle_key: None,
+            };
+            let route = found_route(
+                pools,
+                &all_pools_without_oracles,
+                &fee_request.trade,
+                None,
+                &fee_request,
+            )?;
+            // Exact-out routes are through one hook
+            let [(_, _, swap)] = <[_; 1]>::try_from(route.swaps).ok()?;
+            let gas_cost = pathfinder::gas_cost(
+                swap.gas.estimated_burn,
+                &prices.near_price_raw,
+                &prices.quoted_token_price_raw,
+            )
+            .ok()?;
+            let payment = OracleFeePayment {
+                cost: route.worst_case_amount,
+                swap: Some(OracleFeeSwap {
+                    dex_id: swap.dex_id,
+                    message: swap.message,
+                    gas: swap.gas,
+                    fee: (fee_asset.clone(), *fee),
+                }),
+            };
+            Some((route.worst_case_amount + gas_cost, payment))
+        })
+        .min_by_key(|(cost_with_gas, _)| *cost_with_gas)
+        .map(|(_, payment)| payment)
+}
+
 /// A route through pools, as the swaps of its steps on their DEXes
 struct FoundRoute {
     /// Of the asset in and out of each step
@@ -170,12 +251,12 @@ struct FoundRoute {
     oracle_request: Option<(OracleRequest, intear_dex_common::DexId)>,
 }
 
-/// The best route through the pools of `scope` for `trade`, which is after the fee of `oracle`
+/// The best route through the pools of `scope` for `trade`, which is after paying `oracle`
 fn found_route(
     pools: &RoutingPools,
     scope: &PoolsScope,
     trade: &IntearDexTrade,
-    oracle: Option<(PublicKeyHandle, u128)>,
+    oracle: Option<(PublicKeyHandle, OracleFeePayment)>,
     request: &PoolRoutesRequest,
 ) -> Option<FoundRoute> {
     let amount = match trade.amount {
@@ -198,16 +279,21 @@ fn found_route(
         )
     };
     let undiscounted = route.emulate(graph, amount, None)?;
+    let oracle_fee_swap_gas = oracle
+        .as_ref()
+        .and_then(|(_, payment)| payment.swap.as_ref())
+        .map(|swap| swap.gas);
     let swaps_gas = build_swaps(&undiscounted, None)?
         .iter()
         .map(|(_, _, swap)| swap.gas)
+        .chain(oracle_fee_swap_gas)
         .sum::<Gas>();
     let last_look_fee_discount = request.last_look.as_ref().and_then(|last_look| {
         last_look.fee_discount(|fee_discount| {
             Some(SwapEstimate {
                 estimated_amount: route.emulate(graph, amount, fee_discount)?.amount,
                 gas: swaps_gas,
-                oracle_fee: oracle.as_ref().map(|(_, oracle_fee)| *oracle_fee),
+                oracle_fee: oracle.as_ref().map(|(_, payment)| payment.cost),
             })
         })
     });
@@ -237,11 +323,12 @@ fn found_route(
         .collect::<Vec<_>>();
     let oracle_request = match (oracle_requests.as_slice(), oracle) {
         ([], _) => None,
-        ([(request, dex_id)], Some((oracle_key, fee))) => Some((
+        ([(request, dex_id)], Some((oracle_key, payment))) => Some((
             OracleRequest {
                 oracle_key,
                 request: request.clone(),
-                fee: U128(fee),
+                fee: U128(payment.cost),
+                fee_swap: payment.swap,
             },
             dex_id.clone(),
         )),
@@ -907,6 +994,10 @@ mod tests {
                 near_price_raw: "0.000000000000000000000001".parse().unwrap(),
                 quoted_token_price_raw: 1.into(),
             },
+            asset_in_prices: Some(CostPrices {
+                near_price_raw: "0.000000000000000000000001".parse().unwrap(),
+                quoted_token_price_raw: 1.into(),
+            }),
             last_look: None,
             tear_fee_discount: None,
         }
@@ -1104,14 +1195,103 @@ mod tests {
         );
         assert_eq!(oracle_request.request.request.0, b"prices".to_vec());
         assert_eq!(oracle_request.request.fee, U128(ORACLE_FEE));
+    }
 
-        // NEAR pays no oracle fee, so the oracle's pools aren't routed through from it
-        let from_near = find(
+    #[test]
+    fn an_oracle_that_takes_no_fee_in_the_asset_in_is_paid_with_a_swap_of_it() {
+        let pools = routing_pools(true);
+        let routes = find(
             &pools,
             None,
             &request("near", "tear", Amount::AmountIn(1_000_000)),
         );
-        assert!(from_near.quotes.is_empty() && from_near.chains.is_empty());
+        // The oracle only takes USDC, which a swap on Plach buys with NEAR before the request
+        let [quote] = routes.quotes.as_slice() else {
+            panic!("Not one quote");
+        };
+        let near_for_fee = constant_product(
+            [USDC_NEAR[1], USDC_NEAR[0]],
+            QuoteAmount::ExactOut(ORACLE_FEE),
+            0,
+        )
+        .unwrap()
+        .0;
+        let most_near_for_fee = near_for_fee * 101 / 100;
+        assert_eq!(
+            quote.estimated_amount,
+            U128(out(NEAR_TEAR, 1_000_000 - most_near_for_fee, 0))
+        );
+        let oracle_request = quote.oracle_request.as_ref().unwrap();
+        assert_eq!(oracle_request.fee, U128(most_near_for_fee));
+        let fee_swap = oracle_request.fee_swap.as_ref().unwrap();
+        assert_eq!(fee_swap.dex_id, "slimedragon.near/xyk".parse().unwrap());
+        assert_eq!(fee_swap.fee, (asset("usdc"), U128(ORACLE_FEE)));
+        let fee_swap_request: HookSwapRequest =
+            serde_json::from_slice(&fee_swap.message.0).unwrap();
+        assert_eq!(
+            (fee_swap_request.asset_in, fee_swap_request.asset_out),
+            (asset("near"), asset("usdc"))
+        );
+        assert_eq!(fee_swap_request.amount, Some(Amount::AmountOut(ORACLE_FEE)));
+        assert_eq!(fee_swap_request.fee_discount, None);
+
+        // Without a price of the asset in, the swap's gas can't be weighed
+        let without_price = find(
+            &pools,
+            None,
+            &PoolRoutesRequest {
+                asset_in_prices: None,
+                ..request("near", "tear", Amount::AmountIn(1_000_000))
+            },
+        );
+        assert!(without_price.quotes.is_empty() && without_price.chains.is_empty());
+    }
+
+    #[test]
+    fn an_oracle_fee_is_bought_in_near_when_the_oracle_takes_it() {
+        let pools = RoutingPools::of_snapshots(vec![
+            snapshot(
+                "Plach",
+                "slimedragon.near/xyk",
+                HookPools {
+                    pools: vec![
+                        pool(["xyz", "near"], [1_000_000_000, 1_000_000_000], None),
+                        // USDC is bought for less of XYZ
+                        pool(["xyz", "usdc"], [1_000_000_000, 2_000_000_000], None),
+                    ],
+                    oracle_fees: vec![],
+                },
+            ),
+            snapshot(
+                "Qoq",
+                "slimedragon.near/amp",
+                HookPools {
+                    pools: vec![pool(["xyz", "tear"], NEAR_TEAR, Some(ORACLE_KEY))],
+                    oracle_fees: vec![OracleFees {
+                        oracle_key: ORACLE_KEY.parse().unwrap(),
+                        fees: [
+                            (asset("usdc"), ORACLE_FEE.into()),
+                            (asset("near"), ORACLE_FEE.into()),
+                        ]
+                        .into(),
+                    }],
+                },
+            ),
+        ]);
+        let routes = find(
+            &pools,
+            None,
+            &request("xyz", "tear", Amount::AmountIn(1_000_000)),
+        );
+        let [quote] = routes.quotes.as_slice() else {
+            panic!("Not one quote");
+        };
+        let fee_swap = quote
+            .oracle_request
+            .as_ref()
+            .and_then(|oracle_request| oracle_request.fee_swap.as_ref())
+            .unwrap();
+        assert_eq!(fee_swap.fee, (asset("near"), U128(ORACLE_FEE)));
     }
 
     #[test]

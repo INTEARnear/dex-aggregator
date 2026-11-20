@@ -174,6 +174,7 @@ impl IntearDexSwap {
                     oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
                     request: Base64VecU8(vec![]),
                     fee: U128(0),
+                    fee_swap: None,
                 }),
             },
         )
@@ -333,6 +334,11 @@ pub fn route(
         .oracle_request
         .as_ref()
         .map_or(0, |oracle_request| oracle_request.request.fee.0);
+    // It's the most that the swap that buys the fee takes, which leaves the rest in the input
+    let oracle_fee_is_swapped = swap
+        .oracle_request
+        .as_ref()
+        .is_some_and(|oracle_request| oracle_request.request.fee_swap.is_some());
     // The engine takes the fees out of the input of an exact-in swap
     let (swap_amount, constraint, estimated_amount, worst_case_amount) = match request.amount {
         Amount::AmountIn(amount_in) => (
@@ -384,29 +390,29 @@ pub fn route(
                 }),
             },
         };
+        let rest_of_input = IntearDexWithdrawal {
+            asset: token_in.clone(),
+            amount: IntearDexWithdrawAmount::Full { at_least: None },
+        };
         match request.amount {
+            Amount::AmountIn(_) if oracle_fee_is_swapped => vec![output, rest_of_input],
             Amount::AmountIn(_) => vec![output],
-            Amount::AmountOut(_) => vec![
-                output,
-                IntearDexWithdrawal {
-                    asset: token_in.clone(),
-                    amount: IntearDexWithdrawAmount::Full { at_least: None },
-                },
-            ],
+            Amount::AmountOut(_) => vec![output, rest_of_input],
         }
     };
     let output_withdrawn = !withdrawals.is_empty();
 
     // The fast path swaps from the input's balance, and exact-out withdraws what's left of the
-    // input, so only exact-in deposits are swapped whole without a balance of the input. The fast
-    // path also puts what each step gives into the trader's balance.
+    // input, as does exact-in after a swap that buys an oracle's fee, so only the other exact-in
+    // deposits are swapped whole without a balance of the input. The fast path also puts what each
+    // step gives into the trader's balance.
     let registered_assets = if use_fast_path {
         [token_in.clone()]
             .into_iter()
             .chain(swap.intermediate_assets().cloned())
             .chain([token_out.clone()])
             .collect()
-    } else if matches!(request.amount, Amount::AmountOut(_)) {
+    } else if matches!(request.amount, Amount::AmountOut(_)) || oracle_fee_is_swapped {
         vec![token_in.clone(), token_out.clone()]
     } else {
         vec![token_out.clone()]
@@ -631,6 +637,7 @@ mod tests {
                 oracle_key: ORACLE_KEY.parse().unwrap(),
                 request: Base64VecU8(request.to_vec()),
                 fee: U128(ORACLE_FEE),
+                fee_swap: None,
             }),
             ..quote(dex_id, estimated_amount, worst_case_amount, tgas)
         }
@@ -898,6 +905,7 @@ mod tests {
                     "dex_id": "slimedragon.near/amp",
                     "request": "bmVhcix1c2Rj",
                     "fee": ["near", "3"],
+                    "swap": null,
                 },
             })
         );
@@ -920,6 +928,66 @@ mod tests {
                 .checked_add(oracle_request_and_held_deposit)
                 .unwrap()
                 .checked_add(qoq_swap_margin)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_swap_of_the_deposit_buys_the_oracle_fee_in_another_asset() {
+        let fee_swap = swap_router_types::hook::OracleFeeSwap {
+            dex_id: "slimedragon.near/xyk".parse().unwrap(),
+            message: plach_message(),
+            gas: Gas::from_ggas(5_000, 6_000),
+            fee: (AssetId::Nep141("usdc.near".parse().unwrap()), U128(1_000)),
+        };
+        let fee_in_deposit = || oracle_quote("slimedragon.near/amp", 82, 82, 25, b"near,usdc");
+        let mut fee_bought = fee_in_deposit();
+        fee_bought.oracle_request.as_mut().unwrap().fee_swap = Some(fee_swap);
+        let (operations, gas) = swap_operations(Amount::AmountIn(100), vec![fee_bought]);
+        assert_eq!(
+            operations[0],
+            serde_json::json!({
+                "OracleRequest": {
+                    "oracle_key": ORACLE_KEY,
+                    "dex_id": "slimedragon.near/amp",
+                    "request": "bmVhcix1c2Rj",
+                    "fee": ["nep141:usdc.near", "1000"],
+                    "swap": {
+                        "dex_id": "slimedragon.near/xyk",
+                        "message": plach_message(),
+                        "asset_in": "near",
+                        "constraint": "3",
+                    },
+                },
+            })
+        );
+        // The swap takes at most 3 of the deposit of 100, and what it doesn't take is withdrawn
+        assert_eq!(
+            operations[1]["SwapSimple"]["amount"],
+            serde_json::json!({ "Amount": { "ExactIn": "97" } })
+        );
+        assert_eq!(
+            operations[3],
+            serde_json::json!({
+                "Withdraw": {
+                    "asset_id": "near",
+                    "amount": { "Full": { "at_least": null } },
+                    "to": null,
+                    "rescue_address": null,
+                },
+            })
+        );
+        // The fee's swap, its refund if the oracle doesn't respond, and the withdrawal
+        let (_, gas_with_fee_in_deposit) =
+            swap_operations(Amount::AmountIn(100), vec![fee_in_deposit()]);
+        let rest_withdrawal =
+            Gas::from_ggas(500 + 2_900, 500 + 5_900) + crate::calls::near_receive_gas(None);
+        assert_eq!(
+            gas,
+            gas_with_fee_in_deposit
+                .checked_add(NearGas::from_tgas(6 + 15))
+                .unwrap()
+                .checked_add(rest_withdrawal.needs_attached)
                 .unwrap()
         );
     }

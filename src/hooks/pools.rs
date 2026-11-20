@@ -12,7 +12,7 @@ use intear_dex_common::{AssetId, FeeDiscountFraction};
 use near_min_api::types::{Balance, NearGas};
 use near_sdk::PublicKeyHandle;
 use pathfinder::search::{self, Graph, QuoteAmount};
-use swap_router_types::hook::{HookPools, HookSwap, HookSwapRequest, PoolState};
+use swap_router_types::hook::{HookPools, HookSwap, HookSwapRequest, OracleFees, PoolState};
 
 use super::{answer, loaded, Hook, HookPlugin, SwapFunction};
 use crate::types::IntearAssetId;
@@ -347,24 +347,16 @@ impl RoutingPools {
             .position(|snapshot| snapshot.snapshot.plugin.name == hook.plugin.name)
     }
 
-    /// What each oracle that pools in `snapshot`, or any of them, read takes for a request in
-    /// `asset_id`
-    pub fn oracle_fees_in(
-        &self,
-        snapshot: Option<usize>,
-        asset_id: &AssetId,
-    ) -> Vec<(PublicKeyHandle, u128)> {
+    /// The fees of each oracle that pools in `snapshot`, or any of them, read
+    pub fn oracle_fees(&self, snapshot: Option<usize>) -> Vec<&OracleFees> {
         self.snapshots
             .iter()
             .enumerate()
             .filter(|(index, _)| snapshot.is_none_or(|snapshot| snapshot == *index))
             .flat_map(|(_, snapshot)| &snapshot.pools.oracle_fees)
-            .filter_map(|oracle_fees| {
-                let fee = oracle_fees.fees.get(asset_id)?;
-                Some((oracle_fees.oracle_key.clone(), fee.0))
-            })
+            .map(|oracle_fees| (&oracle_fees.oracle_key, oracle_fees))
             .collect::<HashMap<_, _>>()
-            .into_iter()
+            .into_values()
             .collect()
     }
 
