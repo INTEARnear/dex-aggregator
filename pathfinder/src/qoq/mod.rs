@@ -31,7 +31,6 @@ const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 const SWAP_GAS: Gas = Gas::from_ggas(10_000, 10_000);
 /// Measured as another route through the same pool, a hop through another pool also loads it
 const HOP_GAS: Gas = Gas::from_ggas(5_600, 5_600);
-const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 
 /// A pool of the amp DEX, rated at its fixed price or the median of its oracle's prices
 pub struct Pool {
@@ -332,17 +331,13 @@ impl RatedPools {
     }
 }
 
-/// What a swap on `routes` burns, more with a fee discount
-pub fn swap_gas(routes: &[SwapRoute], fee_discount: bool) -> Gas {
+/// What a swap on `routes` burns
+pub fn swap_gas(routes: &[SwapRoute]) -> Gas {
     let hops = routes
         .iter()
         .map(|route| route.pool_ids.len())
         .sum::<usize>();
-    let gas = SWAP_GAS + HOP_GAS * hops as u64;
-    match fee_discount {
-        true => gas + FEE_DISCOUNT_GAS,
-        false => gas,
-    }
+    SWAP_GAS + HOP_GAS * hops as u64
 }
 
 #[cfg(test)]
@@ -637,10 +632,6 @@ mod tests {
                 pool_ids: vec![PoolId::new(1)],
             },
         ];
-        assert_eq!(swap_gas(&routes, false), SWAP_GAS + HOP_GAS * 3);
-        assert_eq!(
-            swap_gas(&routes, true),
-            SWAP_GAS + HOP_GAS * 3 + FEE_DISCOUNT_GAS
-        );
+        assert_eq!(swap_gas(&routes), SWAP_GAS + HOP_GAS * 3);
     }
 }

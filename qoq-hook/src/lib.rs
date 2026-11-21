@@ -9,7 +9,6 @@ use near_sdk::json_types::Base64VecU8;
 use pathfinder::qoq::{self, OraclePrices, Pools, QOQ_DEX_ID, RatedPools};
 use swap_router_types::{
     export_hook,
-    fee_discount::FeeDiscounter,
     hook::{Hook, HookPools, HookSwap, HookSwapRequest, PoolState, PoolsSnapshot},
     indexed::{AccountState, Watch},
     types::Amount,
@@ -18,7 +17,6 @@ use swap_router_types::{
 use crate::oracle_prices::OraclePricesFeed;
 
 struct Qoq {
-    fee_discounter: Arc<FeeDiscounter>,
     pools: RwLock<Option<Arc<Pools>>>,
     oracle_prices: OraclePricesFeed,
     snapshot: Mutex<Option<Snapshot>>,
@@ -34,7 +32,6 @@ struct Snapshot {
 /// The pools at a block, rated at fixed prices and the oracle's prices of a moment
 struct QoqPools {
     pools: RatedPools,
-    fee_discounter: Arc<FeeDiscounter>,
 }
 
 export_hook!(Qoq);
@@ -46,7 +43,6 @@ impl Hook for Qoq {
         let oracle_url = std::env::var("QOQ_ORACLE_URL")
             .map_err(|err| format!("QOQ_ORACLE_URL, the oracle's HTTP API: {err}"))?;
         Ok(Self {
-            fee_discounter: Arc::new(FeeDiscounter::from_env()?),
             pools: RwLock::default(),
             oracle_prices: OraclePricesFeed::start(oracle_url)?,
             snapshot: Mutex::default(),
@@ -87,7 +83,6 @@ impl Hook for Qoq {
             *snapshot = Some(Snapshot {
                 rated: Arc::new(QoqPools {
                     pools: pools.rated(oracle_prices.as_deref()),
-                    fee_discounter: Arc::clone(&self.fee_discounter),
                 }),
                 pools,
                 oracle_prices,
@@ -120,19 +115,10 @@ impl PoolsSnapshot for QoqPools {
         let dex_id = QOQ_DEX_ID.parse().unwrap();
         let routes = self.pools.swap_routes(&request.routes)?;
         let prices_request = self.pools.prices_request(&request.routes)?;
-        let fee_discount = self
-            .fee_discounter
-            .sign_swap(&dex_id, routes.clone(), &request)?;
-        let gas = qoq::swap_gas(&routes, request.fee_discount.is_some());
+        let gas = qoq::swap_gas(&routes);
         Ok(HookSwap {
             dex_id,
-            message: Base64VecU8(
-                borsh::to_vec(&SwapArgs {
-                    routes,
-                    fee_discount,
-                })
-                .unwrap(),
-            ),
+            message: Base64VecU8(borsh::to_vec(&SwapArgs { routes }).unwrap()),
             gas,
             oracle_request: prices_request
                 .map(|prices_request| Base64VecU8(borsh::to_vec(&prices_request).unwrap())),

@@ -306,7 +306,6 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
 const SWAP_GAS: Gas = Gas::from_ggas(7_200, 7_200);
 const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
 const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
-const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 
 impl Pools {
     pub fn block_height(&self) -> BlockHeight {
@@ -394,19 +393,15 @@ impl Pools {
     }
 }
 
-/// What a swap on `routes` burns, more with a fee discount
-pub fn swap_gas(routes: &[SwapRoute], fee_discount: bool) -> Gas {
+/// What a swap on `routes` burns
+pub fn swap_gas(routes: &[SwapRoute]) -> Gas {
     let hops = routes
         .iter()
         .flat_map(|route| &route.pool_ids)
         .collect::<Vec<_>>();
     let pools = hops.iter().collect::<HashSet<_>>().len() as u64;
     let repeated_hops = hops.len() as u64 - pools;
-    let gas = SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops;
-    match fee_discount {
-        true => gas + FEE_DISCOUNT_GAS,
-        false => gas,
-    }
+    SWAP_GAS + HOP_GAS * pools + REPEATED_HOP_GAS * repeated_hops
 }
 
 #[cfg(test)]
@@ -724,17 +719,10 @@ mod tests {
             fraction: RouteFraction::new(500_000),
             pool_ids: pool_ids.iter().map(|&id| PoolId::new(id)).collect(),
         };
-        assert_eq!(
-            swap_gas(&[route(&[1])], false),
-            Gas::from_ggas(9_200, 9_200)
-        );
-        assert_eq!(
-            swap_gas(&[route(&[1])], true),
-            Gas::from_ggas(10_200, 10_200)
-        );
+        assert_eq!(swap_gas(&[route(&[1])]), Gas::from_ggas(9_200, 9_200));
         // Another route through the same pool costs less than a new pool
         assert_eq!(
-            swap_gas(&[route(&[1, 2]), route(&[1])], false),
+            swap_gas(&[route(&[1, 2]), route(&[1])]),
             Gas::from_ggas(12_000, 12_000)
         );
     }

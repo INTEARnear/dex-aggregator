@@ -4,7 +4,7 @@ use near_min_api::types::NearToken;
 use near_sdk::json_types::{Base64VecU8, U128};
 use swap_router_types::{
     fees::{amount_in_after_referral_fees, amount_in_with_referral_fees},
-    hook::{HookQuote, IntearDexTrade, OracleRequest},
+    hook::{HookQuote, IntearDexTrade, OracleRequest, QuoteFeeDiscount},
     types::Gas,
 };
 
@@ -111,6 +111,8 @@ pub struct IntearDexSwap {
     discount: Option<U128>,
     /// Of the options that read an oracle's response
     oracle_request: Option<IntearDexOracleRequest>,
+    /// On every swap of the steps, which the estimated amount is with
+    fee_discount: Option<QuoteFeeDiscount>,
 }
 
 impl IntearDexSwap {
@@ -120,6 +122,7 @@ impl IntearDexSwap {
             worst_case_amount: quote.worst_case_amount.0,
             discount: quote.discount,
             oracle_request: oracle_request_of(&quote),
+            fee_discount: quote.fee_discount,
             steps: vec![single_step(trade, vec![swap_option(quote)])],
         }
     }
@@ -132,6 +135,7 @@ impl IntearDexSwap {
         worst_case_amount: u128,
         discount: Option<U128>,
         oracle_request: Option<IntearDexOracleRequest>,
+        fee_discount: Option<QuoteFeeDiscount>,
     ) -> Self {
         Self {
             steps: steps
@@ -146,6 +150,7 @@ impl IntearDexSwap {
             worst_case_amount,
             discount,
             oracle_request,
+            fee_discount,
         }
     }
 
@@ -176,6 +181,7 @@ impl IntearDexSwap {
                     fee: U128(0),
                     fee_swap: None,
                 }),
+                fee_discount: None,
             },
         )
     }
@@ -185,8 +191,9 @@ impl IntearDexSwap {
     /// slippage from the best quote, so when a quote without slippage fails, one that gives a bit
     /// less still fills it, and the quotes that give less than the slippage allows are left out.
     /// One oracle request starts the operations, so the quotes that ask an oracle for something
-    /// else than the best quote does are left out. None without quotes, one quote is swapped on
-    /// alone.
+    /// else than the best quote does are left out. The operations have the fee discount of the
+    /// best quote, which the other quotes swap with too when they're fallen back to, as far as
+    /// the constraint allows. None without quotes, one quote is swapped on alone.
     pub fn fallback_queue(trade: &IntearDexTrade, mut quotes: Vec<HookQuote>) -> Option<Self> {
         match trade.amount {
             Amount::AmountIn(_) => {
@@ -246,6 +253,7 @@ impl IntearDexSwap {
             worst_case_amount,
             discount: best.discount,
             oracle_request: best_oracle_request,
+            fee_discount: best.fee_discount,
             steps: vec![single_step(
                 trade,
                 quotes.into_iter().map(swap_option).collect(),
@@ -275,6 +283,10 @@ impl IntearDexSwap {
 
     pub fn oracle_request(&self) -> Option<&IntearDexOracleRequest> {
         self.oracle_request.as_ref()
+    }
+
+    pub fn fee_discount(&self) -> Option<QuoteFeeDiscount> {
+        self.fee_discount
     }
 
     /// Of the steps, in order
@@ -475,6 +487,7 @@ pub fn route(
             .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap()),
         referral_fees,
         trader_account_id: request.trader_account_id.clone(),
+        fee_discount: swap.fee_discount,
     };
     let output_in_wallet = match &token_out {
         IntearAssetId::Near => TokenId::Near,
@@ -552,7 +565,7 @@ mod tests {
     use near_min_api::types::{AccountId, Action, NearGas};
     use near_sdk::json_types::Base64VecU8;
     use swap_router_types::{fees::AGGREGATOR_FEE_RECEIVER_ID, hook::OracleRequest};
-    use xyk_dex_types::{PoolId, SwapArgs, SwapFeeDiscount, SwapRoute, FULL_ROUTE_FRACTION};
+    use xyk_dex_types::{PoolId, SwapArgs, SwapRoute, FULL_ROUTE_FRACTION};
 
     use super::*;
     use crate::calls::RheaOutput;
@@ -565,7 +578,7 @@ mod tests {
     const ORACLE_KEY: &str = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
     const ORACLE_FEE: u128 = 3;
 
-    /// The swap message of the test quotes, through pool 1 without a fee discount
+    /// The swap message of the test quotes, through pool 1
     fn plach_message() -> Base64VecU8 {
         Base64VecU8(
             borsh::to_vec(&SwapArgs {
@@ -573,7 +586,6 @@ mod tests {
                     fraction: FULL_ROUTE_FRACTION,
                     pool_ids: vec![PoolId::new(1)],
                 }],
-                fee_discount: SwapFeeDiscount::None,
             })
             .unwrap(),
         )
@@ -596,6 +608,7 @@ mod tests {
             gas: PLACH_SWAP_GAS,
             discount: None,
             oracle_request: None,
+            fee_discount: None,
         };
         route(
             DexId::Hook("Plach".into()),
@@ -620,6 +633,7 @@ mod tests {
             gas: Gas::from_ggas(tgas * 1_000, (tgas + 10) * 1_000),
             discount: None,
             oracle_request: None,
+            fee_discount: None,
         }
     }
 
@@ -699,6 +713,7 @@ mod tests {
             referrer: account(DEFAULT_REFERRER_ID),
             referral_fees: QuoteFees::default(),
             trader_account_id: Some(trader()),
+            fee_discount: None,
         }
     }
 
@@ -1100,7 +1115,69 @@ mod tests {
             79,
             None,
             None,
+            None,
         )
+    }
+
+    #[test]
+    fn a_fee_discount_is_signed_for_every_swap_of_the_operations() {
+        use intear_dex_common::FeeDiscountFraction;
+        use intear_dex_types::{FeeDiscount, Operation, OperationsFeeDiscount, SignedFeeDiscount};
+        use near_min_api::types::near_crypto::{KeyType, SecretKey, Signature};
+        use sha2::{Digest, Sha256};
+        use swap_router_types::fee_discount::{fee_discount_signature_payload, FeeDiscounter};
+
+        let secret_key = SecretKey::from_seed(KeyType::ED25519, "fee discounter");
+        // Tests that sign start it with the same key
+        let _ = FeeDiscounter {
+            secret_key: secret_key.clone(),
+        }
+        .start();
+        let request = request(TokenId::Near, ft_output(), Amount::AmountIn(100));
+        let network = TestNetworkView::default().with_test_prices();
+        let trade = trade_of_request(&network, &request).unwrap();
+        let fee_discount = QuoteFeeDiscount {
+            fee_discount: FeeDiscountFraction::new(250_000),
+            expiration_block_height: 1_001_000,
+        };
+        let undiscounted = chain("slimedragon.near/xyk", "slimedragon.near/otc");
+        let (undiscounted_args, undiscounted_gas) =
+            last_call(&route(DexId::IntearDex, &request, &trade, undiscounted).unwrap());
+        assert!(undiscounted_args["operations"]
+            .get("fee_discount")
+            .is_none());
+        let swap = IntearDexSwap {
+            fee_discount: Some(fee_discount),
+            ..chain("slimedragon.near/xyk", "slimedragon.near/otc")
+        };
+        let (args, gas) = last_call(&route(DexId::IntearDex, &request, &trade, swap).unwrap());
+        let operations: Vec<Operation> =
+            serde_json::from_value(args["operations"]["operations"].clone()).unwrap();
+        assert_eq!(operations.len(), 3);
+        let signed: SignedFeeDiscount =
+            serde_json::from_value(args["operations"]["fee_discount"].clone()).unwrap();
+        assert_eq!(
+            signed.discount,
+            FeeDiscount::ForOperations(OperationsFeeDiscount {
+                operations_hash: <[u8; 32]>::from(Sha256::digest(
+                    borsh::to_vec(&operations).unwrap()
+                ))
+                .into(),
+                trader_id: Some(trader()),
+                fee_discount: fee_discount.fee_discount,
+                expiration_block_height: fee_discount.expiration_block_height,
+            })
+        );
+        assert!(Signature::from_parts(KeyType::ED25519, &signed.signature.0)
+            .unwrap()
+            .verify(
+                &Sha256::digest(
+                    borsh::to_vec(&fee_discount_signature_payload(&signed.discount)).unwrap()
+                ),
+                &secret_key.public_key(),
+            ));
+        // The engine checks it once for both swaps
+        assert!(gas > undiscounted_gas);
     }
 
     #[test]

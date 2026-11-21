@@ -1,9 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
-#[cfg(feature = "hook")]
-use intear_dex_common::FeeDiscountFraction;
-use intear_dex_common::{AssetId, DexId};
+use intear_dex_common::{AssetId, DexId, FeeDiscountFraction};
 use near_min_api::types::{AccountId, BlockHeight, NearGas, NearToken};
 use near_sdk::{
     json_types::{Base64VecU8, U128},
@@ -15,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::indexed::{AccountState, Watch};
 use crate::types::{Amount, CostPrices, Gas, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 9;
+pub const HOOK_ABI_VERSION: u32 = 10;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -85,12 +83,24 @@ pub struct HookQuote {
     pub worst_case_amount: U128,
     /// Of the DEX's swap on Intear DEX
     pub gas: Gas,
-    /// What a discount that the message carries saves, already in the estimated amount
+    /// What the TEAR staker's part of `fee_discount` saves, already in the estimated amount
     pub discount: Option<U128>,
     /// What the DEX's swap reads the response of its oracle to, which the operations start with
     /// an `OracleRequest` of. Only one starts them, so quotes that ask for another one can't be
     /// fallbacks of this one.
     pub oracle_request: Option<OracleRequest>,
+    /// The discount that the estimated amount is with, which the aggregator signs for the
+    /// operations of the route
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_discount: Option<QuoteFeeDiscount>,
+}
+
+/// A discount on the pool and protocol fees of every swap of a route's operations
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QuoteFeeDiscount {
+    pub fee_discount: FeeDiscountFraction,
+    /// The last block the route can be swapped on with the discount
+    pub expiration_block_height: BlockHeight,
 }
 
 /// A request to the oracle that has `oracle_key`, on Intear DEX
@@ -198,14 +208,6 @@ pub struct HookSwapRequest {
     pub asset_in: AssetId,
     pub asset_out: AssetId,
     pub routes: Vec<HookSwapRoute>,
-    /// `None` for a swap that swaps what the swap before it gave, which isn't known in advance,
-    /// so it doesn't have a fee discount
-    pub amount: Option<Amount>,
-    /// Millionths of the pool and protocol fees that the swap doesn't pay
-    pub fee_discount: Option<u32>,
-    pub trader_account_id: Option<AccountId>,
-    /// The fee discount is valid for some blocks after it
-    pub block_height: BlockHeight,
 }
 
 /// A part of a swap through pools one after another, by their index in [`HookPools::pools`]
@@ -867,6 +869,7 @@ mod export_tests {
                 gas: Gas::from_ggas(20_000, 25_000),
                 discount: None,
                 oracle_request: None,
+                fee_discount: None,
             }])
         }
 
@@ -1021,10 +1024,6 @@ mod export_tests {
                     fraction: 1_000_000,
                     pools: vec![0],
                 }],
-                amount: Some(Amount::AmountIn(100)),
-                fee_discount: None,
-                trader_account_id: None,
-                block_height: 1,
             })
             .unwrap(),
         )

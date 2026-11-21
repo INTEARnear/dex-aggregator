@@ -6,7 +6,6 @@ use near_sdk::json_types::Base64VecU8;
 use pathfinder::plach::{self, PLACH_DEX_ID};
 use swap_router_types::{
     export_hook,
-    fee_discount::FeeDiscounter,
     hook::{Hook, HookPools, HookSwap, HookSwapRequest, PoolState, PoolsSnapshot},
     indexed::{AccountState, Watch},
     types::Amount,
@@ -14,14 +13,12 @@ use swap_router_types::{
 use xyk_dex_types::SwapArgs;
 
 struct Plach {
-    fee_discounter: Arc<FeeDiscounter>,
     pools: RwLock<Option<Arc<PlachPools>>>,
 }
 
 /// The pools at a block
 struct PlachPools {
     pools: plach::Pools,
-    fee_discounter: Arc<FeeDiscounter>,
 }
 
 export_hook!(Plach);
@@ -31,7 +28,6 @@ impl Hook for Plach {
 
     fn init() -> Result<Self, String> {
         Ok(Self {
-            fee_discounter: Arc::new(FeeDiscounter::from_env()?),
             pools: RwLock::default(),
         })
     }
@@ -47,10 +43,7 @@ impl Hook for Plach {
         let height = state.block.height;
         let pools = plach::build_indexed_pools(state)
             .map_err(|err| format!("Failed to build Plach pools at block {height}: {err:#}"))?;
-        *self.pools.write().unwrap() = Some(Arc::new(PlachPools {
-            pools,
-            fee_discounter: Arc::clone(&self.fee_discounter),
-        }));
+        *self.pools.write().unwrap() = Some(Arc::new(PlachPools { pools }));
         Ok(())
     }
 
@@ -81,19 +74,10 @@ impl PoolsSnapshot for PlachPools {
     fn build_swap(&self, request: HookSwapRequest) -> Result<HookSwap, String> {
         let dex_id = PLACH_DEX_ID.parse().unwrap();
         let routes = self.pools.swap_routes(&request.routes)?;
-        let fee_discount = self
-            .fee_discounter
-            .sign_swap(&dex_id, routes.clone(), &request)?;
-        let gas = plach::swap_gas(&routes, request.fee_discount.is_some());
+        let gas = plach::swap_gas(&routes);
         Ok(HookSwap {
             dex_id,
-            message: Base64VecU8(
-                borsh::to_vec(&SwapArgs {
-                    routes,
-                    fee_discount,
-                })
-                .unwrap(),
-            ),
+            message: Base64VecU8(borsh::to_vec(&SwapArgs { routes }).unwrap()),
             gas,
             oracle_request: None,
         })

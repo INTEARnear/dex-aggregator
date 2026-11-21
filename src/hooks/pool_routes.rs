@@ -11,9 +11,10 @@ use pathfinder::{
     BASIS_POINTS,
 };
 use swap_router_types::{
+    fee_discount::{FEE_DISCOUNT_GAS, FEE_DISCOUNT_VALIDITY_BLOCKS},
     hook::{
         HookQuote, HookSwap, HookSwapRequest, HookSwapRoute, IntearDexTrade, OracleFeeSwap,
-        OracleFees, OracleRequest, HOOK_ANSWER_TIMEOUT,
+        OracleFees, OracleRequest, QuoteFeeDiscount, HOOK_ANSWER_TIMEOUT,
     },
     last_look::{with_tear_fee_discount, LastLook, SwapEstimate},
     types::{CostPrices, Gas},
@@ -138,6 +139,7 @@ pub fn find(
                 oracle_request: route
                     .oracle_request
                     .map(|(oracle_request, _)| oracle_request),
+                fee_discount: route.fee_discount,
             }),
             Err(swaps) => routes.chains.push(IntearDexSwap::chain(
                 swaps
@@ -157,6 +159,7 @@ pub fn find(
                 route
                     .oracle_request
                     .map(|(request, dex_id)| IntearDexOracleRequest { dex_id, request }),
+                route.fee_discount,
             )),
         }
     }
@@ -249,6 +252,8 @@ struct FoundRoute {
     discount: Option<Balance>,
     /// And the DEX that reads the response
     oracle_request: Option<(OracleRequest, intear_dex_common::DexId)>,
+    /// Of every swap of the route, which `estimated_amount` is with
+    fee_discount: Option<QuoteFeeDiscount>,
 }
 
 /// The best route through the pools of `scope` for `trade`, which is after paying `oracle`
@@ -268,16 +273,7 @@ fn found_route(
     } = best_route(pools, scope, trade, amount, &request.prices)?;
     let graph = &pools_graph.graph;
 
-    let build_swaps = |emulated: &Emulated, fee_discount: Option<FeeDiscountFraction>| {
-        route.swaps(
-            pools,
-            graph,
-            trade,
-            emulated,
-            fee_discount,
-            request.block_height,
-        )
-    };
+    let build_swaps = |emulated: &Emulated| route.swaps(pools, graph, emulated);
     let oracle_fee_swap_gas = oracle
         .as_ref()
         .and_then(|(_, payment)| payment.swap.as_ref())
@@ -285,10 +281,13 @@ fn found_route(
     let last_look_fee_discount = request.last_look.as_ref().and_then(|last_look| {
         last_look.fee_discount(|fee_discount| {
             let emulated = route.emulate(graph, amount, fee_discount)?;
-            let swaps_gas = build_swaps(&emulated, fee_discount)?
+            // The engine checks the discount once for all the swaps
+            let fee_discount_gas = fee_discount.map(|_| FEE_DISCOUNT_GAS);
+            let swaps_gas = build_swaps(&emulated)?
                 .iter()
                 .map(|(_, _, swap)| swap.gas)
                 .chain(oracle_fee_swap_gas)
+                .chain(fee_discount_gas)
                 .sum::<Gas>();
             Some(SwapEstimate {
                 estimated_amount: emulated.amount,
@@ -307,7 +306,7 @@ fn found_route(
         }
         None => None,
     };
-    let swaps = build_swaps(&emulated, fee_discount)?;
+    let swaps = build_swaps(&emulated)?;
     let slippage_bp = pathfinder::slippage_bp(&trade.slippage).ok()?;
     let worst_case_amount = match amount {
         QuoteAmount::ExactIn(_) => {
@@ -341,6 +340,10 @@ fn found_route(
         worst_case_amount,
         discount,
         oracle_request,
+        fee_discount: fee_discount.map(|fee_discount| QuoteFeeDiscount {
+            fee_discount,
+            expiration_block_height: request.block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
+        }),
     })
 }
 
@@ -531,8 +534,8 @@ impl StepsRoute {
 
     /// Swaps like the DEXes would: each step splits what it swaps between its routes by their
     /// fractions, and the routes swap one after another. A route takes the shares of the step
-    /// that its parts have, and gives each of them a share of its swap in proportion. The steps
-    /// after the first, which can't be signed a fee discount for, swap without `fee_discount`.
+    /// that its parts have, and gives each of them a share of its swap in proportion. Every step
+    /// swaps with `fee_discount`, which the engine takes for all swaps of the operations.
     fn emulate(
         &self,
         graph: &Graph<HookPool>,
@@ -547,7 +550,7 @@ impl StepsRoute {
             .iter()
             .map(|&weight| Balance::from(weight))
             .collect::<Vec<_>>();
-        for (index, step) in self.steps.iter().enumerate() {
+        for step in &self.steps {
             let route_shares = step
                 .routes
                 .iter()
@@ -560,7 +563,6 @@ impl StepsRoute {
                     .iter()
                     .map(|&fraction| RouteFraction::new(fraction)),
             );
-            let step_fee_discount = fee_discount.filter(|_| index == 0);
             let route_amounts = step
                 .routes
                 .iter()
@@ -574,7 +576,7 @@ impl StepsRoute {
                         graph,
                         &route.hops,
                         route_amount,
-                        step_fee_discount,
+                        fee_discount,
                         &mut pools_delta,
                     )
                 })
@@ -597,21 +599,17 @@ impl StepsRoute {
         })
     }
 
-    /// The swaps of the steps, the first one of `trade`'s amount with `fee_discount`
+    /// The swaps of the steps
     fn swaps(
         &self,
         pools: &RoutingPools,
         graph: &Graph<HookPool>,
-        trade: &IntearDexTrade,
         emulated: &Emulated,
-        fee_discount: Option<FeeDiscountFraction>,
-        block_height: BlockHeight,
     ) -> Option<Vec<(AssetId, AssetId, HookSwap)>> {
         self.steps
             .iter()
             .zip(&emulated.fractions)
-            .enumerate()
-            .map(|(index, (step, fractions))| {
+            .map(|(step, fractions)| {
                 let asset_in = pools.tokens[step.token_in as usize].clone();
                 let asset_out = pools.tokens[step.token_out as usize].clone();
                 let request = HookSwapRequest {
@@ -630,12 +628,6 @@ impl StepsRoute {
                                 .collect(),
                         })
                         .collect(),
-                    amount: (index == 0).then_some(trade.amount),
-                    fee_discount: fee_discount
-                        .filter(|_| index == 0)
-                        .map(FeeDiscountFraction::get),
-                    trader_account_id: trade.trader_account_id.clone(),
-                    block_height,
                 };
                 let snapshot = &pools.snapshots[step.snapshot];
                 let swap = snapshot
@@ -883,11 +875,7 @@ mod tests {
         output(Ok(HookSwap {
             dex_id: dex.dex_id.parse().unwrap(),
             message: Base64VecU8(request_json.as_bytes().to_vec()),
-            gas: if request.fee_discount.is_some() {
-                Gas::from_ggas(6_000, 6_000)
-            } else {
-                Gas::from_ggas(5_000, 5_000)
-            },
+            gas: Gas::from_ggas(5_000, 5_000),
             oracle_request: asks_oracle.then(|| Base64VecU8(b"prices".to_vec())),
         }))
     }
@@ -1046,7 +1034,6 @@ mod tests {
             (first.asset_in, first.asset_out),
             (asset("usdc"), asset("near"))
         );
-        assert_eq!(first.amount, Some(Amount::AmountIn(1_000_000)));
         assert_eq!(
             first.routes,
             vec![HookSwapRoute {
@@ -1059,10 +1046,7 @@ mod tests {
             (second.asset_in, second.asset_out),
             (asset("near"), asset("tear"))
         );
-        // Swaps what the first gave
-        assert_eq!(second.amount, None);
-        assert_eq!(first.fee_discount, None);
-        assert_eq!(second.fee_discount, None);
+        assert_eq!(chain.fee_discount(), None);
     }
 
     #[test]
@@ -1115,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn last_look_discounts_the_fees_of_the_first_step_to_match_the_best_other_quote() {
+    fn last_look_discounts_the_fees_of_every_step_to_match_the_best_other_quote() {
         let pools = routing_pools(false);
         let undiscounted = out(NEAR_TEAR, out(USDC_NEAR, 1_000_000, 0), 0);
         let routes = find(
@@ -1137,12 +1121,24 @@ mod tests {
             },
         );
         let chain = &routes.chains[0];
-        let [(first, _), (second, _)] = chain_requests(chain).try_into().unwrap();
-        // The smallest whole percent that matches, shared by the pools of the first step, as
-        // the second's swap isn't of a known amount to sign it for
-        let fee_discount = first.fee_discount.unwrap();
-        assert_eq!(second.fee_discount, None);
-        let with = |fee_discount| out(NEAR_TEAR, out(USDC_NEAR, 1_000_000, fee_discount), 0);
+        // The smallest whole percent that matches, which the operations are signed for, so it's
+        // taken off the pools of every step
+        let QuoteFeeDiscount {
+            fee_discount,
+            expiration_block_height,
+        } = chain.fee_discount().unwrap();
+        assert_eq!(
+            expiration_block_height,
+            1_000 + FEE_DISCOUNT_VALIDITY_BLOCKS
+        );
+        let fee_discount = fee_discount.get();
+        let with = |fee_discount| {
+            out(
+                NEAR_TEAR,
+                out(USDC_NEAR, 1_000_000, fee_discount),
+                fee_discount,
+            )
+        };
         assert!(with(fee_discount) >= undiscounted + 50);
         assert!(with(fee_discount - 10_000) < undiscounted + 50);
         assert_eq!(chain.estimated_amount(), with(fee_discount));
@@ -1168,8 +1164,10 @@ mod tests {
             quote.discount,
             Some(U128(discounted - out(USDC_NEAR, 1_000_000, 0)))
         );
-        let request: HookSwapRequest = serde_json::from_slice(&quote.message.0).unwrap();
-        assert_eq!(request.fee_discount, Some(250_000));
+        assert_eq!(
+            quote.fee_discount.map(|discount| discount.fee_discount),
+            Some(FeeDiscountFraction::new(250_000))
+        );
     }
 
     #[test]
@@ -1186,8 +1184,6 @@ mod tests {
         };
         let tear_out = out(NEAR_TEAR, out(USDC_NEAR, 1_000_000 - ORACLE_FEE, 0), 0);
         assert_eq!(chain.estimated_amount(), tear_out);
-        let [(first, _), _] = chain_requests(chain).try_into().unwrap();
-        assert_eq!(first.amount, Some(Amount::AmountIn(1_000_000 - ORACLE_FEE)));
         let oracle_request = chain.oracle_request().unwrap();
         assert_eq!(
             oracle_request.dex_id,
@@ -1236,8 +1232,6 @@ mod tests {
             (fee_swap_request.asset_in, fee_swap_request.asset_out),
             (asset("near"), asset("usdc"))
         );
-        assert_eq!(fee_swap_request.amount, Some(Amount::AmountOut(ORACLE_FEE)));
-        assert_eq!(fee_swap_request.fee_discount, None);
 
         // Without a price of the asset in, the swap's gas can't be weighed
         let without_price = find(

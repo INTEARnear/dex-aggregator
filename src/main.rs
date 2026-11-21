@@ -704,9 +704,10 @@ async fn main() {
 
     hooks::load();
     tear_stakes::start_fetching();
-    let fee_discounter = Arc::new(
-        FeeDiscounter::from_env().unwrap_or_else(|err| panic!("No fee discount signer: {err}")),
-    );
+    FeeDiscounter::from_env()
+        .unwrap_or_else(|err| panic!("No fee discount signer: {err}"))
+        .start()
+        .unwrap_or_else(|_| panic!("The fee discounter is started once"));
     let rate_limiter = RateLimiter::from_env().await;
     let stats = Stats::from_env().await;
 
@@ -727,7 +728,6 @@ async fn main() {
             get(trader_fee_discount::fee_discount_handler),
         )
         .with_state(stats)
-        .layer(Extension(fee_discounter))
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),
             rate_limit::limit_unauthorized,

@@ -8,7 +8,10 @@ use near_min_api::types::{
     NearToken,
 };
 use near_sdk::json_types::Base64VecU8;
-use swap_router_types::hook::OracleRequest;
+use swap_router_types::{
+    fee_discount::{FeeDiscounter, FEE_DISCOUNT_GAS},
+    hook::{OracleRequest, QuoteFeeDiscount},
+};
 use tracing::warn;
 
 use crate::{
@@ -176,6 +179,8 @@ pub struct IntearDexOperations {
     pub referral_fees: QuoteFees,
     /// The signer, who withdrawn NEAR goes to
     pub trader_account_id: Option<AccountId>,
+    /// On every swap of the operations, which the engine takes when it's signed for them
+    pub fee_discount: Option<QuoteFeeDiscount>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -791,7 +796,12 @@ impl IntearDexOperations {
         };
         let fee_receiver_count =
             self.referral_fees.0.len() + usize::from(self.swap.quote_improvement_fee.is_some());
+        let fee_discount_gas = match self.fee_discount {
+            Some(_) => FEE_DISCOUNT_GAS,
+            None => Gas::from_ggas(0, 0),
+        };
         Gas::from_ggas(600, 600) * fee_receiver_count as u64
+            + fee_discount_gas
             + oracle_request_gas
             + swap_gas
             + withdrawals_gas
@@ -915,11 +925,19 @@ impl IntearDexOperations {
             .chain(swap_operations)
             .chain(withdrawals)
             .collect::<Vec<_>>();
-        serde_json::json!({
+        let mut args = serde_json::json!({
             "operations": operations,
             "referrer": self.referrer,
             "referral_fees": intear_dex_types::ReferralFees::from(&self.referral_fees),
-        })
+        });
+        if let Some(fee_discount) = self.fee_discount {
+            args["fee_discount"] = serde_json::json!(FeeDiscounter::signing().sign_operations(
+                &operations,
+                self.trader_account_id.clone(),
+                fee_discount,
+            ));
+        }
+        args
     }
 }
 
@@ -1075,6 +1093,7 @@ mod tests {
             referrer: account("ref.near"),
             referral_fees: QuoteFees::default(),
             trader_account_id: Some(trader()),
+            fee_discount: None,
         }
     }
 

@@ -1,21 +1,27 @@
-use intear_dex_common::{
-    DexId, FeeDiscount, FeeDiscountFraction, FeeDiscountSignaturePayload, SignedFeeDiscount,
-    SignedTraderFeeDiscount, SwapFeeDiscount, SwapRequestAmount, TokenAmount, TraderFeeDiscount,
-    TraderFeeDiscountSignaturePayload,
+use std::sync::OnceLock;
+
+use intear_dex_types::{
+    FeeDiscount, FeeDiscountSignaturePayload, Operation, OperationsFeeDiscount, SignedFeeDiscount,
 };
 use near_min_api::types::{
     near_crypto::{SecretKey, Signature},
     AccountId, BlockHeight,
 };
-use near_sdk::borsh::BorshSerialize;
+use near_sdk::json_types::Base64VecU8;
 use sha2::{Digest, Sha256};
 
-use crate::{hook::HookSwapRequest, types::Amount};
+use crate::{hook::QuoteFeeDiscount, types::Gas};
 
 /// How long a quote's fee discount can be used, ~10 minutes
 pub const FEE_DISCOUNT_VALIDITY_BLOCKS: BlockHeight = 1000;
+/// What Intear DEX burns to check the signature of a fee discount and the hash of the operations
+/// it's for, once for all their swaps. Simulated swaps burnt 0.34 Tgas more with an ed25519 signer,
+/// 0.42 with secp256k1 and 1.14 with ML-DSA-65.
+pub const FEE_DISCOUNT_GAS: Gas = Gas::from_ggas(450, 1_200);
 
-/// Signs fee discounts with the key set as the fee discount signer of the DEXes
+static FEE_DISCOUNTER: OnceLock<FeeDiscounter> = OnceLock::new();
+
+/// Signs fee discounts with the key set as the fee discount signer of the engine
 pub struct FeeDiscounter {
     pub secret_key: SecretKey,
 }
@@ -36,101 +42,70 @@ impl FeeDiscounter {
         Ok(Self { secret_key })
     }
 
-    /// The fee discount of the swap of `request` on `route` of the DEX `dex_id`, signed
-    pub fn sign_swap<Route: BorshSerialize + Clone>(
+    /// Makes this the signer of [`FeeDiscounter::signing`], which can only be done once. Gives
+    /// itself back if there already is one.
+    pub fn start(self) -> Result<(), Self> {
+        FEE_DISCOUNTER.set(self)
+    }
+
+    pub fn signing() -> &'static Self {
+        FEE_DISCOUNTER
+            .get()
+            .expect("The fee discounter is started before routes are built")
+    }
+
+    /// The discount on every swap of `operations` of `trader_id`, signed
+    pub fn sign_operations(
         &self,
-        dex_id: &DexId,
-        route: Route,
-        request: &HookSwapRequest,
-    ) -> Result<SwapFeeDiscount<Route>, String> {
-        let Some(fee_discount) = request.fee_discount else {
-            return Ok(SwapFeeDiscount::None);
-        };
-        // The DEX checks that the swap is of the amount it was signed for
-        let amount = request
-            .amount
-            .ok_or("A swap of what the swap before it gave can't have a fee discount")?;
-        let discount = FeeDiscount {
-            route,
-            asset_in: request.asset_in.clone(),
-            asset_out: request.asset_out.clone(),
-            trader_id: request.trader_account_id.clone(),
-            amount: match amount {
-                Amount::AmountIn(amount_in) => {
-                    SwapRequestAmount::ExactIn(TokenAmount::new(amount_in))
-                }
-                Amount::AmountOut(amount_out) => {
-                    SwapRequestAmount::ExactOut(TokenAmount::new(amount_out))
-                }
-            },
-            fee_discount: FeeDiscountFraction::new(fee_discount),
-            expiration_block_height: request.block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
-        };
-        Ok(SwapFeeDiscount::ForSwap(SignedFeeDiscount {
-            signature: self.sign(&fee_discount_signature_payload(dex_id, &discount)),
-            discount,
+        operations: &[Operation],
+        trader_id: Option<AccountId>,
+        discount: QuoteFeeDiscount,
+    ) -> SignedFeeDiscount {
+        let operations_hash = Sha256::digest(near_sdk::borsh::to_vec(operations).unwrap());
+        self.sign(FeeDiscount::ForOperations(OperationsFeeDiscount {
+            operations_hash: <[u8; 32]>::from(operations_hash).into(),
+            trader_id,
+            fee_discount: discount.fee_discount,
+            expiration_block_height: discount.expiration_block_height,
         }))
     }
 
-    /// The discount on every swap of its trader on the DEX `dex_id`, signed
-    pub fn sign_trader(
-        &self,
-        dex_id: &DexId,
-        discount: TraderFeeDiscount,
-    ) -> SignedTraderFeeDiscount {
-        SignedTraderFeeDiscount {
-            signature: self.sign(&trader_fee_discount_signature_payload(dex_id, &discount)),
-            discount,
-        }
-    }
-
-    /// Signs sha256(borsh(`payload`)), which the DEX verifies
-    fn sign(&self, payload: &impl BorshSerialize) -> Vec<u8> {
-        let hash = Sha256::digest(near_sdk::borsh::to_vec(payload).unwrap());
-        match self.secret_key.sign(&hash) {
+    /// Signs sha256(borsh([`FeeDiscountSignaturePayload`])) of `discount`, which the engine
+    /// verifies
+    pub fn sign(&self, discount: FeeDiscount) -> SignedFeeDiscount {
+        let payload = fee_discount_signature_payload(&discount);
+        let hash = Sha256::digest(near_sdk::borsh::to_vec(&payload).unwrap());
+        let signature = match self.secret_key.sign(&hash) {
             Signature::ED25519(signature) => signature.to_bytes().to_vec(),
             // Borsh puts the key type before the 65 bytes of r, s, and the recovery id
             signature @ Signature::SECP256K1(_) => {
                 near_sdk::borsh::to_vec(&signature).unwrap()[1..].to_vec()
             }
-            Signature::MLDSA65(_) => panic!("The DEX can't verify ML-DSA-65 fee discounts"),
+            Signature::MLDSA65(signature) => signature.0.to_vec(),
+        };
+        SignedFeeDiscount {
+            discount,
+            signature: Base64VecU8(signature),
         }
     }
 }
 
-/// For `dex_id` on mainnet Intear DEX
-pub fn trader_fee_discount_signature_payload(
-    dex_id: &DexId,
-    discount: &TraderFeeDiscount,
-) -> TraderFeeDiscountSignaturePayload {
-    TraderFeeDiscountSignaturePayload {
-        chain_id: "mainnet".to_string(),
-        engine_contract_id: "dex.intear.near".parse().unwrap(),
-        dex_id: dex_id.clone(),
-        discount: discount.clone(),
-    }
-}
-
-/// For `dex_id` on mainnet Intear DEX
-pub fn fee_discount_signature_payload<Route: Clone>(
-    dex_id: &DexId,
-    discount: &FeeDiscount<Route>,
-) -> FeeDiscountSignaturePayload<Route> {
+/// For mainnet Intear DEX
+pub fn fee_discount_signature_payload(discount: &FeeDiscount) -> FeeDiscountSignaturePayload {
     FeeDiscountSignaturePayload {
         chain_id: "mainnet".to_string(),
         engine_contract_id: "dex.intear.near".parse().unwrap(),
-        dex_id: dex_id.clone(),
         discount: discount.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use intear_dex_common::AssetId;
+    use intear_dex_common::{AssetId, DexId, FeeDiscountFraction};
+    use intear_dex_types::{SwapOperationAmount, TraderFeeDiscount};
     use near_min_api::types::near_crypto::KeyType;
 
     use super::*;
-    use crate::hook::HookSwapRoute;
 
     fn fee_discounter() -> FeeDiscounter {
         FeeDiscounter {
@@ -138,91 +113,59 @@ mod tests {
         }
     }
 
-    fn request(amount: Option<Amount>, fee_discount: Option<u32>) -> HookSwapRequest {
-        HookSwapRequest {
-            asset_in: AssetId::Near,
-            asset_out: AssetId::Nep141("ft".parse().unwrap()),
-            routes: vec![HookSwapRoute {
-                fraction: 1_000_000,
-                pools: vec![1],
-            }],
-            amount,
-            fee_discount,
-            trader_account_id: Some("trader.near".parse().unwrap()),
-            block_height: 1_000_000,
-        }
-    }
-
-    #[test]
-    fn signs_the_fee_discount_of_a_swap_for_its_dex() {
-        let dex_id: DexId = "slimedragon.near/xyk".parse().unwrap();
-        let SwapFeeDiscount::ForSwap(signed) = fee_discounter()
-            .sign_swap(
-                &dex_id,
-                b"route".to_vec(),
-                &request(Some(Amount::AmountIn(100)), Some(250_000)),
-            )
-            .unwrap()
-        else {
-            panic!("Not a fee discount of the swap");
-        };
-        let discount = &signed.discount;
-        assert_eq!(discount.route, b"route".to_vec());
-        assert_eq!(discount.asset_in, AssetId::Near);
-        assert_eq!(discount.asset_out, AssetId::Nep141("ft".parse().unwrap()));
-        assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
-        assert_eq!(
-            discount.amount,
-            SwapRequestAmount::ExactIn(TokenAmount::new(100))
-        );
-        assert_eq!(discount.fee_discount.get(), 250_000);
-        assert_eq!(discount.expiration_block_height, 1_001_000);
-        assert!(Signature::from_parts(KeyType::ED25519, &signed.signature)
+    fn is_signed(signed: &SignedFeeDiscount) -> bool {
+        Signature::from_parts(KeyType::ED25519, &signed.signature.0)
             .unwrap()
             .verify(
                 &Sha256::digest(
-                    near_sdk::borsh::to_vec(&fee_discount_signature_payload(&dex_id, discount))
-                        .unwrap()
+                    near_sdk::borsh::to_vec(&fee_discount_signature_payload(&signed.discount))
+                        .unwrap(),
                 ),
                 &fee_discounter().secret_key.public_key(),
-            ));
+            )
     }
 
     #[test]
-    fn swaps_without_a_known_amount_have_no_fee_discount() {
-        let dex_id: DexId = "slimedragon.near/xyk".parse().unwrap();
-        let sign = |request| fee_discounter().sign_swap(&dex_id, b"route".to_vec(), &request);
-        assert!(matches!(
-            sign(request(None, None)),
-            Ok(SwapFeeDiscount::None)
-        ));
-        assert!(matches!(
-            sign(request(Some(Amount::AmountIn(100)), None)),
-            Ok(SwapFeeDiscount::None)
-        ));
-        assert!(sign(request(None, Some(250_000))).is_err());
+    fn signs_the_fee_discount_of_operations_for_their_hash() {
+        let operations = vec![Operation::SwapSimple {
+            dex_id: "slimedragon.near/xyk".parse::<DexId>().unwrap(),
+            message: Base64VecU8(vec![1, 0, 0, 0]),
+            asset_in: AssetId::Near,
+            asset_out: AssetId::Nep141("ft".parse().unwrap()),
+            amount: SwapOperationAmount::OutputOfLastIn,
+            constraint: None,
+            quote_improvement_fee: None,
+        }];
+        let signed = fee_discounter().sign_operations(
+            &operations,
+            Some("trader.near".parse().unwrap()),
+            QuoteFeeDiscount {
+                fee_discount: FeeDiscountFraction::new(250_000),
+                expiration_block_height: 1_001_000,
+            },
+        );
+        let FeeDiscount::ForOperations(discount) = &signed.discount else {
+            panic!("Not a fee discount of operations");
+        };
+        assert_eq!(
+            discount.operations_hash,
+            near_sdk::json_types::Base58CryptoHash::from(<[u8; 32]>::from(Sha256::digest(
+                near_sdk::borsh::to_vec(&operations).unwrap()
+            )))
+        );
+        assert_eq!(discount.trader_id, Some("trader.near".parse().unwrap()));
+        assert_eq!(discount.fee_discount.get(), 250_000);
+        assert_eq!(discount.expiration_block_height, 1_001_000);
+        assert!(is_signed(&signed));
     }
 
     #[test]
-    fn signs_a_trader_fee_discount_for_its_dex() {
-        let dex_id: DexId = "slimedragon.near/amp".parse().unwrap();
-        let discount = TraderFeeDiscount {
+    fn signs_a_trader_fee_discount() {
+        let signed = fee_discounter().sign(FeeDiscount::ForTrader(TraderFeeDiscount {
             trader_id: "trader.near".parse().unwrap(),
             fee_discount: FeeDiscountFraction::new(250_000),
             expiration_block_height: 2_008_000,
-        };
-        let signed = fee_discounter().sign_trader(&dex_id, discount.clone());
-        assert_eq!(signed.discount.trader_id, discount.trader_id);
-        assert!(Signature::from_parts(KeyType::ED25519, &signed.signature)
-            .unwrap()
-            .verify(
-                &Sha256::digest(
-                    near_sdk::borsh::to_vec(&trader_fee_discount_signature_payload(
-                        &dex_id, &discount
-                    ))
-                    .unwrap()
-                ),
-                &fee_discounter().secret_key.public_key(),
-            ));
+        }));
+        assert!(is_signed(&signed));
     }
 }
