@@ -323,6 +323,11 @@ const RANGE_GAS: Gas = Gas::from_ggas(3_100, 3_100);
 const CROSSING_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 const ORDER_GAS: Gas = Gas::from_ggas(1_800, 1_800);
 const BITMAP_WORD_GAS: Gas = Gas::from_ggas(60, 60);
+/// On top of RANGE_GAS: finding the point that a range stopped between, which the contract does
+/// with a logarithm. Of 142 mainnet swaps replayed on the state before them, single ranges that
+/// stopped at the current point took 3.3 Tgas of wasm, and ones that stopped between points 5 to
+/// 10 Tgas.
+const MID_RANGE_END_GAS: Gas = Gas::from_ggas(2_600, 2_600);
 const GAS_MARGIN: NearGas = NearGas::from_tgas(8);
 const GAS_MARGIN_PERCENT: u64 = 30;
 
@@ -336,13 +341,15 @@ fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> Gas {
             crossings: total.crossings + work.crossings,
             orders: total.orders + work.orders,
             words: total.words + work.words,
+            mid_range_ends: total.mid_range_ends + work.mid_range_ends,
         });
     (SWAP_GAS
         + HOP_GAS * route.hops.len() as u64
         + RANGE_GAS * work.ranges
         + CROSSING_GAS * work.crossings
         + ORDER_GAS * work.orders
-        + BITMAP_WORD_GAS * work.words)
+        + BITMAP_WORD_GAS * work.words
+        + MID_RANGE_END_GAS * work.mid_range_ends)
         .with_margin(GAS_MARGIN, GAS_MARGIN_PERCENT)
 }
 

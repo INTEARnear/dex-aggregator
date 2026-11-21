@@ -220,6 +220,9 @@ pub struct CurrentState {
 #[derive(Debug, Clone, Copy)]
 pub struct RangeRet<Cost, Acquire> {
     pub finished: bool,
+    /// Whether the swap stopped between the range's points, which the contract finds with a
+    /// logarithm
+    pub ended_mid_range: bool,
     pub cost: Cost,
     pub acquire: Acquire,
     pub final_point: i32,
@@ -370,6 +373,7 @@ pub fn x2y_range(
         if new_liquidity_x < state.liquidity || cost >= amount_x {
             return Ok(RangeRet {
                 finished: true,
+                ended_mid_range: false,
                 cost: cost_x,
                 acquire: acquire_y,
                 final_point: point,
@@ -401,6 +405,7 @@ pub fn x2y_range(
         if range.complete {
             return Ok(RangeRet {
                 finished: amount_x == 0,
+                ended_mid_range: false,
                 cost: cost_x,
                 acquire: acquire_y,
                 final_point: left_point,
@@ -412,6 +417,7 @@ pub fn x2y_range(
             x2y_at_price_liquidity(amount_x, range.sqrt_loc, state.liquidity, 0)?;
         return Ok(RangeRet {
             finished: true,
+            ended_mid_range: true,
             cost: checked_add(cost_x, cost)?,
             acquire: add(acquire_y, acquire)?,
             final_point: range.loc_point,
@@ -421,6 +427,7 @@ pub fn x2y_range(
     }
     Ok(RangeRet {
         finished: false,
+        ended_mid_range: false,
         cost: cost_x,
         acquire: acquire_y,
         final_point: point,
@@ -519,6 +526,7 @@ pub fn y2x_range(
         if new_liquidity_x > 0 || cost >= amount_y {
             return Ok(RangeRet {
                 finished: true,
+                ended_mid_range: false,
                 cost: cost_y,
                 acquire: acquire_x,
                 final_point: point,
@@ -531,6 +539,7 @@ pub fn y2x_range(
         if point == right_point {
             return Ok(RangeRet {
                 finished: false,
+                ended_mid_range: false,
                 cost: cost_y,
                 acquire: acquire_x,
                 final_point: point,
@@ -555,6 +564,7 @@ pub fn y2x_range(
     if range.complete {
         return Ok(RangeRet {
             finished: amount_y == 0,
+            ended_mid_range: false,
             cost: cost_y,
             acquire: acquire_x,
             final_point: right_point,
@@ -566,6 +576,7 @@ pub fn y2x_range(
         y2x_at_price_liquidity(amount_y, range.sqrt_loc, state.liquidity)?;
     Ok(RangeRet {
         finished: true,
+        ended_mid_range: true,
         cost: checked_add(cost_y, cost)?,
         acquire: add(acquire_x, acquire)?,
         final_point: range.loc_point,
@@ -685,6 +696,7 @@ pub fn x2y_range_desire(
         if new_liquidity_x < state.liquidity || acquire >= desire_y {
             return Ok(RangeRet {
                 finished: true,
+                ended_mid_range: false,
                 cost: cost_x,
                 acquire: acquire_y,
                 final_point: point,
@@ -715,6 +727,7 @@ pub fn x2y_range_desire(
         if range.complete {
             return Ok(RangeRet {
                 finished: desire_y == 0,
+                ended_mid_range: false,
                 cost: cost_x,
                 acquire: acquire_y,
                 final_point: left_point,
@@ -726,6 +739,7 @@ pub fn x2y_range_desire(
             x2y_at_price_liquidity_desire(desire_y, range.sqrt_loc, state.liquidity, 0)?;
         return Ok(RangeRet {
             finished: true,
+            ended_mid_range: true,
             cost: add(cost_x, cost)?,
             acquire: checked_add(acquire_y, acquire)?,
             final_point: range.loc_point,
@@ -735,6 +749,7 @@ pub fn x2y_range_desire(
     }
     Ok(RangeRet {
         finished: false,
+        ended_mid_range: false,
         cost: cost_x,
         acquire: acquire_y,
         final_point: point,
@@ -838,6 +853,7 @@ pub fn y2x_range_desire(
         if new_liquidity_x > 0 || acquire >= desire_x {
             return Ok(RangeRet {
                 finished: true,
+                ended_mid_range: false,
                 cost: cost_y,
                 acquire: acquire_x,
                 final_point: point,
@@ -850,6 +866,7 @@ pub fn y2x_range_desire(
         if point == right_point {
             return Ok(RangeRet {
                 finished: false,
+                ended_mid_range: false,
                 cost: cost_y,
                 acquire: acquire_x,
                 final_point: point,
@@ -874,6 +891,7 @@ pub fn y2x_range_desire(
     if range.complete {
         return Ok(RangeRet {
             finished: desire_x == 0,
+            ended_mid_range: false,
             cost: cost_y,
             acquire: acquire_x,
             final_point: right_point,
@@ -885,6 +903,7 @@ pub fn y2x_range_desire(
         y2x_at_price_liquidity_desire(desire_x, range.sqrt_loc, state.liquidity)?;
     Ok(RangeRet {
         finished: true,
+        ended_mid_range: true,
         cost: add(cost_y, cost)?,
         acquire: checked_add(acquire_x, acquire)?,
         final_point: range.loc_point,

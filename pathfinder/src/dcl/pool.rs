@@ -67,6 +67,8 @@ pub struct Work {
     pub orders: u64,
     /// Words of the bitmap of points searched for the next point
     pub words: u64,
+    /// Ranges that the swap stopped between the points of
+    pub mid_range_ends: u64,
 }
 
 /// A pool's tax, both out of PROTOCOL_FEE_DENOMINATOR: the tax takes `tax_rate` of each
@@ -405,6 +407,7 @@ impl Pool {
         }
         self.work.ranges += 1;
         let range = x2y_range(&self.state, left, amount_no_fee)?;
+        self.work.mid_range_ends += u64::from(range.ended_mid_range);
         let fee = self.exact_in_fee(amount, range.cost, amount_no_fee)?;
         self.charge_fee(true, fee)?;
         self.apply(&range);
@@ -529,6 +532,7 @@ impl Pool {
             }
             self.work.ranges += 1;
             let range = y2x_range(&self.state, next_point, amount_no_fee)?;
+            self.work.mid_range_ends += u64::from(range.ended_mid_range);
             let fee = self.exact_in_fee(amount, range.cost, amount_no_fee)?;
             self.charge_fee(false, fee)?;
             acquired = checked_add(acquired, as_u128(range.acquire)?)?;
@@ -568,6 +572,7 @@ impl Pool {
         }
         self.work.ranges += 1;
         let range = x2y_range_desire(&self.state, left, desire)?;
+        self.work.mid_range_ends += u64::from(range.ended_mid_range);
         let fee = self.exact_out_fee(range.cost)?;
         self.charge_fee(true, fee)?;
         self.apply(&range);
@@ -680,6 +685,7 @@ impl Pool {
             }
             self.work.ranges += 1;
             let range = y2x_range_desire(&self.state, next_point, desire)?;
+            self.work.mid_range_ends += u64::from(range.ended_mid_range);
             let fee = self.exact_out_fee(range.cost)?;
             self.charge_fee(false, fee)?;
             paid = checked_add(paid, checked_add(as_u128(range.cost)?, fee)?)?;
@@ -779,5 +785,21 @@ mod tests {
             Ok(29085689450957559429942)
         );
         assert_eq!(taxed.fee_charged_x, 33);
+    }
+
+    #[test]
+    fn only_the_range_that_the_swap_stops_in_counts_as_ended_mid_range() {
+        let mut pool = pool(
+            PoolTax {
+                tax_rate: 7777,
+                protocol_portion: 3333,
+            },
+            [3 * 10u128.pow(10), 4 * 10u128.pow(10), 5 * 10u128.pow(10)],
+        );
+        pool.swap_exact_in(&"x.near".parse().unwrap(), 79624)
+            .unwrap();
+        assert_eq!(pool.work().ranges, 5);
+        assert_eq!(pool.work().crossings, 2);
+        assert_eq!(pool.work().mid_range_ends, 1);
     }
 }

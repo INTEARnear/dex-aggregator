@@ -278,20 +278,20 @@ fn found_route(
             request.block_height,
         )
     };
-    let undiscounted = route.emulate(graph, amount, None)?;
     let oracle_fee_swap_gas = oracle
         .as_ref()
         .and_then(|(_, payment)| payment.swap.as_ref())
         .map(|swap| swap.gas);
-    let swaps_gas = build_swaps(&undiscounted, None)?
-        .iter()
-        .map(|(_, _, swap)| swap.gas)
-        .chain(oracle_fee_swap_gas)
-        .sum::<Gas>();
     let last_look_fee_discount = request.last_look.as_ref().and_then(|last_look| {
         last_look.fee_discount(|fee_discount| {
+            let emulated = route.emulate(graph, amount, fee_discount)?;
+            let swaps_gas = build_swaps(&emulated, fee_discount)?
+                .iter()
+                .map(|(_, _, swap)| swap.gas)
+                .chain(oracle_fee_swap_gas)
+                .sum::<Gas>();
             Some(SwapEstimate {
-                estimated_amount: route.emulate(graph, amount, fee_discount)?.amount,
+                estimated_amount: emulated.amount,
                 gas: swaps_gas,
                 oracle_fee: oracle.as_ref().map(|(_, payment)| payment.cost),
             })
@@ -883,7 +883,11 @@ mod tests {
         output(Ok(HookSwap {
             dex_id: dex.dex_id.parse().unwrap(),
             message: Base64VecU8(request_json.as_bytes().to_vec()),
-            gas: Gas::from_ggas(5_000, 5_000),
+            gas: if request.fee_discount.is_some() {
+                Gas::from_ggas(6_000, 6_000)
+            } else {
+                Gas::from_ggas(5_000, 5_000)
+            },
             oracle_request: asks_oracle.then(|| Base64VecU8(b"prices".to_vec())),
         }))
     }
