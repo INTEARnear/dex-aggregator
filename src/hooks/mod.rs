@@ -34,7 +34,6 @@ use tracing::{info, warn};
 use crate::{
     route::RouteBlueprint,
     shared_utils::{BaseTokenId, NetworkView, TOKEN_INFOS_REFRESH_INTERVAL},
-    stats::RouteOutcome,
     types::Quote,
     Amount, DexId, SwapRequest,
 };
@@ -281,8 +280,8 @@ impl Hook {
         DexId::Hook(self.plugin.name.clone())
     }
 
-    /// The quotes the hook adds on top of `quotes` for the Intear DEX trade of the request, and
-    /// how asking it went
+    /// The quotes the hook adds on top of `quotes` for the Intear DEX trade of the request. None
+    /// when it's busy, takes too long or panics.
     pub async fn quotes(
         &self,
         request: &SwapRequest,
@@ -291,9 +290,9 @@ impl Hook {
         block_height: BlockHeight,
         quotes: &[Quote],
         route_costs: &IntearDexRouteCosts,
-    ) -> (RouteOutcome, Vec<HookQuote>) {
+    ) -> Vec<HookQuote> {
         let Ok(call_running) = self.calls_running.clone().try_acquire_owned() else {
-            return (RouteOutcome::TimedOut, vec![]);
+            return vec![];
         };
         let input = serde_json::to_string(&HookInput {
             request: Cow::Borrowed(request_details),
@@ -314,33 +313,27 @@ impl Hook {
             hook_quotes.unwrap_or_else(|err| panic!("{} failed: {err}", plugin.name))
         });
         match tokio::time::timeout(HOOK_ANSWER_TIMEOUT, answer).await {
-            Ok(Ok(hook_quotes)) if hook_quotes.is_empty() => (RouteOutcome::NotFound, vec![]),
-            Ok(Ok(hook_quotes)) => (RouteOutcome::Found, hook_quotes),
+            Ok(Ok(hook_quotes)) => hook_quotes,
             // The panic is logged where it happened
-            Ok(Err(_)) => (RouteOutcome::Panicked, vec![]),
-            Err(_) => (RouteOutcome::TimedOut, vec![]),
+            Ok(Err(_)) | Err(_) => vec![],
         }
     }
 }
 
-/// The routes of the swaps for the Intear DEX trade of the request, and how building them went
+/// The routes of the swaps for the Intear DEX trade of the request. None if building them panics.
 pub fn routes(
     dex_id: DexId,
     request: &SwapRequest,
     trade: &IntearDexTrade,
     swaps: Vec<inteardex::IntearDexSwap>,
-) -> (RouteOutcome, Vec<RouteBlueprint>) {
-    let routes = catch_unwind(AssertUnwindSafe(|| {
+) -> Vec<RouteBlueprint> {
+    catch_unwind(AssertUnwindSafe(|| {
         swaps
             .into_iter()
             .filter_map(|swap| inteardex::route(dex_id.clone(), request, trade, swap))
             .collect::<Vec<_>>()
-    }));
-    match routes {
-        Ok(routes) if routes.is_empty() => (RouteOutcome::NotFound, routes),
-        Ok(routes) => (RouteOutcome::Found, routes),
-        Err(_) => (RouteOutcome::Panicked, vec![]),
-    }
+    }))
+    .unwrap_or_default()
 }
 
 /// Blocks on the hook. An answer that isn't of the ABI panics, which is recorded as the hook

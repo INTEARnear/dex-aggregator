@@ -84,6 +84,13 @@ pub enum CallBlueprint {
         amount: Balance,
         swap_referrer_id: AccountId,
     },
+    /// What a swap gave above its quote's estimate, or took below it, out of the signer's wallet
+    /// balance. The memo is for DEX backend to tell it apart from referral fees.
+    QuoteImprovementFeeTransfer {
+        token_id: AccountId,
+        receiver_id: AccountId,
+        amount: Balance,
+    },
     /// Storage of `account_id` on Rhea, of the signer without it
     RheaStorageDeposit {
         account_id: Option<AccountId>,
@@ -330,7 +337,8 @@ impl CallBlueprint {
             | CallBlueprint::InputNep141TransferCallRheaSwap { token_id, .. }
             | CallBlueprint::InputNep141TransferCallRheaDclSwap { token_id, .. }
             | CallBlueprint::InputNep141TransferCallIntearDex { token_id, .. }
-            | CallBlueprint::InputNep141FeeTransfer { token_id, .. } => token_id.clone(),
+            | CallBlueprint::InputNep141FeeTransfer { token_id, .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { token_id, .. } => token_id.clone(),
             CallBlueprint::WrapNear { .. } | CallBlueprint::UnwrapNear { .. } => {
                 WRAP_NEAR.parse().unwrap()
             }
@@ -404,7 +412,10 @@ impl CallBlueprint {
                     + Gas::from_ggas(2_600, 2_600)
                     + operations.gas_with_deposit()
             }
-            CallBlueprint::InputNep141FeeTransfer { token_id, .. } => ft_transfer_gas(token_id),
+            CallBlueprint::InputNep141FeeTransfer { token_id, .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { token_id, .. } => {
+                ft_transfer_gas(token_id)
+            }
             CallBlueprint::RheaStorageDeposit { .. } => Gas::from_ggas(2_610, 3_000),
             CallBlueprint::RheaRegisterTokens { token_ids } => {
                 Gas::from_ggas(2_500, 3_000) + Gas::from_ggas(500, 500) * token_ids.len() as u64
@@ -469,6 +480,7 @@ impl CallBlueprint {
             | CallBlueprint::InputNep141TransferCallRheaDclSwap { .. }
             | CallBlueprint::InputNep141TransferCallIntearDex { .. }
             | CallBlueprint::InputNep141FeeTransfer { .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { .. }
             | CallBlueprint::RheaRegisterTokens { .. }
             | CallBlueprint::RheaSwap { .. }
             | CallBlueprint::InputRheaFeeMftTransfer { .. }
@@ -484,7 +496,8 @@ impl CallBlueprint {
     pub fn wallet_fee_amount(&self) -> Balance {
         match self {
             CallBlueprint::InputNep141FeeTransfer { amount, .. } => *amount,
-            CallBlueprint::Nep141StorageDeposit { .. }
+            CallBlueprint::QuoteImprovementFeeTransfer { .. }
+            | CallBlueprint::Nep141StorageDeposit { .. }
             | CallBlueprint::Nep141DepositOnRhea { .. }
             | CallBlueprint::Nep141DepositOnIntearDex { .. }
             | CallBlueprint::WrapNear { .. }
@@ -643,6 +656,19 @@ impl CallBlueprint {
                     "receiver_id": receiver_id,
                     "amount": amount.to_string(),
                     "memo": format!("Trading fee ({swap_referrer_id})"),
+                }),
+                one_yocto,
+            ),
+            CallBlueprint::QuoteImprovementFeeTransfer {
+                receiver_id,
+                amount,
+                ..
+            } => (
+                "ft_transfer",
+                serde_json::json!({
+                    "receiver_id": receiver_id,
+                    "amount": amount.to_string(),
+                    "memo": "Quote improvement fee",
                 }),
                 one_yocto,
             ),

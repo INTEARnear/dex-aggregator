@@ -451,6 +451,10 @@ pub struct Quote {
     /// `trader_account_id` and `signing_public_key` in the request, once the key is found
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing: Option<SigningContext>,
+    /// Of a quote of `/route/subscribe` that asked for `fees_in_next_steps`, to send with its
+    /// executed transactions for their outcome
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_id: Option<i64>,
 }
 
 /// What quotes' costs, in NEAR, are weighed with against their amounts, in the token whose amount
@@ -543,11 +547,15 @@ pub enum OutcomeWaitUntil {
 pub struct SwapOutcome {
     /// Whether the swap went through, so the fee transactions of the route should be sent
     pub charge_fee: bool,
-    /// How much of the input token the transactions spent, wherever it was held. NEAR doesn't
-    /// count gas and storage deposits. Fees that the fee transactions pay aren't spent yet.
+    /// How much of the input token the swaps took, as the DEXes logged them, with the fees Intear
+    /// DEX takes within a swap. Fees paid outside of the swaps, like fee transactions and Rhea's
+    /// fee transfers, aren't counted. Of a route without a swap, like Wrap, how much the
+    /// transactions spent, wherever it was held, without gas and storage deposits.
     #[serde(with = "dec_format")]
     pub amount_in: Balance,
-    /// How much of the output token the transactions gave, wherever it ended up
+    /// How much of the output token the swaps gave, as the DEXes logged them, without the quote
+    /// improvement fee Intear DEX takes. Of a route without a swap, how much of it the
+    /// transactions gave, wherever it ended up.
     #[serde(with = "dec_format")]
     pub amount_out: Balance,
     /// The balances of the input and output tokens that changed, in every place a token can be
@@ -564,6 +572,12 @@ pub struct SwapOutcome {
     /// whose `balance_changes` and `next_steps` are empty: ask again with
     /// `wait_until=executed` for them.
     pub settled: bool,
+    /// What `next_steps` pay the quote's `quote_improvement_receiver` for the swap beating the
+    /// quote's estimate, in the output token for exact-in and in the input token for exact-out.
+    /// Only of the outcome of a quote with `fees_in_next_steps`, as Intear DEX takes it within
+    /// the swap.
+    #[serde(with = "dec_format", default, skip_serializing_if = "Option::is_none")]
+    pub quote_improvement_fee: Option<Balance>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

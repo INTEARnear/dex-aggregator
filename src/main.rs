@@ -1,22 +1,22 @@
 #![deny(clippy::float_arithmetic)]
 
 use axum::{
-    extract::{Json, Query, State},
+    extract::{Json, Query},
     http::{HeaderMap, StatusCode, Uri},
     middleware,
     routing::get,
     Extension, Router,
 };
-use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use near_min_api::{
     types::{BlockHeight, Finality},
     QueryFinality, RpcClient,
 };
 use std::{
+    collections::HashMap,
     env,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{Arc, LazyLock},
@@ -45,7 +45,6 @@ use crate::{
         base_token, convert_to, final_block_hash, price_raw, BaseTokenId, Mainnet, NetworkView,
         RPC_CLIENT,
     },
-    stats::{QueryStats, RouteOutcome, RouteStats, Stats},
     types::{
         Amount, CostPrices, DexId, OutcomeRequest, Quote, Route, SigningContext, Slippage,
         SwapOutcome, SwapRequest, TokenId,
@@ -62,7 +61,6 @@ mod providers;
 mod rate_limit;
 mod route;
 mod shared_utils;
-mod stats;
 mod subscription;
 mod tear_stakes;
 mod token_infos;
@@ -78,27 +76,15 @@ pub trait Provider: Sync {
 }
 
 async fn route_handler(
-    State(stats): State<Stats>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     uri: Uri,
     headers: HeaderMap,
     Query(request): Query<SwapRequest>,
 ) -> Result<Json<Vec<Quote>>, (StatusCode, String)> {
-    let started_at = Instant::now();
-    let timestamp = Utc::now();
     info!("Received route request: {:?}", request);
 
     validate_request(&request)?;
-    let (quotes, route_stats) =
-        find_routes(&request, &hooks::request_details(ip, &uri, &headers)).await;
-    record_stats(
-        &stats,
-        ip,
-        timestamp,
-        &request,
-        started_at.elapsed(),
-        route_stats,
-    );
+    let (quotes, _) = find_routes(&request, &hooks::request_details(ip, &uri, &headers)).await;
 
     Ok(Json(quotes))
 }
@@ -110,27 +96,6 @@ async fn outcome_handler(
     outcome::swap_outcome(&Mainnet, &Mainnet, request)
         .await
         .map(Json)
-}
-
-fn record_stats(
-    stats: &Stats,
-    ip: IpAddr,
-    timestamp: DateTime<Utc>,
-    request: &SwapRequest,
-    duration: Duration,
-    routes: Vec<RouteStats>,
-) {
-    stats.record(QueryStats {
-        timestamp,
-        ip,
-        token_in: request.token_in.clone(),
-        token_out: request.token_out.clone(),
-        amount: request.amount,
-        referrer_id: request.referrer_id.clone(),
-        trader_account_id: request.trader_account_id.clone(),
-        duration,
-        routes,
-    });
 }
 
 fn validate_request(request: &SwapRequest) -> Result<(), (StatusCode, String)> {
@@ -229,11 +194,11 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Quotes of every requested DEX, best first
+/// Quotes of every requested DEX, best first, and how long routing on each DEX that quotes took
 async fn find_routes(
     request: &SwapRequest,
     request_details: &RequestDetails,
-) -> (Vec<Quote>, Vec<RouteStats>) {
+) -> (Vec<Quote>, HashMap<DexId, Duration>) {
     let providers: &[&dyn Provider] = &[
         &providers::rhea::RheaProvider,
         &providers::wrap::WrapProvider,
@@ -271,23 +236,11 @@ async fn find_routes(
         let request_cloned = request.clone();
         routes.push(tokio::spawn(async move {
             let started_at = Instant::now();
-            let (outcome, route) = tokio::select! {
-                route = AssertUnwindSafe(provider.route(request_cloned)).catch_unwind() => match route {
-                    Ok(Some(route)) => (RouteOutcome::Found, Some(route)),
-                    Ok(None) => (RouteOutcome::NotFound, None),
-                    Err(_) => (RouteOutcome::Panicked, None),
-                },
-                _ = tokio::time::sleep(Duration::from_millis(60_000)) => (RouteOutcome::TimedOut, None),
+            let route = tokio::select! {
+                route = AssertUnwindSafe(provider.route(request_cloned)).catch_unwind() => route.ok().flatten(),
+                _ = tokio::time::sleep(Duration::from_millis(60_000)) => None,
             };
-            let route_stats = RouteStats {
-                dex_id: provider.dex_id(),
-                duration: started_at.elapsed(),
-                outcome,
-                estimated_amount: route.as_ref().map(|route| match route.estimated_amount {
-                    Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
-                }),
-            };
-            (route_stats, route)
+            ((provider.dex_id(), started_at.elapsed()), route)
         }));
     }
 
@@ -306,7 +259,7 @@ async fn find_routes(
     let hook_trade = hook_trade_and_block_height
         .zip(hook_route_costs)
         .map(|((trade, block_height), route_costs)| (trade, block_height, route_costs));
-    let (mut route_stats, routes): (Vec<_>, Vec<_>) = routes
+    let (mut dex_durations, routes): (HashMap<_, _>, Vec<_>) = routes
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
         .unzip();
@@ -317,17 +270,12 @@ async fn find_routes(
         }
     }))
     .await;
-    let mut quotes = Vec::new();
-    for (stats, resolved_route) in route_stats.iter_mut().zip(resolved_routes) {
-        match resolved_route {
-            Some(Some(route)) => quotes.push(quote_of_route(route, signing.clone())),
-            Some(None) => {
-                stats.outcome = RouteOutcome::NotFound;
-                stats.estimated_amount = None;
-            }
-            None => {}
-        }
-    }
+    let mut quotes = resolved_routes
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|route| quote_of_route(route, signing.clone()))
+        .collect::<Vec<_>>();
     sort_quotes(request, &mut quotes);
 
     // Pools of hooks are routed through together, and through one hook's alone when it's asked
@@ -348,15 +296,9 @@ async fn find_routes(
             continue;
         }
         let Some((trade, block_height, route_costs)) = &hook_trade else {
-            route_stats.push(RouteStats {
-                dex_id: hook.dex_id(),
-                duration: started_at.elapsed(),
-                outcome: RouteOutcome::NotFound,
-                estimated_amount: None,
-            });
             continue;
         };
-        let (mut outcome, hook_quotes) = hook
+        let hook_quotes = hook
             .quotes(
                 request,
                 request_details,
@@ -367,14 +309,13 @@ async fn find_routes(
             )
             .await;
         intear_dex_hook_quotes.extend(hook_quotes.iter().cloned());
-        let mut estimated_amount = hook_quotes.first().map(|quote| quote.estimated_amount.0);
         if asked_alone {
             let mut swaps = hook_quotes
                 .into_iter()
                 .map(|quote| IntearDexSwap::of_quote(trade, quote))
                 .collect::<Vec<_>>();
             if let Some((pools, snapshot)) = hook_pools {
-                let (pools_outcome, pool_routes) = pool_routes(
+                let pool_routes = pool_routes(
                     pools,
                     Some(snapshot),
                     request,
@@ -384,9 +325,6 @@ async fn find_routes(
                     None,
                 )
                 .await;
-                if swaps.is_empty() {
-                    outcome = pools_outcome;
-                }
                 swaps.extend(
                     pool_routes
                         .quotes
@@ -396,70 +334,54 @@ async fn find_routes(
                 );
             }
             if !swaps.is_empty() {
-                let (routes_outcome, hook_route_quotes) =
+                let hook_route_quotes =
                     intear_dex_quotes(hook.dex_id(), request, trade, swaps, &signing).await;
-                outcome = routes_outcome;
-                estimated_amount = hook_route_quotes.first().map(estimated_amount_of);
                 quotes.extend(hook_route_quotes);
                 sort_quotes(request, &mut quotes);
             }
+            dex_durations.insert(hook.dex_id(), started_at.elapsed());
         }
-        route_stats.push(RouteStats {
-            dex_id: hook.dex_id(),
-            duration: started_at.elapsed(),
-            outcome,
-            estimated_amount,
-        });
     }
     if intear_dex_requested {
-        let (outcome, intear_dex_quote) = match &hook_trade {
+        let intear_dex_quote = match &hook_trade {
             Some((trade, block_height, route_costs)) => {
                 let mut swaps = Vec::new();
-                let pools_outcome = match routing_pools {
-                    Some(routing_pools) => {
-                        let last_look = LastLook::of(&quotes, &request.fees, route_costs);
-                        let (outcome, found) = pool_routes(
-                            routing_pools,
-                            None,
-                            request,
-                            trade,
-                            *block_height,
-                            route_costs,
-                            last_look,
-                        )
-                        .await;
-                        intear_dex_hook_quotes.extend(found.quotes);
-                        swaps.extend(found.chains);
-                        outcome
-                    }
-                    None => RouteOutcome::NotFound,
-                };
+                if let Some(routing_pools) = routing_pools {
+                    let last_look = LastLook::of(&quotes, &request.fees, route_costs);
+                    let found = pool_routes(
+                        routing_pools,
+                        None,
+                        request,
+                        trade,
+                        *block_height,
+                        route_costs,
+                        last_look,
+                    )
+                    .await;
+                    intear_dex_hook_quotes.extend(found.quotes);
+                    swaps.extend(found.chains);
+                }
                 swaps.extend(IntearDexSwap::fallback_queue(trade, intear_dex_hook_quotes));
                 if swaps.is_empty() {
-                    (pools_outcome, vec![])
+                    vec![]
                 } else {
                     intear_dex_quotes(DexId::IntearDex, request, trade, swaps, &signing).await
                 }
             }
-            None => (RouteOutcome::NotFound, vec![]),
+            None => vec![],
         };
-        route_stats.push(RouteStats {
-            dex_id: DexId::IntearDex,
-            duration: intear_dex_started_at.elapsed(),
-            outcome,
-            estimated_amount: intear_dex_quote.first().map(estimated_amount_of),
-        });
+        dex_durations.insert(DexId::IntearDex, intear_dex_started_at.elapsed());
         quotes.extend(intear_dex_quote);
         sort_quotes(request, &mut quotes);
     }
 
     tracing::info!("Found {} routes: {:?}", quotes.len(), quotes);
 
-    (quotes, route_stats)
+    (quotes, dex_durations)
 }
 
-/// Routes through the pools of the hook of `snapshot` in `pools`, or of every hook, and how finding
-/// them went. Without prices to weigh what hops cost, there are none.
+/// Routes through the pools of the hook of `snapshot` in `pools`, or of every hook. Without prices
+/// to weigh what hops cost, there are none.
 async fn pool_routes(
     pools: Arc<hooks::RoutingPools>,
     snapshot: Option<usize>,
@@ -468,9 +390,9 @@ async fn pool_routes(
     block_height: BlockHeight,
     route_costs: &IntearDexRouteCosts,
     last_look: Option<LastLook>,
-) -> (RouteOutcome, PoolRoutes) {
+) -> PoolRoutes {
     let Some(prices) = route_costs.prices.clone() else {
-        return (RouteOutcome::NotFound, PoolRoutes::default());
+        return PoolRoutes::default();
     };
     let tear_fee_discount = trade
         .trader_account_id
@@ -492,15 +414,15 @@ async fn pool_routes(
     .await
 }
 
-/// The quotes of the routes of the swaps on Intear DEX, best first, and how building them went
+/// The quotes of the routes of the swaps on Intear DEX, best first
 async fn intear_dex_quotes(
     dex_id: DexId,
     request: &SwapRequest,
     trade: &IntearDexTrade,
     swaps: Vec<IntearDexSwap>,
     signing: &Option<SigningContext>,
-) -> (RouteOutcome, Vec<Quote>) {
-    let (mut outcome, routes) = hooks::routes(dex_id, request, trade, swaps);
+) -> Vec<Quote> {
+    let routes = hooks::routes(dex_id, request, trade, swaps);
     let resolved_routes = futures_util::future::join_all(
         routes
             .into_iter()
@@ -512,17 +434,8 @@ async fn intear_dex_quotes(
         .flatten()
         .map(|route| quote_of_route(route, signing.clone()))
         .collect::<Vec<_>>();
-    if matches!(outcome, RouteOutcome::Found) && quotes.is_empty() {
-        outcome = RouteOutcome::NotFound;
-    }
     sort_quotes(request, &mut quotes);
-    (outcome, quotes)
-}
-
-fn estimated_amount_of(quote: &Quote) -> u128 {
-    match quote.route.estimated_amount {
-        Amount::AmountIn(amount) | Amount::AmountOut(amount) => amount,
-    }
+    quotes
 }
 
 /// The route with its output converted to the requested token location, and what its steps need
@@ -600,6 +513,7 @@ fn quote_of_route(route: ResolvedRoute, signing: Option<SigningContext>) -> Quot
         storage_deposits: route.storage_deposits(),
         fee_amount: route.fee_amount(),
         signing,
+        quote_id: None,
         route: Route {
             estimated_amount: route.estimated_amount,
             worst_case_amount: route.worst_case_amount,
@@ -709,7 +623,7 @@ async fn main() {
         .start()
         .unwrap_or_else(|_| panic!("The fee discounter is started once"));
     let rate_limiter = RateLimiter::from_env().await;
-    let stats = Stats::from_env().await;
+    let database = subscription::open_database().await;
 
     shared_utils::start_background_refresh().await;
     tokio::spawn(hooks::follow_prices(Mainnet));
@@ -727,7 +641,7 @@ async fn main() {
             "/fee-discount",
             get(trader_fee_discount::fee_discount_handler),
         )
-        .with_state(stats)
+        .layer(Extension(database))
         .layer(middleware::from_fn_with_state(
             rate_limiter.clone(),
             rate_limit::limit_unauthorized,

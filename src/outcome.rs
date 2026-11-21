@@ -24,12 +24,16 @@ use intear_dex_common::AssetId;
 use trade_indexer::{receipt_events, ReceiptEvent};
 
 use crate::{
-    route::{into_transactions, resolve_steps},
+    calls::CallBlueprint,
+    route::{into_transactions, resolve_steps, RouteStep},
     shared_utils::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
         RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
-    types::{BalanceChange, IntearAssetId, OutcomeRequest, OutcomeWaitUntil, SwapOutcome, TokenId},
+    types::{
+        Amount, BalanceChange, DexId, ExecutionInstruction, IntearAssetId, OutcomeRequest,
+        OutcomeWaitUntil, Quote, Route, SwapOutcome, SwapRequest, TokenId,
+    },
 };
 
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -498,14 +502,14 @@ fn locations(token_id: &TokenId) -> Vec<TokenId> {
     }
 }
 
-/// Where the fee transactions of a route pay from: the wallet NEP-141 of the input token, wNEAR
-/// for NEAR
-fn fee_location(token_in: &TokenId) -> TokenId {
-    if is_near(token_in) {
-        return TokenId::Nep141(WRAP_NEAR.parse().unwrap());
+/// The wallet NEP-141 of a token, wNEAR for NEAR, which the fee transactions of a route pay
+/// from
+fn wallet_nep141(token: &TokenId) -> AccountId {
+    if is_near(token) {
+        return WRAP_NEAR.parse().unwrap();
     }
-    match base_token(token_in) {
-        BaseTokenId::Nep141(contract_id) => TokenId::Nep141(contract_id),
+    match base_token(token) {
+        BaseTokenId::Nep141(contract_id) => contract_id,
         BaseTokenId::Near => unreachable!("NEAR is handled above"),
     }
 }
@@ -673,10 +677,7 @@ fn swapped(
     transactions: &[(FinalExecutionOutcomeWithReceiptView, bool)],
 ) -> Result<Option<SwapOutcome>, (StatusCode, String)> {
     let trader_account_id = &request.trader_account_id;
-    let input_locations = locations(&request.token_in);
-    let output_locations = locations(&request.token_out);
-    let mut amount_in: Balance = 0;
-    let mut amount_out: Balance = 0;
+    let mut traded_by_transaction = Vec::new();
     for (view, executed) in transactions {
         let outcome = &view.final_outcome;
         if &outcome.transaction.signer_id != trader_account_id {
@@ -699,15 +700,13 @@ fn swapped(
         if !executed && traded.is_empty() {
             return Ok(None);
         }
-        for (token, change) in traded {
-            if change < 0 && input_locations.contains(&token) {
-                amount_in = amount_in.saturating_add(change.unsigned_abs());
-            }
-            if change > 0 && output_locations.contains(&token) {
-                amount_out = amount_out.saturating_add(change.unsigned_abs());
-            }
-        }
+        traded_by_transaction.push(traded);
     }
+    let (amount_in, amount_out) = swapped_amounts(
+        &request.token_in,
+        &request.token_out,
+        &traded_by_transaction,
+    );
     Ok((amount_out > 0).then_some(SwapOutcome {
         charge_fee: true,
         amount_in,
@@ -716,7 +715,30 @@ fn swapped(
         next_steps: Vec::new(),
         error: None,
         settled: false,
+        quote_improvement_fee: None,
     }))
+}
+
+/// What swaps took of the input token and gave of the output token, wherever each was held,
+/// from what the transactions traded
+fn swapped_amounts<'a>(
+    token_in: &TokenId,
+    token_out: &TokenId,
+    traded_by_transaction: impl IntoIterator<Item = &'a HashMap<TokenId, i128>>,
+) -> (Balance, Balance) {
+    let input_locations = locations(token_in);
+    let output_locations = locations(token_out);
+    let mut amount_in: Balance = 0;
+    let mut amount_out: Balance = 0;
+    for (token, change) in traded_by_transaction.into_iter().flatten() {
+        if *change < 0 && input_locations.contains(token) {
+            amount_in = amount_in.saturating_add(change.unsigned_abs());
+        }
+        if *change > 0 && output_locations.contains(token) {
+            amount_out = amount_out.saturating_add(change.unsigned_abs());
+        }
+    }
+    (amount_in, amount_out)
 }
 
 /// How far waiting for a route's swaps got
@@ -795,6 +817,207 @@ pub async fn swap_outcome(
     chain: &impl ChainView,
     request: OutcomeRequest,
 ) -> Result<SwapOutcome, (StatusCode, String)> {
+    let transactions = match wait_for_transactions(chain, &request).await? {
+        SwapProgress::Swapped(outcome) => return Ok(outcome),
+        SwapProgress::Executed(transactions) => transactions,
+    };
+    within_balances_timeout(outcome_of(
+        network,
+        chain,
+        &request,
+        request.fee_amount,
+        &transactions,
+    ))
+    .await
+}
+
+/// A quote whose fees are paid in the next steps of the outcome of its transactions, as
+/// [`quote_outcome`] needs it
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredQuote {
+    pub token_in: TokenId,
+    pub token_out: TokenId,
+    pub trader_account_id: AccountId,
+    pub dex_id: DexId,
+    /// `AmountOut` for exact-in, `AmountIn` for exact-out
+    pub estimated_amount: Amount,
+    /// What the fee transactions pay out of the wallet balance of the input token
+    pub fee_amount: Balance,
+    /// Taken out of the quote, to pay after the swap went through
+    pub fee_instructions: Vec<ExecutionInstruction>,
+    pub quote_improvement_receiver: Option<AccountId>,
+}
+
+impl StoredQuote {
+    /// The quote without its fee transactions, and what the outcome of its transactions needs of
+    /// it, which takes `trader_account_id`
+    pub fn split(
+        quote: Quote,
+        request: &SwapRequest,
+        trader_account_id: AccountId,
+    ) -> (Quote, Self) {
+        let (fee_instructions, execution_instructions) =
+            quote.route.execution_instructions.into_iter().partition(
+                |instruction| match instruction {
+                    ExecutionInstruction::NearTransaction {
+                        is_fee_transaction, ..
+                    } => *is_fee_transaction,
+                },
+            );
+        let stored = Self {
+            token_in: request.token_in.clone(),
+            token_out: request.token_out.clone(),
+            trader_account_id,
+            dex_id: quote.route.dex_id.clone(),
+            estimated_amount: quote.route.estimated_amount,
+            fee_amount: quote.fee_amount,
+            fee_instructions,
+            quote_improvement_receiver: request.quote_improvement_receiver.clone(),
+        };
+        let quote = Quote {
+            route: Route {
+                execution_instructions,
+                ..quote.route
+            },
+            ..quote
+        };
+        (quote, stored)
+    }
+
+    /// What the swaps gave above the estimate for exact-in, or took below it for exact-out, and
+    /// who it's paid to. Intear DEX takes it within the swap, and without a swap there's none.
+    fn quote_improvement_fee(
+        &self,
+        swapped_in: Balance,
+        swapped_out: Balance,
+    ) -> Option<(AccountId, Balance)> {
+        let receiver_id = self.quote_improvement_receiver.clone()?;
+        if matches!(self.dex_id, DexId::IntearDex | DexId::Hook(_)) || swapped_out == 0 {
+            return None;
+        }
+        let fee = match self.estimated_amount {
+            Amount::AmountOut(estimated_out) => swapped_out.checked_sub(estimated_out)?,
+            // The fee transactions' referral fees are on top of what the swap is estimated to take
+            Amount::AmountIn(estimated_in) => estimated_in
+                .checked_sub(self.fee_amount)
+                .expect("The estimated input of an exact-out quote includes its fees")
+                .checked_sub(swapped_in)?,
+        };
+        (fee > 0).then_some((receiver_id, fee))
+    }
+}
+
+/// [`swap_outcome`] of the transactions of a quote whose fees are paid after them: once the swap
+/// went through, `next_steps` also pay the quote's fee transactions, then the quote improvement
+/// fee
+pub async fn quote_outcome(
+    network: &impl NetworkView,
+    chain: &impl ChainView,
+    quote: StoredQuote,
+    tx_hashes: Vec<CryptoHash>,
+    wait_until: OutcomeWaitUntil,
+) -> Result<SwapOutcome, (StatusCode, String)> {
+    let request = OutcomeRequest {
+        token_in: quote.token_in.clone(),
+        token_out: quote.token_out.clone(),
+        trader_account_id: quote.trader_account_id.clone(),
+        tx_hashes: Some(tx_hashes),
+        fee_amount: quote.fee_amount,
+        wait_until,
+    };
+    let transactions = match wait_for_transactions(chain, &request).await? {
+        SwapProgress::Swapped(outcome) => return Ok(outcome),
+        SwapProgress::Executed(transactions) => transactions,
+    };
+    let (swapped_in, swapped_out) = swapped_amounts(
+        &request.token_in,
+        &request.token_out,
+        transactions.iter().map(|transaction| &transaction.traded),
+    );
+    let quote_improvement_fee = quote.quote_improvement_fee(swapped_in, swapped_out);
+    // Of exact-out, it's paid out of the input, which is left in the wallet with the fees of the
+    // fee transactions
+    let input_left_for_fees = match (quote.estimated_amount, &quote_improvement_fee) {
+        (Amount::AmountIn(_), Some((_, fee))) => quote.fee_amount + fee,
+        _ => quote.fee_amount,
+    };
+    let mut outcome = within_balances_timeout(outcome_of(
+        network,
+        chain,
+        &request,
+        input_left_for_fees,
+        &transactions,
+    ))
+    .await?;
+    if !outcome.charge_fee {
+        return Ok(outcome);
+    }
+    let quote_improvement_transfer = match &quote_improvement_fee {
+        Some((receiver_id, fee)) => {
+            quote_improvement_transfer(network, &quote, receiver_id.clone(), *fee).await?
+        }
+        None => Vec::new(),
+    };
+    outcome.next_steps.extend(quote.fee_instructions);
+    outcome.next_steps.extend(quote_improvement_transfer);
+    outcome.quote_improvement_fee = quote_improvement_fee.map(|(_, fee)| fee);
+    Ok(outcome)
+}
+
+/// The transactions that pay the quote improvement fee out of the wallet NEP-141 of its token:
+/// the input's, where the fees of the fee transactions are left, or the output's, where it's moved
+/// from where the trader asked for the output
+async fn quote_improvement_transfer(
+    network: &impl NetworkView,
+    quote: &StoredQuote,
+    receiver_id: AccountId,
+    fee: Balance,
+) -> Result<Vec<ExecutionInstruction>, (StatusCode, String)> {
+    let (into_wallet, token_id) = match quote.estimated_amount {
+        Amount::AmountOut(_) => {
+            let token_id = wallet_nep141(&quote.token_out);
+            (
+                convert_to(
+                    &quote.token_out,
+                    &TokenId::Nep141(token_id.clone()),
+                    fee,
+                    Some(&quote.trader_account_id),
+                ),
+                token_id,
+            )
+        }
+        Amount::AmountIn(_) => (vec![], wallet_nep141(&quote.token_in)),
+    };
+    let steps = [
+        into_wallet,
+        vec![
+            RouteStep::StorageDepositOnNep141IfNeeded {
+                token_id: token_id.clone(),
+                account_id: receiver_id.clone(),
+            },
+            RouteStep::Call(CallBlueprint::QuoteImprovementFeeTransfer {
+                token_id,
+                receiver_id,
+                amount: fee,
+            }),
+        ],
+    ]
+    .concat();
+    let calls = resolve_steps(network, steps).await.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to build paying the quote improvement fee".to_string(),
+        )
+    })?;
+    Ok(into_transactions(calls, true))
+}
+
+/// Checks the request, then waits for its transactions to execute, or only for their swaps with
+/// `wait_until=swap`
+async fn wait_for_transactions(
+    chain: &impl ChainView,
+    request: &OutcomeRequest,
+) -> Result<SwapProgress, (StatusCode, String)> {
     let tx_hashes = request.tx_hashes.as_deref().unwrap_or_default();
     if tx_hashes.is_empty() || tx_hashes.len() > MAX_TRANSACTIONS {
         return Err((
@@ -814,56 +1037,54 @@ pub async fn swap_outcome(
             "Token in and token out must be different".to_string(),
         ));
     }
-    let fee_amount = i128::try_from(request.fee_amount).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "fee_amount is too large".to_string(),
-        )
-    })?;
 
     let deadline = Instant::now() + EXECUTION_TIMEOUT;
-    let transactions = match request.wait_until {
-        OutcomeWaitUntil::Executed => {
+    match request.wait_until {
+        OutcomeWaitUntil::Executed => Ok(SwapProgress::Executed(
             try_join_all(
                 tx_hashes
                     .iter()
                     .map(|tx_hash| wait_for_execution(chain, *tx_hash, deadline)),
             )
-            .await?
-        }
-        OutcomeWaitUntil::Swap => {
-            match wait_for_swap(chain, &request, tx_hashes, deadline).await? {
-                SwapProgress::Swapped(outcome) => return Ok(outcome),
-                SwapProgress::Executed(transactions) => transactions,
-            }
-        }
-    };
-
-    tokio::time::timeout(
-        BALANCES_TIMEOUT,
-        outcome_of(network, chain, &request, fee_amount, &transactions),
-    )
-    .await
-    .map_err(|_elapsed| {
-        (
-            StatusCode::GATEWAY_TIMEOUT,
-            format!(
-                "Reading the balances took more than {}s",
-                BALANCES_TIMEOUT.as_secs()
-            ),
-        )
-    })?
+            .await?,
+        )),
+        OutcomeWaitUntil::Swap => wait_for_swap(chain, request, tx_hashes, deadline).await,
+    }
 }
 
-/// What the executed transactions of a route did
+async fn within_balances_timeout<T>(
+    reading_balances: impl Future<Output = Result<T, (StatusCode, String)>>,
+) -> Result<T, (StatusCode, String)> {
+    tokio::time::timeout(BALANCES_TIMEOUT, reading_balances)
+        .await
+        .map_err(|_elapsed| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Reading the balances took more than {}s",
+                    BALANCES_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+}
+
+/// What the executed transactions of a route did: the amounts its swaps traded, and the balances
+/// they changed, which `next_steps` move to where the trader asked for each token, but for
+/// `input_left_for_fees` of the input in the wallet once the swap went through
 async fn outcome_of(
     network: &impl NetworkView,
     chain: &impl ChainView,
     request: &OutcomeRequest,
-    fee_amount: i128,
+    input_left_for_fees: Balance,
     transactions: &[ExecutedTransaction],
 ) -> Result<SwapOutcome, (StatusCode, String)> {
     let trader_account_id = &request.trader_account_id;
+    let input_left_for_fees = i128::try_from(input_left_for_fees).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "fee_amount is too large".to_string(),
+        )
+    })?;
     if let Some(transaction) = transactions
         .iter()
         .find(|transaction| &transaction.signer_id != trader_account_id)
@@ -939,26 +1160,25 @@ async fn outcome_of(
             .map_or(0, |(_, change)| *change)
     };
 
-    let (input_change, output_change) = if same_token {
-        (change_of(&request.token_in), change_of(&request.token_out))
-    } else {
+    // The swaps' own amounts, so tokens that the trader got from elsewhere meanwhile don't count.
+    // A conversion swaps nothing, so it's what the balances changed by.
+    let (amount_in, amount_out) = if same_token {
         (
-            input_locations.iter().map(change_of).sum::<i128>(),
-            output_locations.iter().map(change_of).sum::<i128>(),
+            (-change_of(&request.token_in)).max(0).unsigned_abs(),
+            change_of(&request.token_out).max(0).unsigned_abs(),
+        )
+    } else {
+        swapped_amounts(
+            &request.token_in,
+            &request.token_out,
+            transactions.iter().map(|transaction| &transaction.traded),
         )
     };
-    let amount_in = (-input_change).max(0).unsigned_abs();
-    let amount_out = output_change.max(0).unsigned_abs();
-    let output_swapped = same_token
-        || transactions
-            .iter()
-            .flat_map(|transaction| &transaction.traded)
-            .any(|(token, change)| output_locations.contains(token) && *change > 0);
-    let charge_fee = output_swapped && amount_out > 0;
+    let charge_fee = amount_out > 0;
 
     // Whatever of a token ended up elsewhere is moved to where the trader asked for it, but for
     // what the fee transactions pay out of the wallet after a swap that went through
-    let fee_location = charge_fee.then(|| fee_location(&request.token_in));
+    let fee_location = charge_fee.then(|| TokenId::Nep141(wallet_nep141(&request.token_in)));
     let targets = if same_token {
         vec![(&output_locations, &request.token_out)]
     } else {
@@ -972,7 +1192,7 @@ async fn outcome_of(
         for location in token_locations {
             let mut change = change_of(location);
             if fee_location.as_ref() == Some(location) {
-                change = change.saturating_sub(fee_amount);
+                change = change.saturating_sub(input_left_for_fees);
             }
             if location == target || change <= 0 {
                 continue;
@@ -1018,5 +1238,6 @@ async fn outcome_of(
         next_steps: into_transactions(next_steps, false),
         error,
         settled: true,
+        quote_improvement_fee: None,
     })
 }

@@ -28,7 +28,6 @@ use super::{
 };
 use crate::{
     calls::{IntearDexOracleRequest, IntearDexSwapOption},
-    stats::RouteOutcome,
     Amount, SwapRequest,
 };
 
@@ -66,27 +65,23 @@ pub struct PoolRoutes {
     pub chains: Vec<IntearDexSwap>,
 }
 
-/// [`find`] on a blocking thread, and how it went
+/// [`find`] on a blocking thread. None when too many run, it takes too long or it panics.
 pub async fn find_in_background(
     pools: Arc<RoutingPools>,
     snapshot: Option<usize>,
     request: PoolRoutesRequest,
-) -> (RouteOutcome, PoolRoutes) {
+) -> PoolRoutes {
     let Ok(search_running) = SEARCHES_RUNNING.try_acquire() else {
-        return (RouteOutcome::TimedOut, PoolRoutes::default());
+        return PoolRoutes::default();
     };
     let routes = tokio::task::spawn_blocking(move || {
         let _search_running = search_running;
         find(&pools, snapshot, &request)
     });
     match tokio::time::timeout(HOOK_ANSWER_TIMEOUT, routes).await {
-        Ok(Ok(routes)) if routes.quotes.is_empty() && routes.chains.is_empty() => {
-            (RouteOutcome::NotFound, routes)
-        }
-        Ok(Ok(routes)) => (RouteOutcome::Found, routes),
+        Ok(Ok(routes)) => routes,
         // The panic is logged where it happened
-        Ok(Err(_)) => (RouteOutcome::Panicked, PoolRoutes::default()),
-        Err(_) => (RouteOutcome::TimedOut, PoolRoutes::default()),
+        Ok(Err(_)) | Err(_) => PoolRoutes::default(),
     }
 }
 
