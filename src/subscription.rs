@@ -5,7 +5,7 @@ use axum::{
         ws::{Message, WebSocket},
         WebSocketUpgrade,
     },
-    http::{HeaderMap, Uri},
+    http::{HeaderMap, StatusCode, Uri},
     response::Response,
     Extension,
 };
@@ -102,7 +102,7 @@ async fn subscribe(
                 };
                 if let Some(outcome) = outcome {
                     if let Err(error) = limit.check() {
-                        let update = json!({ "id": id, "error": error }).to_string();
+                        let update = error_update(id, (StatusCode::TOO_MANY_REQUESTS, error));
                         if socket.send(Message::text(update)).await.is_err() {
                             break;
                         }
@@ -112,11 +112,11 @@ async fn subscribe(
                     let updates_sender = updates_sender.clone();
                     outcomes.spawn(async move {
                         let update = match quote_outcome(&database, outcome).await {
-                            Ok(outcome) => json!({ "id": id, "outcome": outcome }),
-                            Err(error) => json!({ "id": id, "error": error }),
+                            Ok(outcome) => json!({ "id": id, "outcome": outcome }).to_string(),
+                            Err(error) => error_update(id, error),
                         };
                         // The connection is gone if nothing receives it
-                        updates_sender.send(update.to_string()).ok();
+                        updates_sender.send(update).ok();
                     });
                     continue;
                 }
@@ -133,7 +133,10 @@ async fn subscribe(
                             Some((database.clone(), trader_account_id.clone()))
                         }
                         (true, None) => {
-                            return Err("fees_in_next_steps needs trader_account_id".to_string())
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "fees_in_next_steps needs trader_account_id".to_string(),
+                            ))
                         }
                     };
                     Ok((request, fees_in_next_steps))
@@ -150,7 +153,7 @@ async fn subscribe(
                         )));
                     }
                     Err(error) => {
-                        let update = json!({ "id": id, "error": error }).to_string();
+                        let update = error_update(id, error);
                         if socket.send(Message::text(update)).await.is_err() {
                             break;
                         }
@@ -170,11 +173,22 @@ async fn subscribe(
     }
 }
 
-fn parse_route_request(query: &str, limit: &RequestLimit) -> Result<SwapRequest, String> {
-    limit.check()?;
-    let request: SwapRequest =
-        serde_urlencoded::from_str(query).map_err(|error| error.to_string())?;
-    validate_request(&request).map_err(|(_, error)| error)?;
+/// An error of the request `id`, with the HTTP status that `/route` or `/route/outcome` answer
+/// it with, which tells whether asking again can help
+fn error_update(id: u64, (status, error): (StatusCode, String)) -> String {
+    json!({ "id": id, "error": error, "status": status.as_u16() }).to_string()
+}
+
+fn parse_route_request(
+    query: &str,
+    limit: &RequestLimit,
+) -> Result<SwapRequest, (StatusCode, String)> {
+    limit
+        .check()
+        .map_err(|error| (StatusCode::TOO_MANY_REQUESTS, error))?;
+    let request: SwapRequest = serde_urlencoded::from_str(query)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    validate_request(&request)?;
     Ok(request)
 }
 
@@ -183,10 +197,16 @@ fn parse_route_request(query: &str, limit: &RequestLimit) -> Result<SwapRequest,
 async fn quote_outcome(
     database: &SqlitePool,
     request: QuoteOutcomeRequest,
-) -> Result<SwapOutcome, String> {
+) -> Result<SwapOutcome, (StatusCode, String)> {
     let quote = stored_quote(database, request.quote_id)
-        .await?
-        .ok_or_else(|| format!("Quote {} doesn't exist", request.quote_id))?;
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Quote {} doesn't exist", request.quote_id),
+            )
+        })?;
     let outcome = outcome::quote_outcome(
         &Mainnet,
         &Mainnet,
@@ -194,9 +214,10 @@ async fn quote_outcome(
         request.tx_hashes.clone(),
         request.wait_until,
     )
-    .await
-    .map_err(|(_, error)| error)?;
-    record_outcome(database, request.quote_id, &request.tx_hashes, &outcome).await?;
+    .await?;
+    record_outcome(database, request.quote_id, &request.tx_hashes, &outcome)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(outcome)
 }
 
@@ -271,7 +292,7 @@ async fn route_updates(
                         Ok(routes) => routes,
                         Err(error) => {
                             updates
-                                .send(json!({ "id": id, "error": error }).to_string())
+                                .send(error_update(id, (StatusCode::INTERNAL_SERVER_ERROR, error)))
                                 .ok();
                             return;
                         }
@@ -619,5 +640,20 @@ mod tests {
             r#"{"id":2,"outcome":{"quote_id":"7","tx_hashes":[]}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn errors_have_the_http_status_of_the_request() {
+        let (status, _) =
+            parse_route_request("token_in=near", &RequestLimit::Unlimited).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let update = error_update(
+            3,
+            (StatusCode::NOT_FOUND, "Quote 7 doesn't exist".to_string()),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&update).unwrap(),
+            json!({ "id": 3, "error": "Quote 7 doesn't exist", "status": 404 })
+        );
     }
 }
