@@ -16,7 +16,7 @@ use near_min_api::{
     ExperimentalTxDetails, QueryFinality, RpcClient,
 };
 use near_sdk::{json_types::U128, NearToken};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::time::Instant;
 
 use inindexer::{transaction_trees::ExecutedReceipt, IndexerExecutionOutcomeWithReceipt};
@@ -25,6 +25,7 @@ use trade_indexer::{receipt_events, ReceiptEvent};
 
 use crate::{
     calls::CallBlueprint,
+    providers::rhea::RHEA_CONTRACT_ID,
     route::{into_transactions, resolve_steps, RouteStep},
     shared_utils::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
@@ -285,6 +286,8 @@ struct ExecutedTransaction {
     failures: Vec<String>,
     /// What the swaps of the signer took and gave of each token
     traded: HashMap<TokenId, i128>,
+    /// What the signer transferred out of its balances on Rhea, by token
+    rhea_transfers: HashMap<String, Balance>,
 }
 
 impl ExecutedTransaction {
@@ -434,8 +437,81 @@ impl ExecutedTransaction {
             native_received,
             failures,
             traded: traded_amounts(view)?,
+            rhea_transfers: rhea_transfers(view)?,
         })
     }
+}
+
+/// What the transaction transferred out of the signer's balances on Rhea, by token, once its
+/// actions executed. Rhea routes only transfer referral fees, with their swap.
+fn rhea_transfers(
+    view: &FinalExecutionOutcomeWithReceiptView,
+) -> Result<HashMap<String, Balance>, String> {
+    let outcome = &view.final_outcome;
+    let ExecutionStatusView::SuccessReceiptId(receipt_id) =
+        &outcome.transaction_outcome.outcome.status
+    else {
+        return Ok(HashMap::new());
+    };
+    let executed = outcome.receipts_outcome.iter().any(|receipt| {
+        receipt.id == *receipt_id
+            && matches!(
+                receipt.outcome.status,
+                ExecutionStatusView::SuccessValue(_) | ExecutionStatusView::SuccessReceiptId(_)
+            )
+    });
+    if outcome.transaction.receiver_id.as_str() != RHEA_CONTRACT_ID || !executed {
+        return Ok(HashMap::new());
+    }
+    mft_transfers(&outcome.transaction.actions)
+}
+
+/// The amounts of the `mft_transfer` calls, by token
+fn mft_transfers(actions: &[ActionView]) -> Result<HashMap<String, Balance>, String> {
+    #[derive(Deserialize)]
+    struct MftTransfer {
+        token_id: String,
+        amount: U128,
+    }
+    let mut transfers = HashMap::new();
+    for action in actions {
+        let ActionView::FunctionCall {
+            method_name, args, ..
+        } = action
+        else {
+            continue;
+        };
+        if method_name != "mft_transfer" {
+            continue;
+        }
+        let MftTransfer { token_id, amount } = serde_json::from_slice(args)
+            .map_err(|err| format!("Failed to parse the arguments of mft_transfer: {err}"))?;
+        *transfers.entry(token_id).or_insert(0) += amount.0;
+    }
+    Ok(transfers)
+}
+
+/// What Rhea routes transferred out of the trader's balance of the input on Rhea, as referral
+/// fees, besides their swaps
+fn rhea_fees<'a>(
+    token_in: &TokenId,
+    rhea_transfers: impl IntoIterator<Item = &'a HashMap<String, Balance>>,
+) -> Balance {
+    let token_id = wallet_nep141(token_in);
+    rhea_transfers
+        .into_iter()
+        .filter_map(|transfers| transfers.get(token_id.as_str()))
+        .sum()
+}
+
+/// What the trader spent and got in the end, once the swap went through: on top of what the swaps
+/// took, what's paid out of the input besides them, and without what's paid out of the output
+fn charged(mut outcome: SwapOutcome, input_fees: Balance, output_fees: Balance) -> SwapOutcome {
+    if outcome.charge_fee {
+        outcome.amount_in += input_fees;
+        outcome.amount_out -= output_fees;
+    }
+    outcome
 }
 
 /// The panic message of a contract, or what the runtime says about another error
@@ -675,9 +751,10 @@ fn traded_amounts(
 fn swapped(
     request: &OutcomeRequest,
     transactions: &[(FinalExecutionOutcomeWithReceiptView, bool)],
-) -> Result<Option<SwapOutcome>, (StatusCode, String)> {
+) -> Result<Option<SwapProgress>, (StatusCode, String)> {
     let trader_account_id = &request.trader_account_id;
     let mut traded_by_transaction = Vec::new();
+    let mut rhea_transfers_by_transaction = Vec::new();
     for (view, executed) in transactions {
         let outcome = &view.final_outcome;
         if &outcome.transaction.signer_id != trader_account_id {
@@ -701,21 +778,26 @@ fn swapped(
             return Ok(None);
         }
         traded_by_transaction.push(traded);
+        rhea_transfers_by_transaction
+            .push(rhea_transfers(view).map_err(|err| (StatusCode::BAD_GATEWAY, err))?);
     }
     let (amount_in, amount_out) = swapped_amounts(
         &request.token_in,
         &request.token_out,
         &traded_by_transaction,
     );
-    Ok((amount_out > 0).then_some(SwapOutcome {
-        charge_fee: true,
-        amount_in,
-        amount_out,
-        balance_changes: Vec::new(),
-        next_steps: Vec::new(),
-        error: None,
-        settled: false,
-        quote_improvement_fee: None,
+    Ok((amount_out > 0).then(|| SwapProgress::Swapped {
+        outcome: SwapOutcome {
+            charge_fee: true,
+            amount_in,
+            amount_out,
+            balance_changes: Vec::new(),
+            next_steps: Vec::new(),
+            error: None,
+            settled: false,
+            quote_improvement_fee: None,
+        },
+        rhea_fees: rhea_fees(&request.token_in, &rhea_transfers_by_transaction),
     }))
 }
 
@@ -743,8 +825,12 @@ fn swapped_amounts<'a>(
 
 /// How far waiting for a route's swaps got
 enum SwapProgress {
-    /// Before everything executed
-    Swapped(SwapOutcome),
+    /// Before everything executed, with what the swaps took and gave, and the referral fees that
+    /// Rhea routes transferred besides them
+    Swapped {
+        outcome: SwapOutcome,
+        rhea_fees: Balance,
+    },
     /// Everything executed first, or nothing swapped
     Executed(Vec<ExecutedTransaction>),
 }
@@ -788,7 +874,7 @@ async fn wait_for_swap(
                             .map_err(|err| (StatusCode::BAD_GATEWAY, err));
                     }
                     Ok(included) => match swapped(request, &included)? {
-                        Some(outcome) => return Ok(SwapProgress::Swapped(outcome)),
+                        Some(swapped) => return Ok(swapped),
                         None => pending_reason = "still executing".to_string(),
                     },
                     Err(reason) => pending_reason = reason,
@@ -817,18 +903,25 @@ pub async fn swap_outcome(
     chain: &impl ChainView,
     request: OutcomeRequest,
 ) -> Result<SwapOutcome, (StatusCode, String)> {
-    let transactions = match wait_for_transactions(chain, &request).await? {
-        SwapProgress::Swapped(outcome) => return Ok(outcome),
-        SwapProgress::Executed(transactions) => transactions,
+    let (outcome, rhea_fees) = match wait_for_transactions(chain, &request).await? {
+        SwapProgress::Swapped { outcome, rhea_fees } => (outcome, rhea_fees),
+        SwapProgress::Executed(transactions) => {
+            let outcome = within_balances_timeout(outcome_of(
+                network,
+                chain,
+                &request,
+                request.fee_amount,
+                &transactions,
+            ))
+            .await?;
+            let rhea_transfers = transactions
+                .iter()
+                .map(|transaction| &transaction.rhea_transfers);
+            (outcome, rhea_fees(&request.token_in, rhea_transfers))
+        }
     };
-    within_balances_timeout(outcome_of(
-        network,
-        chain,
-        &request,
-        request.fee_amount,
-        &transactions,
-    ))
-    .await
+    // The fee transactions pay `fee_amount` once the swap went through
+    Ok(charged(outcome, request.fee_amount + rhea_fees, 0))
 }
 
 /// A quote whose fees are paid in the next steps of the outcome of its transactions, as
@@ -905,6 +998,22 @@ impl StoredQuote {
         };
         (fee > 0).then_some((receiver_id, fee))
     }
+
+    /// What's paid besides the swaps once they went through, out of the input and out of the
+    /// output: the referral fees of the fee transactions and of Rhea's transfers, and the quote
+    /// improvement fee, in the token the swap beat the quote in
+    fn fees(
+        &self,
+        rhea_fees: Balance,
+        quote_improvement_fee: Option<&(AccountId, Balance)>,
+    ) -> (Balance, Balance) {
+        let referral_fees = self.fee_amount + rhea_fees;
+        let quote_improvement_fee = quote_improvement_fee.map_or(0, |(_, fee)| *fee);
+        match self.estimated_amount {
+            Amount::AmountOut(_) => (referral_fees, quote_improvement_fee),
+            Amount::AmountIn(_) => (referral_fees + quote_improvement_fee, 0),
+        }
+    }
 }
 
 /// [`swap_outcome`] of the transactions of a quote whose fees are paid after them: once the swap
@@ -926,7 +1035,13 @@ pub async fn quote_outcome(
         wait_until,
     };
     let transactions = match wait_for_transactions(chain, &request).await? {
-        SwapProgress::Swapped(outcome) => return Ok(outcome),
+        // With the fees that the next steps pay, which come once everything executed
+        SwapProgress::Swapped { outcome, rhea_fees } => {
+            let quote_improvement_fee =
+                quote.quote_improvement_fee(outcome.amount_in, outcome.amount_out);
+            let (input_fees, output_fees) = quote.fees(rhea_fees, quote_improvement_fee.as_ref());
+            return Ok(charged(outcome, input_fees, output_fees));
+        }
         SwapProgress::Executed(transactions) => transactions,
     };
     let (swapped_in, swapped_out) = swapped_amounts(
@@ -952,6 +1067,13 @@ pub async fn quote_outcome(
     if !outcome.charge_fee {
         return Ok(outcome);
     }
+    let rhea_transfers = transactions
+        .iter()
+        .map(|transaction| &transaction.rhea_transfers);
+    let (input_fees, output_fees) = quote.fees(
+        rhea_fees(&quote.token_in, rhea_transfers),
+        quote_improvement_fee.as_ref(),
+    );
     let quote_improvement_transfer = match &quote_improvement_fee {
         Some((receiver_id, fee)) => {
             quote_improvement_transfer(network, &quote, receiver_id.clone(), *fee).await?
@@ -961,7 +1083,7 @@ pub async fn quote_outcome(
     outcome.next_steps.extend(quote.fee_instructions);
     outcome.next_steps.extend(quote_improvement_transfer);
     outcome.quote_improvement_fee = quote_improvement_fee.map(|(_, fee)| fee);
-    Ok(outcome)
+    Ok(charged(outcome, input_fees, output_fees))
 }
 
 /// The transactions that pay the quote improvement fee out of the wallet NEP-141 of its token:

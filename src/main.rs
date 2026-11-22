@@ -334,9 +334,9 @@ async fn find_routes(
                 );
             }
             if !swaps.is_empty() {
-                let hook_route_quotes =
-                    intear_dex_quotes(hook.dex_id(), request, trade, swaps, &signing).await;
-                quotes.extend(hook_route_quotes);
+                let hook_quote =
+                    best_intear_dex_quote(hook.dex_id(), request, trade, swaps, &signing).await;
+                quotes.extend(hook_quote);
                 sort_quotes(request, &mut quotes);
             }
             dex_durations.insert(hook.dex_id(), started_at.elapsed());
@@ -363,12 +363,12 @@ async fn find_routes(
                 }
                 swaps.extend(IntearDexSwap::fallback_queue(trade, intear_dex_hook_quotes));
                 if swaps.is_empty() {
-                    vec![]
+                    None
                 } else {
-                    intear_dex_quotes(DexId::IntearDex, request, trade, swaps, &signing).await
+                    best_intear_dex_quote(DexId::IntearDex, request, trade, swaps, &signing).await
                 }
             }
-            None => vec![],
+            None => None,
         };
         dex_durations.insert(DexId::IntearDex, intear_dex_started_at.elapsed());
         quotes.extend(intear_dex_quote);
@@ -414,14 +414,14 @@ async fn pool_routes(
     .await
 }
 
-/// The quotes of the routes of the swaps on Intear DEX, best first
-async fn intear_dex_quotes(
+/// The one quote of the DEX: of the best of the routes of the swaps on Intear DEX
+async fn best_intear_dex_quote(
     dex_id: DexId,
     request: &SwapRequest,
     trade: &IntearDexTrade,
     swaps: Vec<IntearDexSwap>,
     signing: &Option<SigningContext>,
-) -> Vec<Quote> {
+) -> Option<Quote> {
     let routes = hooks::routes(dex_id, request, trade, swaps);
     let resolved_routes = futures_util::future::join_all(
         routes
@@ -435,7 +435,7 @@ async fn intear_dex_quotes(
         .map(|route| quote_of_route(route, signing.clone()))
         .collect::<Vec<_>>();
     sort_quotes(request, &mut quotes);
-    quotes
+    quotes.into_iter().next()
 }
 
 /// The route with its output converted to the requested token location, and what its steps need

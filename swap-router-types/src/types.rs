@@ -547,15 +547,18 @@ pub enum OutcomeWaitUntil {
 pub struct SwapOutcome {
     /// Whether the swap went through, so the fee transactions of the route should be sent
     pub charge_fee: bool,
-    /// How much of the input token the swaps took, as the DEXes logged them, with the fees Intear
-    /// DEX takes within a swap. Fees paid outside of the swaps, like fee transactions and Rhea's
-    /// fee transfers, aren't counted. Of a route without a swap, like Wrap, how much the
-    /// transactions spent, wherever it was held, without gas and storage deposits.
+    /// How much of the input token the trader spent: what the swaps took, as the DEXes logged
+    /// them, with the fees Intear DEX takes within a swap, and once the swap went through, what's
+    /// paid besides the swaps: the referral fees of the fee transactions (`fee_amount`) and of
+    /// Rhea's fee transfers, and the quote improvement fee of an exact-out quote with
+    /// `fees_in_next_steps`. Of a route without a swap, like Wrap, how much the transactions spent,
+    /// wherever it was held, with the same fees, without gas and storage deposits.
     #[serde(with = "dec_format")]
     pub amount_in: Balance,
-    /// How much of the output token the swaps gave, as the DEXes logged them, without the quote
-    /// improvement fee Intear DEX takes. Of a route without a swap, how much of it the
-    /// transactions gave, wherever it ended up.
+    /// How much of the output token the trader got: what the swaps gave, as the DEXes logged them,
+    /// without the quote improvement fee, which Intear DEX takes within the swap, and the next
+    /// steps of an exact-in quote with `fees_in_next_steps` pay. Of a route without a swap, how
+    /// much of it the transactions gave, wherever it ended up.
     #[serde(with = "dec_format")]
     pub amount_out: Balance,
     /// The balances of the input and output tokens that changed, in every place a token can be
