@@ -303,9 +303,9 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
     storage::pools_source(state).map(build_pools)
 }
 
-const SWAP_GAS: Gas = Gas::from_ggas(7_200, 7_200);
-const HOP_GAS: Gas = Gas::from_ggas(2_000, 2_000);
-const REPEATED_HOP_GAS: Gas = Gas::from_ggas(800, 800);
+const SWAP_GAS: Gas = Gas::from_ggas(5_730, 5_730);
+const HOP_GAS: Gas = Gas::from_ggas(1_710, 1_710);
+const REPEATED_HOP_GAS: Gas = Gas::from_ggas(590, 590);
 
 impl Pools {
     pub fn block_height(&self) -> BlockHeight {
@@ -719,11 +719,11 @@ mod tests {
             fraction: RouteFraction::new(500_000),
             pool_ids: pool_ids.iter().map(|&id| PoolId::new(id)).collect(),
         };
-        assert_eq!(swap_gas(&[route(&[1])]), Gas::from_ggas(9_200, 9_200));
+        assert_eq!(swap_gas(&[route(&[1])]), SWAP_GAS + HOP_GAS);
         // Another route through the same pool costs less than a new pool
         assert_eq!(
             swap_gas(&[route(&[1, 2]), route(&[1])]),
-            Gas::from_ggas(12_000, 12_000)
+            SWAP_GAS + HOP_GAS * 2 + REPEATED_HOP_GAS
         );
     }
 }

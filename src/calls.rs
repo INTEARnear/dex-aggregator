@@ -265,11 +265,16 @@ pub enum IntearDexWithdrawAmount {
 /// Burns `ft_transfer_call` and `ft_resolve_transfer` with the fees of `ft_on_transfer`, and needs
 /// attached what the token keeps, `ft_on_transfer` gets the rest. Simulated on mainnet state for a
 /// token of each contract code, tokens keep 9 to 47 (linear-protocol.near) Tgas.
+/// The others are medians of what the router's swaps of two days on mainnet burnt.
 fn ft_transfer_call_gas(token_id: &AccountId) -> Gas {
     let estimated_burn = match token_id.as_str() {
         "meta-pool.near" => 20_600,
         "linear-protocol.near" => 6_800,
-        _ => 5_400,
+        "wrap.near" => 4_370,
+        "usdt.tether-token.near" => 4_780,
+        // USDC
+        "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1" => 5_340,
+        _ => 4_530,
     };
     Gas::from_ggas(estimated_burn, 50_000)
 }
@@ -285,11 +290,13 @@ fn storage_deposit_gas(token_id: &AccountId) -> Gas {
 }
 
 /// `ft_transfer`, simulated on mainnet state for a token of each contract code, burns 1.5 to 9.4
-/// (meta-pool.near) Tgas
+/// (meta-pool.near) Tgas.
+/// The others are medians of what the router's swaps of two days on mainnet burnt.
 fn ft_transfer_gas(token_id: &AccountId) -> Gas {
     let estimated_burn = match token_id.as_str() {
         "meta-pool.near" => 9_700,
-        _ => 2_000,
+        "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1" => 2_320,
+        _ => 1_900,
     };
     Gas::from_ggas(estimated_burn, 20_000)
 }
@@ -307,8 +314,8 @@ const QOQ_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
 /// them in a receipt of their own, and pays the oracle its fee in a call after them that it
 /// attaches 10 Tgas to. On mainnet, holding them burnt 0.9 Tgas more than the call that makes the
-/// request burns without it, and the call after them 2.84. The oracle pays for its response.
-const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(3_700, 14_700);
+/// request burns without it, and the call after them 2.89. The oracle pays for its response.
+const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(3_790, 14_700);
 /// What Intear DEX attaches to the last call after the operations of a deposit that waited for
 /// an oracle, which keeps the deposit if refunding it failed. That's the call after the
 /// operations, which ORACLE_REQUEST_GAS counts the burn of.
@@ -366,7 +373,8 @@ impl CallBlueprint {
             CallBlueprint::Nep141DepositOnIntearDex { token_id, .. } => {
                 ft_transfer_call_gas(token_id) + Gas::from_ggas(3_670, 3_300)
             }
-            CallBlueprint::WrapNear { .. } => Gas::from_ggas(1_700, 2_500),
+            // In one transaction with the call to wrap.near after it, which spends the wrapped NEAR
+            CallBlueprint::WrapNear { .. } => Gas::from_ggas(1_610, 2_500),
             CallBlueprint::UnwrapNear {
                 trader_account_id, ..
             } => Gas::from_ggas(1_900, 2_500) + near_receive_gas(trader_account_id.as_ref()),
@@ -379,7 +387,7 @@ impl CallBlueprint {
             } => {
                 let token_out = &actions.last().expect("Swaps have actions").token_out;
                 ft_transfer_call_gas(token_id)
-                    + Gas::from_ggas(3_600, 3_600)
+                    + Gas::from_ggas(4_700, 3_600)
                     + *swap_gas
                     + rhea_output_gas(output, token_out)
                     + GAS_MARGIN
@@ -394,10 +402,10 @@ impl CallBlueprint {
                 // DCL reserves the same gas for sending either output
                 let output_gas = match output {
                     RheaOutput::Nep141 => {
-                        Gas::from_ggas(2_360, 31_800) + burn_only(ft_transfer_gas(token_out))
+                        Gas::from_ggas(2_510, 31_800) + burn_only(ft_transfer_gas(token_out))
                     }
                     RheaOutput::Near { trader_account_id } => {
-                        Gas::from_ggas(5_160, 31_800)
+                        Gas::from_ggas(4_790, 31_800)
                             + burn_only(near_receive_gas(trader_account_id.as_ref()))
                     }
                 };
@@ -427,10 +435,10 @@ impl CallBlueprint {
             CallBlueprint::RheaWithdraw {
                 token_id, output, ..
             } => Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output, token_id),
-            CallBlueprint::RheaDclStorageDeposit { .. } => Gas::from_ggas(3_000, 4_000),
-            CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(3_080, 3_500),
+            CallBlueprint::RheaDclStorageDeposit { .. } => Gas::from_ggas(3_540, 4_000),
+            CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(2_900, 3_500),
             CallBlueprint::IntearDexRegisterAssets { asset_ids, .. } => {
-                Gas::from_ggas(3_270, 3_770) + Gas::from_ggas(340, 340) * asset_ids.len() as u64
+                Gas::from_ggas(3_070, 3_770) + Gas::from_ggas(340, 340) * asset_ids.len() as u64
             }
             CallBlueprint::IntearDexDepositNear {
                 operations: None, ..
@@ -438,7 +446,7 @@ impl CallBlueprint {
             CallBlueprint::IntearDexDepositNear {
                 operations: Some(operations),
                 ..
-            } => Gas::from_ggas(3_600, 3_600) + operations.gas_with_deposit(),
+            } => Gas::from_ggas(3_080, 3_600) + operations.gas_with_deposit(),
             CallBlueprint::IntearDexExecuteOperations { operations } => {
                 Gas::from_ggas(3_600, 3_600) + operations.gas()
             }
@@ -1025,10 +1033,10 @@ fn burn_only(gas: Gas) -> Gas {
 /// Of Rhea sending `token_id` out of the signer's balance
 fn rhea_output_gas(output: &RheaOutput, token_id: &AccountId) -> Gas {
     match output {
-        RheaOutput::Nep141 => Gas::from_ggas(2_200, 26_800) + burn_only(ft_transfer_gas(token_id)),
+        RheaOutput::Nep141 => Gas::from_ggas(2_170, 26_800) + burn_only(ft_transfer_gas(token_id)),
         // Rhea attaches no gas to the transfer of NEAR
         RheaOutput::Near { trader_account_id } => {
-            Gas::from_ggas(4_600, 31_800) + burn_only(near_receive_gas(trader_account_id.as_ref()))
+            Gas::from_ggas(4_460, 31_800) + burn_only(near_receive_gas(trader_account_id.as_ref()))
         }
     }
 }
@@ -1036,11 +1044,11 @@ fn rhea_output_gas(output: &RheaOutput, token_id: &AccountId) -> Gas {
 /// Of Intear DEX sending an asset out of the signer's balance
 fn intear_dex_sending_out_gas(asset: &IntearAssetId, trader_account_id: Option<&AccountId>) -> Gas {
     match asset {
-        // after_withdraw burnt 2.41 Tgas on mainnet
-        IntearAssetId::Near => Gas::from_ggas(2_400, 5_900) + near_receive_gas(trader_account_id),
+        // after_withdraw burnt 2.45 Tgas on mainnet
+        IntearAssetId::Near => Gas::from_ggas(2_450, 5_900) + near_receive_gas(trader_account_id),
         // The DEX attaches 10 Tgas to ft_transfer
         IntearAssetId::Nep141(token_id) => {
-            Gas::from_ggas(2_400, 16_800) + burn_only(ft_transfer_gas(token_id))
+            Gas::from_ggas(2_450, 16_800) + burn_only(ft_transfer_gas(token_id))
         }
     }
 }
@@ -1197,14 +1205,14 @@ mod tests {
         };
         assert_eq!(
             rhea_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(18_700, 88_900)
+            Gas::from_ggas(18_640, 88_900)
         );
         assert_eq!(
             rhea_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
             .gas(),
-            gas(19_323_182_562_500, 93_900_000_000_000)
+            gas(19_253_182_562_500, 93_900_000_000_000)
         );
         assert_eq!(
             CallBlueprint::RheaSwap {
@@ -1228,14 +1236,14 @@ mod tests {
         };
         assert_eq!(
             rhea_dcl_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(29_760, 101_800)
+            Gas::from_ggas(28_780, 101_800)
         );
         assert_eq!(
             rhea_dcl_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
             .gas(),
-            gas(30_783_182_562_500, 101_800_000_000_000)
+            gas(29_383_182_562_500, 101_800_000_000_000)
         );
 
         assert_eq!(
@@ -1244,7 +1252,7 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft()])),
             }
             .gas(),
-            Gas::from_ggas(42_500, 67_000)
+            Gas::from_ggas(41_930, 67_000)
         );
         assert_eq!(
             CallBlueprint::IntearDexDepositNear {
@@ -1252,7 +1260,7 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft(), withdraw_near()])),
             }
             .gas(),
-            gas(45_623_182_562_500, 73_623_182_562_500)
+            gas(45_103_182_562_500, 73_623_182_562_500)
         );
         assert_eq!(
             CallBlueprint::IntearDexExecuteOperations {
@@ -1268,7 +1276,7 @@ mod tests {
                 operations: intear_operations(vec![withdraw_near()]),
             }
             .gas(),
-            gas(45_123_182_562_500, 105_323_182_562_500)
+            gas(44_303_182_562_500, 105_323_182_562_500)
         );
     }
 
@@ -1303,7 +1311,7 @@ mod tests {
                 for_account: None,
             }
             .gas(),
-            Gas::from_ggas(3_610, 4_110)
+            Gas::from_ggas(3_410, 4_110)
         );
         assert_eq!(
             CallBlueprint::IntearDexRegisterAssets {
@@ -1311,7 +1319,7 @@ mod tests {
                 for_account: None,
             }
             .gas(),
-            Gas::from_ggas(3_950, 4_450)
+            Gas::from_ggas(3_750, 4_450)
         );
     }
 

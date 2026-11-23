@@ -502,12 +502,11 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
     Ok(pools)
 }
 
-// Source: routes simulated on mainnet state with INTEAR_simulate_transactions
-const HOP_GAS: Gas = Gas::from_ggas(2_900, 2_900);
-const STABLE_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_000, 1_000);
-const RATED_POOL_GAS: Gas = Gas::from_ggas(2_400, 2_400);
-const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_000, 1_000);
-const DEGEN_POOL_GAS: Gas = Gas::from_ggas(3_600, 3_600);
+const HOP_GAS: Gas = Gas::from_ggas(2_540, 2_540);
+const STABLE_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_070, 1_070);
+const RATED_POOL_GAS: Gas = Gas::from_ggas(1_530, 1_530);
+const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_290, 1_290);
+const DEGEN_POOL_GAS: Gas = Gas::from_ggas(3_940, 3_940);
 /// Simulated swaps burnt up to 3.5 Tgas more than estimated
 const GAS_MARGIN: NearGas = NearGas::from_tgas(4);
 const GAS_MARGIN_PERCENT: u64 = 15;

@@ -115,7 +115,7 @@ impl PoolsSnapshot for QoqPools {
         let dex_id = QOQ_DEX_ID.parse().unwrap();
         let routes = self.pools.swap_routes(&request.routes)?;
         let prices_request = self.pools.prices_request(&request.routes)?;
-        let gas = qoq::swap_gas(&routes);
+        let gas = self.pools.swap_gas(&request.routes)?;
         Ok(HookSwap {
             dex_id,
             message: Base64VecU8(borsh::to_vec(&SwapArgs { routes }).unwrap()),

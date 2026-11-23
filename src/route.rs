@@ -376,9 +376,9 @@ mod tests {
         assert_eq!(
             route.gas(),
             Gas::from_ggas(2_300, 20_000) * 2
-                + Gas::from_ggas(3_000, 4_000)
-                + Gas::from_ggas(1_700, 2_500)
-                + Gas::from_ggas(2_000, 20_000) * 2
+                + Gas::from_ggas(3_540, 4_000)
+                + Gas::from_ggas(1_610, 2_500)
+                + Gas::from_ggas(1_900, 20_000) * 2
         );
     }
 }

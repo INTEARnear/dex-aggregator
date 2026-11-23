@@ -28,9 +28,10 @@ use crate::intear_dex::{self, OracleFees};
 pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
-const SWAP_GAS: Gas = Gas::from_ggas(10_000, 10_000);
+const SWAP_GAS: Gas = Gas::from_ggas(6_820, 6_820);
 /// Measured as another route through the same pool, a hop through another pool also loads it
-const HOP_GAS: Gas = Gas::from_ggas(5_600, 5_600);
+const ORACLE_HOP_GAS: Gas = Gas::from_ggas(6_030, 6_030);
+const FIXED_PRICE_HOP_GAS: Gas = Gas::from_ggas(1_990, 1_990);
 
 /// A pool of the amp DEX, rated at its fixed price or the median of its oracle's prices
 pub struct Pool {
@@ -48,6 +49,13 @@ pub struct Pool {
 }
 
 impl Pool {
+    fn hop_gas(&self) -> Gas {
+        match self.oracle_key {
+            Some(_) => ORACLE_HOP_GAS,
+            None => FIXED_PRICE_HOP_GAS,
+        }
+    }
+
     fn new(id: PoolId, stored: &StoredPool, price: Price) -> Self {
         Self {
             id,
@@ -239,7 +247,7 @@ impl RatedPools {
                 .map(|pool| HookPool {
                     tokens: pool.tokens.clone(),
                     state: PoolState::of_balances(pool.balances.0.map(TokenAmount::get)),
-                    hop_gas: HOP_GAS.estimated_burn,
+                    hop_gas: pool.hop_gas().estimated_burn,
                     oracle_key: pool.oracle_key.clone(),
                 })
                 .collect(),
@@ -276,6 +284,17 @@ impl RatedPools {
             Amount::AmountIn(_) => swap_amounts.amount_out.get(),
             Amount::AmountOut(_) => swap_amounts.amount_in.get(),
         })
+    }
+
+    /// What a swap on `routes` burns
+    pub fn swap_gas(&self, routes: &[HookSwapRoute]) -> Result<Gas, String> {
+        Ok(SWAP_GAS
+            + self
+                .pools_of(routes)?
+                .into_iter()
+                .flatten()
+                .map(Pool::hop_gas)
+                .sum::<Gas>())
     }
 
     fn pools_of(&self, routes: &[HookSwapRoute]) -> Result<Vec<Vec<&Pool>>, String> {
@@ -329,15 +348,6 @@ impl RatedPools {
             )
         }))
     }
-}
-
-/// What a swap on `routes` burns
-pub fn swap_gas(routes: &[SwapRoute]) -> Gas {
-    let hops = routes
-        .iter()
-        .map(|route| route.pool_ids.len())
-        .sum::<usize>();
-    SWAP_GAS + HOP_GAS * hops as u64
 }
 
 #[cfg(test)]
@@ -621,17 +631,12 @@ mod tests {
     }
 
     #[test]
-    fn swap_gas_counts_hops() {
-        let routes = [
-            SwapRoute {
-                fraction: RouteFraction::new(500_000),
-                pool_ids: vec![PoolId::new(0), PoolId::new(1)],
-            },
-            SwapRoute {
-                fraction: RouteFraction::new(500_000),
-                pool_ids: vec![PoolId::new(1)],
-            },
-        ];
-        assert_eq!(swap_gas(&routes), SWAP_GAS + HOP_GAS * 3);
+    fn swap_gas_counts_hops_by_their_pool() {
+        let rated = pools_with_a_fixed_price().rated(Some(&oracle_prices()));
+        assert_eq!(
+            rated.swap_gas(&[route(&[0, 1]), route(&[1])]).unwrap(),
+            SWAP_GAS + ORACLE_HOP_GAS + FIXED_PRICE_HOP_GAS * 2
+        );
+        assert!(rated.swap_gas(&[route(&[2])]).is_err());
     }
 }
