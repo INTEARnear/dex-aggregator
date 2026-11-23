@@ -388,7 +388,7 @@ impl CallBlueprint {
             } => {
                 let token_out = &actions.last().expect("Swaps have actions").token_out;
                 ft_transfer_call_gas(token_id)
-                    + Gas::from_ggas(4_700, 3_600)
+                    + Gas::from_ggas(4_700, 4_700)
                     + *swap_gas
                     + rhea_output_gas(output, token_out)
                     + GAS_MARGIN

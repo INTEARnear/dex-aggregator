@@ -40,11 +40,9 @@ impl Hook for Qoq {
     type Pools = QoqPools;
 
     fn init() -> Result<Self, String> {
-        let oracle_url = std::env::var("QOQ_ORACLE_URL")
-            .map_err(|err| format!("QOQ_ORACLE_URL, the oracle's HTTP API: {err}"))?;
         Ok(Self {
             pools: RwLock::default(),
-            oracle_prices: OraclePricesFeed::start(oracle_url)?,
+            oracle_prices: OraclePricesFeed::start("https://qoq-oracle.intear.tech".to_string())?,
             snapshot: Mutex::default(),
         })
     }
