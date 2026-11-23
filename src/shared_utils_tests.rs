@@ -125,7 +125,7 @@ fn deposit_storage_if_needed_registers_where_the_token_is() {
         vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader(),
             asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
-            fee_receivers: vec![],
+            receivers: vec![],
         }]
     );
     assert_eq!(
@@ -1124,7 +1124,7 @@ async fn convert_to_intear_near_destination_uses_deposit_near() {
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
                 asset_ids: vec![IntearAssetId::Near],
-                fee_receivers: vec![],
+                receivers: vec![],
             },
             deposit_near,
         ]
@@ -1153,7 +1153,7 @@ fn convert_to_step_order_is_register_withdraw_convert_deposit() {
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
                 asset_ids: vec![IntearAssetId::Nep141(account(WRAP_NEAR))],
-                fee_receivers: vec![],
+                receivers: vec![],
             },
             RouteStep::TraderStorageDepositOnNep141IfNeeded {
                 token_id: account(WRAP_NEAR),
@@ -1227,7 +1227,7 @@ fn convert_to_doesnt_register_the_trader_on_their_wallet_token() {
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
                 asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
-                fee_receivers: vec![],
+                receivers: vec![],
             },
             RouteStep::StorageDepositOnNep141IfNeeded {
                 token_id: account("ft"),

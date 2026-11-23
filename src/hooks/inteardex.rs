@@ -414,20 +414,36 @@ pub fn route(
     };
     let output_withdrawn = !withdrawals.is_empty();
 
-    // The fast path swaps from the input's balance, and exact-out withdraws what's left of the
-    // input, as does exact-in after a swap that buys an oracle's fee, so only the other exact-in
-    // deposits are swapped whole without a balance of the input. The fast path also puts what each
-    // step gives into the trader's balance.
-    let registered_assets = if use_fast_path {
-        [token_in.clone()]
+    let referrer = request
+        .referrer_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap());
+    // The fast path swaps from the input's balance and puts what each step gives into the
+    // trader's balance. The deposit paths send to the trader what they withdraw, and the referrer
+    // takes what can't be sent: the output, what's left of the input of exact-out and of exact-in
+    // after a swap that buys an oracle's fee, and a deposit that an oracle didn't respond to in
+    // time, with the fee that it bought.
+    let (trader_assets, rescued_assets) = if use_fast_path {
+        let balances = [token_in.clone()]
             .into_iter()
             .chain(swap.intermediate_assets().cloned())
             .chain([token_out.clone()])
-            .collect()
-    } else if matches!(request.amount, Amount::AmountOut(_)) || oracle_fee_is_swapped {
-        vec![token_in.clone(), token_out.clone()]
+            .collect();
+        (balances, vec![])
     } else {
-        vec![token_out.clone()]
+        let input_can_return =
+            matches!(request.amount, Amount::AmountOut(_)) || swap.oracle_request.is_some();
+        let bought_oracle_fee = swap
+            .oracle_request
+            .as_ref()
+            .and_then(|oracle_request| oracle_request.request.fee_swap.as_ref())
+            .map(|fee_swap| intear_asset(fee_swap.fee.0.clone()));
+        let rescued = [token_out.clone()]
+            .into_iter()
+            .chain(input_can_return.then(|| token_in.clone()))
+            .chain(bought_oracle_fee)
+            .collect();
+        (vec![], rescued)
     };
     // The quote improvement fee is paid out of the output of an exact-in swap, and on top of the
     // input of an exact-out one
@@ -438,8 +454,8 @@ pub fn route(
     let registration = match &request.trader_account_id {
         Some(trader_account_id) => vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader_account_id.clone(),
-            asset_ids: registered_assets,
-            fee_receivers: referral_fees
+            asset_ids: trader_assets,
+            receivers: referral_fees
                 .0
                 .iter()
                 .map(|(receiver_id, _)| (receiver_id.clone(), token_in.clone()))
@@ -450,6 +466,11 @@ pub fn route(
                         .map(|receiver_id| {
                             (receiver_id.clone(), quote_improvement_fee_asset.clone())
                         }),
+                )
+                .chain(
+                    rescued_assets
+                        .into_iter()
+                        .map(|asset| (referrer.clone(), asset)),
                 )
                 .collect(),
         }],
@@ -481,10 +502,7 @@ pub fn route(
             quote_improvement_fee,
         },
         withdrawals,
-        referrer: request
-            .referrer_id
-            .clone()
-            .unwrap_or_else(|| DEFAULT_REFERRER_ID.parse().unwrap()),
+        referrer,
         referral_fees,
         trader_account_id: request.trader_account_id.clone(),
         fee_discount: swap.fee_discount,
@@ -742,7 +760,19 @@ mod tests {
         RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id: trader(),
             asset_ids,
-            fee_receivers: vec![],
+            receivers: vec![],
+        }
+    }
+
+    /// Of the assets the referrer takes if they can't be sent to the trader
+    fn rescue_registration(asset_ids: Vec<IntearAssetId>) -> RouteStep {
+        RouteStep::RegisterOnIntearDexIfNeeded {
+            trader_account_id: trader(),
+            asset_ids: vec![],
+            receivers: asset_ids
+                .into_iter()
+                .map(|asset_id| (account(DEFAULT_REFERRER_ID), asset_id))
+                .collect(),
         }
     }
 
@@ -921,6 +951,7 @@ mod tests {
                     "request": "bmVhcix1c2Rj",
                     "fee": ["near", "3"],
                     "swap": null,
+                    "rescue_address": DEFAULT_REFERRER_ID,
                 },
             })
         );
@@ -973,6 +1004,7 @@ mod tests {
                         "asset_in": "near",
                         "constraint": "3",
                     },
+                    "rescue_address": DEFAULT_REFERRER_ID,
                 },
             })
         );
@@ -988,7 +1020,7 @@ mod tests {
                     "asset_id": "near",
                     "amount": { "Full": { "at_least": null } },
                     "to": null,
-                    "rescue_address": null,
+                    "rescue_address": DEFAULT_REFERRER_ID,
                 },
             })
         );
@@ -1227,7 +1259,7 @@ mod tests {
                         "asset_id": "nep141:ft",
                         "amount": { "Full": { "at_least": "79" } },
                         "to": null,
-                        "rescue_address": null,
+                        "rescue_address": DEFAULT_REFERRER_ID,
                     },
                 },
             ])
@@ -1296,7 +1328,7 @@ mod tests {
                                 "asset_id": "nep141:ft",
                                 "amount": { "Full": { "at_least": "79" } },
                                 "to": null,
-                                "rescue_address": null,
+                                "rescue_address": DEFAULT_REFERRER_ID,
                             },
                         },
                     ],
@@ -1316,7 +1348,7 @@ mod tests {
                 Amount::AmountOut(79),
                 ft_output(),
                 vec![
-                    registration(vec![ft()]),
+                    rescue_registration(vec![ft()]),
                     trader_storage("ft"),
                     deposit_near(100, exact_in_operations(IntearAssetId::Near, ft())),
                 ],
@@ -1337,7 +1369,7 @@ mod tests {
                 Amount::AmountOut(79),
                 ft_output(),
                 vec![
-                    registration(vec![ft()]),
+                    rescue_registration(vec![ft()]),
                     trader_storage("ft"),
                     RouteStep::Call(CallBlueprint::UnwrapNear {
                         amount: NearToken::from_yoctonear(100),
@@ -1362,7 +1394,7 @@ mod tests {
                 Amount::AmountOut(79),
                 ft_output(),
                 vec![
-                    registration(vec![ft()]),
+                    rescue_registration(vec![ft()]),
                     trader_storage("ft"),
                     RouteStep::RegisterOnRheaIfNeeded {
                         trader_account_id: trader(),
@@ -1418,7 +1450,7 @@ mod tests {
                 Amount::AmountOut(79),
                 TokenId::Near,
                 vec![
-                    registration(vec![IntearAssetId::Near]),
+                    rescue_registration(vec![IntearAssetId::Near]),
                     RouteStep::Call(CallBlueprint::InputNep141TransferCallIntearDex {
                         token_id: account("ft"),
                         amount: 100,
@@ -1442,7 +1474,7 @@ mod tests {
                 Amount::AmountOut(79),
                 TokenId::Near,
                 vec![
-                    registration(vec![IntearAssetId::Near]),
+                    rescue_registration(vec![IntearAssetId::Near]),
                     trader_storage("ft"),
                     RouteStep::RegisterOnRheaIfNeeded {
                         trader_account_id: trader(),
@@ -1472,7 +1504,7 @@ mod tests {
                 Amount::AmountIn(101),
                 ft_output(),
                 vec![
-                    registration(vec![IntearAssetId::Near, ft()]),
+                    rescue_registration(vec![ft(), IntearAssetId::Near]),
                     trader_storage("ft"),
                     deposit_near(
                         101,
@@ -1594,12 +1626,25 @@ mod tests {
     #[test]
     fn custom_referrer_id_is_passed_in_operations() {
         let route = test_route(SwapRequest {
-            trader_account_id: None,
             referrer_id: Some(account("ref.near")),
             ..request(TokenId::Near, ft_output(), Amount::AmountIn(100))
         })
         .unwrap();
-        assert_eq!(last_call(&route).0["operations"]["referrer"], "ref.near");
+        let (args, _) = last_call(&route);
+        assert_eq!(args["operations"]["referrer"], "ref.near");
+        // It takes the output if it can't be sent to the trader, which registers it for that
+        assert_eq!(
+            args["operations"]["operations"][1]["Withdraw"]["rescue_address"],
+            "ref.near"
+        );
+        assert_eq!(
+            route.steps[0],
+            RouteStep::RegisterOnIntearDexIfNeeded {
+                trader_account_id: trader(),
+                asset_ids: vec![],
+                receivers: vec![(account("ref.near"), ft())],
+            }
+        );
     }
 
     #[tokio::test]
@@ -1675,16 +1720,19 @@ mod tests {
             route.steps[0],
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![ft()],
-                fee_receivers: vec![
+                asset_ids: vec![],
+                receivers: vec![
                     (account("ref.near"), IntearAssetId::Near),
                     (account("ref2.near"), IntearAssetId::Near),
                     (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), IntearAssetId::Near),
+                    (account(DEFAULT_REFERRER_ID), ft()),
                 ],
             }
         );
 
-        // ref.near and the aggregator haven't registered NEAR, so the trader registers it for them
+        // ref.near and the aggregator haven't registered NEAR, nor the aggregator, the referrer,
+        // the output that it takes if it can't be sent to the trader, so the trader registers
+        // them, the aggregator's in one call
         let network = TestNetworkView::default()
             .with_storage(
                 INTEAR_DEX_CONTRACT_ID,
@@ -1698,7 +1746,6 @@ mod tests {
                 NearToken::from_near(1),
                 NearToken::from_near(1),
             )
-            .with_intear_registered("trader.near", &AssetId::Nep141(account("ft")), true)
             .with_intear_registered("ref2.near", &AssetId::Near, true);
         let resolved = resolve(&network, route.clone()).await.unwrap();
         assert_eq!(
@@ -1709,7 +1756,7 @@ mod tests {
                     for_account: Some(account("ref.near")),
                 },
                 CallBlueprint::IntearDexRegisterAssets {
-                    asset_ids: vec![IntearAssetId::Near],
+                    asset_ids: vec![IntearAssetId::Near, ft()],
                     for_account: Some(AGGREGATOR_FEE_RECEIVER_ID.to_owned()),
                 },
             ]
@@ -1770,13 +1817,16 @@ mod tests {
                 "quote_improvement_receiver": "improvement.near",
             })
         );
-        // The trader registers the receiver for the output, which it's paid in
+        // The trader registers the receiver for the output, which it's paid in, as the referrer
         assert_eq!(
             exact_in.steps[0],
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![ft()],
-                fee_receivers: vec![(account("improvement.near"), ft())],
+                asset_ids: vec![],
+                receivers: vec![
+                    (account("improvement.near"), ft()),
+                    (account(DEFAULT_REFERRER_ID), ft()),
+                ],
             }
         );
 
@@ -1793,11 +1843,13 @@ mod tests {
             exact_out.steps[0],
             RouteStep::RegisterOnIntearDexIfNeeded {
                 trader_account_id: trader(),
-                asset_ids: vec![IntearAssetId::Near, ft()],
-                fee_receivers: vec![
+                asset_ids: vec![],
+                receivers: vec![
                     (account("ref.near"), IntearAssetId::Near),
                     (AGGREGATOR_FEE_RECEIVER_ID.to_owned(), IntearAssetId::Near),
                     (account("improvement.near"), IntearAssetId::Near),
+                    (account(DEFAULT_REFERRER_ID), ft()),
+                    (account(DEFAULT_REFERRER_ID), IntearAssetId::Near),
                 ],
             }
         );

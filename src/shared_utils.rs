@@ -730,14 +730,14 @@ fn intear_balances_bytes(
     balances_bytes + assets_bytes
 }
 
-/// Registers the assets the account has no balance of on Intear DEX yet, and each fee receiver's
-/// asset it hasn't registered, so the engine pays it its fee. The account deposits the storage
-/// all of them lack.
+/// Registers the assets the account has no balance of on Intear DEX yet, and each other receiver's
+/// asset it hasn't registered, so the engine can pay it: a fee receiver its fee, the referrer what
+/// can't be sent to the account. The account deposits the storage all of them lack.
 pub async fn register_assets_on_intear(
     network: &impl NetworkView,
     account_id: &AccountId,
     assets: &[IntearAssetId],
-    fee_receivers: &[(AccountId, IntearAssetId)],
+    receivers: &[(AccountId, IntearAssetId)],
 ) -> Option<Vec<CallBlueprint>> {
     let contract_id: AccountId = INTEAR_DEX_CONTRACT_ID.parse().unwrap();
     let mut unregistered = Vec::new();
@@ -755,18 +755,28 @@ pub async fn register_assets_on_intear(
             unregistered.push(asset);
         }
     }
-    let mut unregistered_fee_receivers = Vec::new();
-    for fee_receiver in fee_receivers {
-        let (receiver_id, asset) = fee_receiver;
-        if !unregistered_fee_receivers.contains(&fee_receiver)
-            && !network
+    // Each receiver's assets in one call
+    let mut unregistered_of_receivers: Vec<(&AccountId, Vec<&IntearAssetId>)> = Vec::new();
+    for (receiver_id, asset) in receivers {
+        let listed = unregistered_of_receivers
+            .iter()
+            .any(|(id, assets)| *id == receiver_id && assets.contains(&asset));
+        if listed
+            || network
                 .is_intear_asset_registered(receiver_id, &AssetId::from(asset))
                 .await
         {
-            unregistered_fee_receivers.push(fee_receiver);
+            continue;
+        }
+        match unregistered_of_receivers
+            .iter_mut()
+            .find(|(id, _)| *id == receiver_id)
+        {
+            Some((_, assets)) => assets.push(asset),
+            None => unregistered_of_receivers.push((receiver_id, vec![asset])),
         }
     }
-    if unregistered.is_empty() && unregistered_fee_receivers.is_empty() {
+    if unregistered.is_empty() && unregistered_of_receivers.is_empty() {
         return Some(vec![]);
     }
     let storage = network
@@ -789,18 +799,21 @@ pub async fn register_assets_on_intear(
                     .ok()?);
         bytes += intear_balances_bytes(account_id, &unregistered, balances_exist);
     }
-    for (receiver_id, asset) in &unregistered_fee_receivers {
+    for (receiver_id, assets) in &unregistered_of_receivers {
         // Others can register assets for an account without storage, so it can have balances
         let balances_exist = network
             .intear_balances_exist(receiver_id)
             .await
             .inspect_err(|e| info!("Failed to get the balances of {receiver_id}: {e}"))
             .ok()?;
-        bytes += intear_balances_bytes(receiver_id, &[asset], balances_exist);
+        bytes += intear_balances_bytes(receiver_id, assets, balances_exist);
     }
     let mut new_assets = unregistered.clone();
-    for (_, asset) in &unregistered_fee_receivers {
-        if !new_assets.contains(&asset) {
+    for asset in unregistered_of_receivers
+        .iter()
+        .flat_map(|(_, assets)| assets)
+    {
+        if !new_assets.contains(asset) {
             new_assets.push(asset);
         }
     }
@@ -838,9 +851,9 @@ pub async fn register_assets_on_intear(
             for_account: None,
         });
     }
-    for (receiver_id, asset) in unregistered_fee_receivers {
+    for (receiver_id, assets) in unregistered_of_receivers {
         calls.push(CallBlueprint::IntearDexRegisterAssets {
-            asset_ids: vec![asset.clone()],
+            asset_ids: assets.into_iter().cloned().collect(),
             for_account: Some(receiver_id.clone()),
         });
     }
@@ -1262,7 +1275,7 @@ pub fn deposit_storage_if_needed(
         TokenId::TokenOnIntearDex(asset_id) => vec![RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id,
             asset_ids: vec![asset_id.clone()],
-            fee_receivers: vec![],
+            receivers: vec![],
         }],
     }
 }

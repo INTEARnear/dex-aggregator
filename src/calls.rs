@@ -181,6 +181,7 @@ pub enum RheaDclSwap {
 pub struct IntearDexOperations {
     pub swap: IntearDexSwapOperation,
     pub withdrawals: Vec<IntearDexWithdrawal>,
+    /// Also takes what the engine can't send to the trader
     pub referrer: AccountId,
     /// The engine takes them out of the swap's input
     pub referral_fees: QuoteFees,
@@ -314,8 +315,8 @@ const QOQ_SWAP_MARGIN_PERCENT: u64 = 15;
 /// Intear DEX holds the operations after an oracle request until the oracle responds, then runs
 /// them in a receipt of their own, and pays the oracle its fee in a call after them that it
 /// attaches 10 Tgas to. On mainnet, holding them burnt 0.9 Tgas more than the call that makes the
-/// request burns without it, and the call after them 2.89. The oracle pays for its response.
-const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(3_790, 14_700);
+/// request burns without it, and the call after them 2.77. The oracle pays for its response.
+const ORACLE_REQUEST_GAS: Gas = Gas::from_ggas(3_670, 14_700);
 /// What Intear DEX attaches to the last call after the operations of a deposit that waited for
 /// an oracle, which keeps the deposit if refunding it failed. That's the call after the
 /// operations, which ORACLE_REQUEST_GAS counts the burn of.
@@ -417,7 +418,7 @@ impl CallBlueprint {
                 ..
             } => {
                 ft_transfer_call_gas(token_id)
-                    + Gas::from_ggas(2_600, 2_600)
+                    + Gas::from_ggas(2_430, 2_600)
                     + operations.gas_with_deposit()
             }
             CallBlueprint::InputNep141FeeTransfer { token_id, .. }
@@ -436,26 +437,26 @@ impl CallBlueprint {
                 token_id, output, ..
             } => Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output, token_id),
             CallBlueprint::RheaDclStorageDeposit { .. } => Gas::from_ggas(3_540, 4_000),
-            CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(2_900, 3_500),
+            CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(2_790, 3_500),
             CallBlueprint::IntearDexRegisterAssets { asset_ids, .. } => {
-                Gas::from_ggas(3_070, 3_770) + Gas::from_ggas(340, 340) * asset_ids.len() as u64
+                Gas::from_ggas(2_950, 3_770) + Gas::from_ggas(340, 340) * asset_ids.len() as u64
             }
             CallBlueprint::IntearDexDepositNear {
                 operations: None, ..
-            } => Gas::from_ggas(3_720, 4_000),
+            } => Gas::from_ggas(3_600, 4_000),
             CallBlueprint::IntearDexDepositNear {
                 operations: Some(operations),
                 ..
-            } => Gas::from_ggas(3_080, 3_600) + operations.gas_with_deposit(),
+            } => Gas::from_ggas(2_920, 3_600) + operations.gas_with_deposit(),
             CallBlueprint::IntearDexExecuteOperations { operations } => {
-                Gas::from_ggas(3_600, 3_600) + operations.gas()
+                Gas::from_ggas(3_480, 3_600) + operations.gas()
             }
             CallBlueprint::IntearDexWithdraw {
                 asset,
                 trader_account_id,
                 ..
             } => {
-                Gas::from_ggas(4_400, 4_400)
+                Gas::from_ggas(4_280, 4_400)
                     + intear_dex_sending_out_gas(asset, trader_account_id.as_ref())
             }
         };
@@ -922,7 +923,7 @@ impl IntearDexOperations {
                     },
                 },
                 to: None,
-                rescue_address: None,
+                rescue_address: Some(self.referrer.clone()),
             });
         let oracle_request = swap.oracle_request.iter().map(|oracle_request| {
             let OracleRequest {
@@ -953,6 +954,7 @@ impl IntearDexOperations {
                 request: request.clone(),
                 fee,
                 swap,
+                rescue_address: Some(self.referrer.clone()),
             }
         });
         let operations = oracle_request
@@ -1044,11 +1046,11 @@ fn rhea_output_gas(output: &RheaOutput, token_id: &AccountId) -> Gas {
 /// Of Intear DEX sending an asset out of the signer's balance
 fn intear_dex_sending_out_gas(asset: &IntearAssetId, trader_account_id: Option<&AccountId>) -> Gas {
     match asset {
-        // after_withdraw burnt 2.45 Tgas on mainnet
-        IntearAssetId::Near => Gas::from_ggas(2_450, 5_900) + near_receive_gas(trader_account_id),
+        // after_withdraw burnt 2.34 Tgas on mainnet
+        IntearAssetId::Near => Gas::from_ggas(2_340, 5_900) + near_receive_gas(trader_account_id),
         // The DEX attaches 10 Tgas to ft_transfer
         IntearAssetId::Nep141(token_id) => {
-            Gas::from_ggas(2_450, 16_800) + burn_only(ft_transfer_gas(token_id))
+            Gas::from_ggas(2_340, 16_800) + burn_only(ft_transfer_gas(token_id))
         }
     }
 }
@@ -1252,7 +1254,7 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft()])),
             }
             .gas(),
-            Gas::from_ggas(41_930, 67_000)
+            Gas::from_ggas(41_660, 67_000)
         );
         assert_eq!(
             CallBlueprint::IntearDexDepositNear {
@@ -1260,14 +1262,14 @@ mod tests {
                 operations: Some(intear_operations(vec![withdraw_ft(), withdraw_near()])),
             }
             .gas(),
-            gas(45_103_182_562_500, 73_623_182_562_500)
+            gas(44_723_182_562_500, 73_623_182_562_500)
         );
         assert_eq!(
             CallBlueprint::IntearDexExecuteOperations {
                 operations: intear_operations(vec![]),
             }
             .gas(),
-            Gas::from_ggas(37_600, 49_700)
+            Gas::from_ggas(37_480, 49_700)
         );
         assert_eq!(
             CallBlueprint::InputNep141TransferCallIntearDex {
@@ -1276,7 +1278,7 @@ mod tests {
                 operations: intear_operations(vec![withdraw_near()]),
             }
             .gas(),
-            gas(44_303_182_562_500, 105_323_182_562_500)
+            gas(44_023_182_562_500, 105_323_182_562_500)
         );
     }
 
@@ -1311,7 +1313,7 @@ mod tests {
                 for_account: None,
             }
             .gas(),
-            Gas::from_ggas(3_410, 4_110)
+            Gas::from_ggas(3_290, 4_110)
         );
         assert_eq!(
             CallBlueprint::IntearDexRegisterAssets {
@@ -1319,7 +1321,7 @@ mod tests {
                 for_account: None,
             }
             .gas(),
-            Gas::from_ggas(3_750, 4_450)
+            Gas::from_ggas(3_630, 4_450)
         );
     }
 

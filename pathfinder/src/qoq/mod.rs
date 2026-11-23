@@ -28,10 +28,9 @@ use crate::intear_dex::{self, OracleFees};
 pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
-const SWAP_GAS: Gas = Gas::from_ggas(6_820, 6_820);
-/// Measured as another route through the same pool, a hop through another pool also loads it
-const ORACLE_HOP_GAS: Gas = Gas::from_ggas(6_030, 6_030);
-const FIXED_PRICE_HOP_GAS: Gas = Gas::from_ggas(1_990, 1_990);
+const SWAP_GAS: Gas = Gas::from_ggas(6_560, 6_560);
+const ORACLE_HOP_GAS: Gas = Gas::from_ggas(5_420, 5_420);
+const FIXED_PRICE_HOP_GAS: Gas = Gas::from_ggas(1_620, 1_620);
 
 /// A pool of the amp DEX, rated at its fixed price or the median of its oracle's prices
 pub struct Pool {

@@ -303,9 +303,9 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
     storage::pools_source(state).map(build_pools)
 }
 
-const SWAP_GAS: Gas = Gas::from_ggas(5_730, 5_730);
-const HOP_GAS: Gas = Gas::from_ggas(1_710, 1_710);
-const REPEATED_HOP_GAS: Gas = Gas::from_ggas(590, 590);
+const SWAP_GAS: Gas = Gas::from_ggas(5_470, 5_470);
+const HOP_GAS: Gas = Gas::from_ggas(920, 920);
+const REPEATED_HOP_GAS: Gas = Gas::from_ggas(360, 360);
 
 impl Pools {
     pub fn block_height(&self) -> BlockHeight {

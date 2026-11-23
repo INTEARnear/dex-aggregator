@@ -65,7 +65,7 @@ pub enum RouteStep {
     RegisterOnIntearDexIfNeeded {
         trader_account_id: AccountId,
         asset_ids: Vec<IntearAssetId>,
-        fee_receivers: Vec<(AccountId, IntearAssetId)>,
+        receivers: Vec<(AccountId, IntearAssetId)>,
     },
 }
 
@@ -229,10 +229,8 @@ async fn resolve_step(network: &impl NetworkView, step: RouteStep) -> Option<Vec
         RouteStep::RegisterOnIntearDexIfNeeded {
             trader_account_id,
             asset_ids,
-            fee_receivers,
-        } => {
-            register_assets_on_intear(network, &trader_account_id, &asset_ids, &fee_receivers).await
-        }
+            receivers,
+        } => register_assets_on_intear(network, &trader_account_id, &asset_ids, &receivers).await,
     }
 }
 
