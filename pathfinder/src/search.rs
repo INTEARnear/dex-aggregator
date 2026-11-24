@@ -273,7 +273,7 @@ impl<P: Pool> Graph<P> {
             .unwrap_or_default()
     }
 
-    fn hop(&self, pool: usize, token_in: usize, token_out: usize) -> Hop {
+    pub fn hop(&self, pool: usize, token_in: usize, token_out: usize) -> Hop {
         let position = |token| {
             self.pool_tokens[pool]
                 .iter()

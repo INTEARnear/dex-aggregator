@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use bigdecimal::num_bigint::BigUint;
 use intear_dex_common::{
@@ -268,47 +268,46 @@ fn found_route(
     } = best_route(pools, scope, trade, amount, &request.prices)?;
     let graph = &pools_graph.graph;
 
-    let build_swaps = |emulated: &Emulated| route.swaps(pools, graph, emulated);
+    let swaps = route.swaps(pools, graph)?;
     let oracle_fee_swap_gas = oracle
         .as_ref()
         .and_then(|(_, payment)| payment.swap.as_ref())
         .map(|swap| swap.gas);
     let last_look_fee_discount = request.last_look.as_ref().and_then(|last_look| {
         last_look.fee_discount(|fee_discount| {
-            let emulated = route.emulate(graph, amount, fee_discount)?;
+            let estimated_amount = route.emulate(graph, amount, fee_discount)?;
             // The engine checks the discount once for all the swaps
             let fee_discount_gas = fee_discount.map(|_| FEE_DISCOUNT_GAS);
-            let swaps_gas = build_swaps(&emulated)?
+            let swaps_gas = swaps
                 .iter()
                 .map(|(_, _, swap)| swap.gas)
                 .chain(oracle_fee_swap_gas)
                 .chain(fee_discount_gas)
                 .sum::<Gas>();
             Some(SwapEstimate {
-                estimated_amount: emulated.amount,
+                estimated_amount,
                 gas: swaps_gas,
                 oracle_fee: oracle.as_ref().map(|(_, payment)| payment.cost),
             })
         })
     });
     let fee_discount = with_tear_fee_discount(last_look_fee_discount, request.tear_fee_discount);
-    let emulated = route.emulate(graph, amount, fee_discount)?;
+    let estimated_amount = route.emulate(graph, amount, fee_discount)?;
     // Only what the TEAR staker's discount adds is shown as the discount
     let discount = match request.tear_fee_discount {
         Some(_) => {
-            let counted_from = route.emulate(graph, amount, last_look_fee_discount)?.amount;
-            Some(emulated.amount.abs_diff(counted_from))
+            let counted_from = route.emulate(graph, amount, last_look_fee_discount)?;
+            Some(estimated_amount.abs_diff(counted_from))
         }
         None => None,
     };
-    let swaps = build_swaps(&emulated)?;
     let slippage_bp = pathfinder::slippage_bp(&trade.slippage).ok()?;
     let worst_case_amount = match amount {
         QuoteAmount::ExactIn(_) => {
-            pathfinder::with_slippage(emulated.amount, BASIS_POINTS - slippage_bp)
+            pathfinder::with_slippage(estimated_amount, BASIS_POINTS - slippage_bp)
         }
         QuoteAmount::ExactOut(_) => {
-            pathfinder::with_slippage(emulated.amount, BASIS_POINTS + slippage_bp)
+            pathfinder::with_slippage(estimated_amount, BASIS_POINTS + slippage_bp)
         }
     };
     let oracle_requests = swaps
@@ -331,7 +330,7 @@ fn found_route(
     };
     Some(FoundRoute {
         swaps,
-        estimated_amount: emulated.amount,
+        estimated_amount,
         worst_case_amount,
         discount,
         oracle_request,
@@ -406,7 +405,8 @@ fn searched_route<'a>(
         hop_cost,
     )
     .ok()?;
-    let (route, emulated, complete) = StepsRoute::best_of(pools, graph, &split_route, amount)?;
+    let (route, emulated, complete) =
+        StepsRoute::best_of(pools, scope, graph, &split_route, amount, hop_cost)?;
     Some(SearchedRoute {
         pools_graph,
         route,
@@ -416,12 +416,9 @@ fn searched_route<'a>(
 }
 
 /// A route through the pools of hooks, as steps on one hook's pools each, every step swapping
-/// what the one before it gave. Parts of a split route that go through the same pools in a step
-/// are one route of the step, which gives each of them its share of what it swaps.
+/// what the one before it gave
 struct StepsRoute {
     steps: Vec<Step>,
-    /// Of the parts of the split route, in percent
-    part_weights: Vec<u32>,
 }
 
 /// Routes on the pools of one hook, between the same tokens
@@ -434,164 +431,154 @@ struct Step {
     routes: Vec<StepRoute>,
 }
 
-/// Pools one after another
+/// Pools one after another, which swap a fraction of what the step swaps
 struct StepRoute {
     hops: Vec<Hop>,
-    /// Indices in [`StepsRoute::part_weights`] of the parts that go through it
-    parts: Vec<usize>,
-}
-
-/// What a route swaps, and the fraction of each step that each of its routes takes
-struct Emulated {
-    amount: Balance,
-    fractions: Vec<Vec<u32>>,
+    /// Of [`FULL_ROUTE_FRACTION`]
+    fraction: u32,
 }
 
 impl StepsRoute {
     /// Parts of a split route can only be swapped together when they go through the same hooks
-    /// and tokens between them, so of the parts that do, the ones that swap best, with the
-    /// amount split between them alone. A route of an exact-out swap is through one hook, since
-    /// only exact-in swaps can swap what the one before them gave. With what it swaps, and whether
-    /// it has every part.
+    /// and tokens between them, so of the parts that do, the ones that swap best. A route of an
+    /// exact-out swap is through one hook, since only exact-in swaps can swap what the one before
+    /// them gave. With what it swaps, and whether it has every part.
     fn best_of(
         pools: &RoutingPools,
+        scope: &PoolsScope,
         graph: &Graph<HookPool>,
         split_route: &search::SplitRoute,
         amount: QuoteAmount,
+        hop_cost: Balance,
     ) -> Option<(Self, Balance, bool)> {
-        let mut routes = Vec::<(Vec<(usize, u32, u32)>, Self)>::new();
+        let mut parts_by_shape = Vec::<(Vec<(usize, u32, u32)>, Vec<(Vec<Step>, u32)>)>::new();
         for part in &split_route.parts {
             let steps = steps_of(pools, graph, &part.route.hops);
             let shape = steps
                 .iter()
                 .map(|step| (step.snapshot, step.token_in, step.token_out))
                 .collect::<Vec<_>>();
-            match routes
+            let part = (steps, part.weight_percentage);
+            match parts_by_shape
                 .iter_mut()
                 .find(|(other_shape, _)| *other_shape == shape)
             {
-                Some((_, route)) => route.add_part(steps, part.weight_percentage),
-                None => {
-                    let mut route = Self {
-                        steps: steps
-                            .iter()
-                            .map(|step| Step {
-                                routes: Vec::new(),
-                                ..*step
-                            })
-                            .collect(),
-                        part_weights: Vec::new(),
-                    };
-                    route.add_part(steps, part.weight_percentage);
-                    routes.push((shape, route));
-                }
+                Some((_, parts)) => parts.push(part),
+                None => parts_by_shape.push((shape, vec![part])),
             }
         }
-        let complete = routes.len() == 1;
-        routes
+        let complete = parts_by_shape.len() == 1;
+        parts_by_shape
             .into_iter()
             .filter(|(shape, _)| shape.len() == 1 || matches!(amount, QuoteAmount::ExactIn(_)))
-            .filter_map(|(_, route)| {
-                let emulated = route.emulate(graph, amount, None)?;
-                Some((route, emulated.amount))
-            })
+            .filter_map(|(_, parts)| Self::of_parts(pools, scope, graph, parts, amount, hop_cost))
             .max_by(|(_, emulated), (_, other)| more_for(amount, *emulated, *other))
             .map(|(route, emulated)| (route, emulated, complete))
     }
 
-    /// A part through the same hooks and tokens between them, of one route each step
-    fn add_part(&mut self, part_steps: Vec<Step>, weight: u32) {
-        let part = self.part_weights.len();
-        self.part_weights.push(weight);
-        for (step, part_step) in self.steps.iter_mut().zip(part_steps) {
-            let [part_route] = <[StepRoute; 1]>::try_from(part_step.routes)
-                .unwrap_or_else(|_| unreachable!("A part's step is one route"));
-            let same_pools = |route: &&mut StepRoute| {
-                route.hops.len() == part_route.hops.len()
-                    && route
-                        .hops
-                        .iter()
-                        .zip(&part_route.hops)
-                        .all(|(hop, part_hop)| {
-                            (hop.pool, hop.token_in, hop.token_out)
-                                == (part_hop.pool, part_hop.token_in, part_hop.token_out)
-                        })
+    /// Parts through the same hooks and tokens between them, as one route, with what it swaps.
+    /// The first step splits the amount between the parts' routes by their weights. The search
+    /// weighs parts as if each swapped through all of its steps alone, so the weights don't tell
+    /// how to split what a step that parts share gives, and each later step is split as found
+    /// for what the step before it gives.
+    fn of_parts(
+        pools: &RoutingPools,
+        scope: &PoolsScope,
+        graph: &Graph<HookPool>,
+        parts: Vec<(Vec<Step>, u32)>,
+        amount: QuoteAmount,
+        hop_cost: Balance,
+    ) -> Option<(Self, Balance)> {
+        let mut first_step_routes = Vec::<(Vec<Hop>, Balance)>::new();
+        for (steps, weight) in &parts {
+            let [part_route] = steps[0].routes.as_slice() else {
+                unreachable!("A part's step is one route");
             };
-            match step.routes.iter_mut().find(same_pools) {
-                Some(route) => route.parts.push(part),
-                None => step.routes.push(StepRoute {
-                    hops: part_route.hops,
-                    parts: vec![part],
-                }),
+            let same_pools = |(hops, _): &&mut (Vec<Hop>, Balance)| {
+                hops.len() == part_route.hops.len()
+                    && hops.iter().zip(&part_route.hops).all(|(hop, part_hop)| {
+                        (hop.pool, hop.token_in, hop.token_out)
+                            == (part_hop.pool, part_hop.token_in, part_hop.token_out)
+                    })
+            };
+            match first_step_routes.iter_mut().find(same_pools) {
+                Some((_, route_weight)) => *route_weight += Balance::from(*weight),
+                None => first_step_routes.push((part_route.hops.clone(), Balance::from(*weight))),
             }
         }
+        let fractions = fractions_of(
+            &first_step_routes
+                .iter()
+                .map(|(_, weight)| *weight)
+                .collect::<Vec<_>>(),
+        )?;
+        let (shape_steps, _) = &parts[0];
+        let first_step = Step {
+            routes: first_step_routes
+                .into_iter()
+                .zip(fractions)
+                .map(|((hops, _), fraction)| StepRoute { hops, fraction })
+                .collect(),
+            ..shape_steps[0]
+        };
+        let mut pools_delta = PoolsDelta::default();
+        let mut step_amount = first_step.swap(graph, amount, None, &mut pools_delta)?;
+        let mut steps = vec![first_step];
+        for (index, shape_step) in shape_steps.iter().enumerate().skip(1) {
+            let asks_oracle = parts
+                .iter()
+                .flat_map(|(steps, _)| &steps[index].routes)
+                .flat_map(|route| &route.hops)
+                .any(|hop| {
+                    pools.origins[graph.pools()[hop.pool].index as usize]
+                        .oracle_key
+                        .is_some()
+                });
+            // The cost of hops is in the trade's output, which only the last step gives
+            let step_hop_cost = if index == shape_steps.len() - 1 {
+                hop_cost
+            } else {
+                0
+            };
+            let step = searched_step(
+                pools,
+                scope,
+                graph,
+                shape_step,
+                step_amount,
+                asks_oracle,
+                step_hop_cost,
+            )?;
+            step_amount = step.swap(
+                graph,
+                QuoteAmount::ExactIn(step_amount),
+                None,
+                &mut pools_delta,
+            )?;
+            steps.push(step);
+        }
+        Some((Self { steps }, step_amount))
     }
 
-    /// Swaps like the DEXes would: each step splits what it swaps between its routes by their
-    /// fractions, and the routes swap one after another. A route takes the shares of the step
-    /// that its parts have, and gives each of them a share of its swap in proportion. Every step
-    /// swaps with `fee_discount`, which the engine takes for all swaps of the operations.
+    /// Swaps like the DEXes would, every step with `fee_discount`, which the engine takes for all
+    /// swaps of the operations
     fn emulate(
         &self,
         graph: &Graph<HookPool>,
         amount: QuoteAmount,
         fee_discount: Option<FeeDiscountFraction>,
-    ) -> Option<Emulated> {
+    ) -> Option<Balance> {
         let mut pools_delta = PoolsDelta::default();
-        let mut fractions = Vec::with_capacity(self.steps.len());
-        let mut step_amount = amount.value();
-        let mut part_shares = self
-            .part_weights
+        self.steps
             .iter()
-            .map(|&weight| Balance::from(weight))
-            .collect::<Vec<_>>();
-        for step in &self.steps {
-            let route_shares = step
-                .routes
-                .iter()
-                .map(|route| route.parts.iter().map(|&part| part_shares[part]).sum())
-                .collect::<Vec<Balance>>();
-            let step_fractions = fractions_of(&route_shares)?;
-            let split = RouteFraction::split(
-                TokenAmount::new(step_amount),
-                step_fractions
-                    .iter()
-                    .map(|&fraction| RouteFraction::new(fraction)),
-            );
-            let route_amounts = step
-                .routes
-                .iter()
-                .zip(split)
-                .map(|(route, route_amount)| {
-                    let route_amount = match amount {
-                        QuoteAmount::ExactIn(_) => QuoteAmount::ExactIn(route_amount.get()),
-                        QuoteAmount::ExactOut(_) => QuoteAmount::ExactOut(route_amount.get()),
-                    };
-                    swap_hops(
-                        graph,
-                        &route.hops,
-                        route_amount,
-                        fee_discount,
-                        &mut pools_delta,
-                    )
-                })
-                .collect::<Option<Vec<_>>>()?;
-            for ((route, &route_amount), &route_share) in
-                step.routes.iter().zip(&route_amounts).zip(&route_shares)
-            {
-                for &part in &route.parts {
-                    part_shares[part] = share_of(route_amount, part_shares[part], route_share)?;
-                }
-            }
-            step_amount = route_amounts
-                .iter()
-                .try_fold(0u128, |total, amount| total.checked_add(*amount))?;
-            fractions.push(step_fractions);
-        }
-        Some(Emulated {
-            amount: step_amount,
-            fractions,
-        })
+            .try_fold(amount.value(), |step_amount, step| {
+                step.swap(
+                    graph,
+                    with_value(amount, step_amount),
+                    fee_discount,
+                    &mut pools_delta,
+                )
+            })
     }
 
     /// The swaps of the steps
@@ -599,12 +586,10 @@ impl StepsRoute {
         &self,
         pools: &RoutingPools,
         graph: &Graph<HookPool>,
-        emulated: &Emulated,
     ) -> Option<Vec<(AssetId, AssetId, HookSwap)>> {
         self.steps
             .iter()
-            .zip(&emulated.fractions)
-            .map(|(step, fractions)| {
+            .map(|step| {
                 let asset_in = pools.tokens[step.token_in as usize].clone();
                 let asset_out = pools.tokens[step.token_out as usize].clone();
                 let request = HookSwapRequest {
@@ -613,9 +598,8 @@ impl StepsRoute {
                     routes: step
                         .routes
                         .iter()
-                        .zip(fractions)
-                        .map(|(route, &fraction)| HookSwapRoute {
-                            fraction,
+                        .map(|route| HookSwapRoute {
+                            fraction: route.fraction,
                             pools: route
                                 .hops
                                 .iter()
@@ -638,6 +622,118 @@ impl StepsRoute {
     }
 }
 
+impl Step {
+    /// Splits `amount` between the routes by their fractions, and the routes swap one after
+    /// another: the output for exact in, the input for exact out
+    fn swap(
+        &self,
+        graph: &Graph<HookPool>,
+        amount: QuoteAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+        pools_delta: &mut PoolsDelta<HookPool>,
+    ) -> Option<Balance> {
+        let split = RouteFraction::split(
+            TokenAmount::new(amount.value()),
+            self.routes
+                .iter()
+                .map(|route| RouteFraction::new(route.fraction)),
+        );
+        self.routes
+            .iter()
+            .zip(split)
+            .try_fold(0u128, |total, (route, route_amount)| {
+                let swapped = swap_hops(
+                    graph,
+                    &route.hops,
+                    with_value(amount, route_amount.get()),
+                    fee_discount,
+                    pools_delta,
+                )?;
+                total.checked_add(swapped)
+            })
+    }
+}
+
+/// The routes through the pools of `step`'s hook that swap `amount_in` best, found in the pools
+/// as they are, with their hops in `graph`. Through the pools of the oracle of `scope` only if
+/// the step `asks_oracle` already, since one oracle request starts the operations. `hop_cost` is
+/// in the step's output.
+fn searched_step(
+    pools: &RoutingPools,
+    scope: &PoolsScope,
+    graph: &Graph<HookPool>,
+    step: &Step,
+    amount_in: Balance,
+    asks_oracle: bool,
+    hop_cost: Balance,
+) -> Option<Step> {
+    let step_scope = PoolsScope {
+        snapshot: Some(step.snapshot),
+        oracle_key: scope.oracle_key.clone().filter(|_| asks_oracle),
+    };
+    let step_graph = &pools.graph(&step_scope)?.graph;
+    let split_route = search::route(
+        step_graph,
+        step_graph.token_index(&step.token_in)?,
+        step_graph.token_index(&step.token_out)?,
+        QuoteAmount::ExactIn(amount_in),
+        MaxHops::Four,
+        SETTINGS,
+        hop_cost,
+    )
+    .ok()?;
+    let graph_pools_by_index = graph
+        .pools()
+        .iter()
+        .enumerate()
+        .map(|(graph_pool, pool)| (pool.index, graph_pool))
+        .collect::<HashMap<_, _>>();
+    // The step's scope has a part of the pools of `scope`, which `graph` has
+    let graph_token = |step_graph_token| {
+        graph
+            .token_index(step_graph.token(step_graph_token))
+            .unwrap()
+    };
+    let fractions = fractions_of(
+        &split_route
+            .parts
+            .iter()
+            .map(|part| Balance::from(part.weight_percentage))
+            .collect::<Vec<_>>(),
+    )?;
+    Some(Step {
+        routes: split_route
+            .parts
+            .iter()
+            .zip(fractions)
+            .map(|(part, fraction)| StepRoute {
+                hops: part
+                    .route
+                    .hops
+                    .iter()
+                    .map(|hop| {
+                        graph.hop(
+                            graph_pools_by_index[&step_graph.pools()[hop.pool].index],
+                            graph_token(hop.token_in),
+                            graph_token(hop.token_out),
+                        )
+                    })
+                    .collect(),
+                fraction,
+            })
+            .collect(),
+        ..*step
+    })
+}
+
+/// An amount of the same kind as `amount`
+fn with_value(amount: QuoteAmount, value: Balance) -> QuoteAmount {
+    match amount {
+        QuoteAmount::ExactIn(_) => QuoteAmount::ExactIn(value),
+        QuoteAmount::ExactOut(_) => QuoteAmount::ExactOut(value),
+    }
+}
+
 /// Orders the output of exact-in swaps from the least, and the input of exact-out ones from the
 /// most
 fn more_for(amount: QuoteAmount, swapped: Balance, other: Balance) -> std::cmp::Ordering {
@@ -647,7 +743,7 @@ fn more_for(amount: QuoteAmount, swapped: Balance, other: Balance) -> std::cmp::
     }
 }
 
-/// The hops of a part as steps on one hook's pools each
+/// The hops of a part as steps on one hook's pools each, of one route that swaps all of a step
 fn steps_of(pools: &RoutingPools, graph: &Graph<HookPool>, hops: &[Hop]) -> Vec<Step> {
     let mut steps = Vec::<Step>::new();
     for hop in hops {
@@ -664,18 +760,12 @@ fn steps_of(pools: &RoutingPools, graph: &Graph<HookPool>, hops: &[Hop]) -> Vec<
                 token_out,
                 routes: vec![StepRoute {
                     hops: vec![*hop],
-                    parts: Vec::new(),
+                    fraction: FULL_ROUTE_FRACTION.get(),
                 }],
             }),
         }
     }
     steps
-}
-
-/// `part` of `whole` of `amount`, rounded down
-fn share_of(amount: Balance, part: Balance, whole: Balance) -> Option<Balance> {
-    let share = BigUint::from(amount) * part / BigUint::from(whole);
-    Balance::try_from(share).ok()
 }
 
 /// Through the hops one after another: the output for exact in, the input for exact out
@@ -1396,6 +1486,47 @@ mod tests {
             .map(|near_part| out(NEAR_TEAR, near_part.get(), 0))
             .sum::<u128>();
         assert_eq!(chain.estimated_amount(), tear);
+    }
+
+    #[test]
+    fn a_later_step_splits_what_the_step_before_it_gives() {
+        let usdc_near = [1_000_000_000, 1_000_000];
+        let big_near_tear = [1_000_000, 3_000_000];
+        let small_near_tear = [100_000, 300_000];
+        let pools = RoutingPools::of_snapshots(vec![
+            snapshot(
+                "Plach",
+                "slimedragon.near/xyk",
+                HookPools {
+                    pools: vec![pool(["usdc", "near"], usdc_near, None)],
+                    oracle_fees: vec![],
+                },
+            ),
+            snapshot(
+                "Qoq",
+                "slimedragon.near/amp",
+                HookPools {
+                    pools: vec![
+                        pool(["near", "tear"], big_near_tear, None),
+                        pool(["near", "tear"], small_near_tear, None),
+                    ],
+                    oracle_fees: vec![],
+                },
+            ),
+        ]);
+        // Enough to take most of the NEAR of the USDC/NEAR pool, which the search gives to the
+        // part that swaps first, so it splits the USDC as if the other part got little of it
+        let usdc_in = 10_000_000_000;
+        let routes = find(
+            &pools,
+            None,
+            &request("usdc", "tear", Amount::AmountIn(usdc_in)),
+        );
+        let [chain] = routes.chains.as_slice() else {
+            panic!("Not one chain");
+        };
+        let near = out(usdc_near, usdc_in, 0);
+        assert!(chain.estimated_amount() >= out(big_near_tear, near, 0));
     }
 
     #[test]
