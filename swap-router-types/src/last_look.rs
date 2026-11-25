@@ -8,6 +8,7 @@ use crate::{
 };
 
 const MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT: u32 = 99;
+const LAST_LOOK_IMPROVEMENT_DIVISOR: u128 = 10_000;
 
 /// The best quote of the DEXes outside of Intear DEX, which a route on Intear DEX that gives less
 /// matches with a fee discount, net of costs as the aggregator ranks them
@@ -49,29 +50,45 @@ impl LastLook {
         })
     }
 
-    /// The smallest fee discount, in whole percents up to 99%, with which the swap matches
-    /// the best other quote. None when it matches without one, or no discount makes it match.
+    /// The smallest fee discount, in whole percents up to 99%, with which the swap beats the
+    /// best other quote by 0.01%, or else matches it. None when it does that without one, or no
+    /// discount makes it match.
     pub fn fee_discount(
         &self,
         swap_with: impl Fn(Option<FeeDiscountFraction>) -> Option<SwapEstimate>,
     ) -> Option<FeeDiscountFraction> {
         let percent =
             |percent: u32| FeeDiscountFraction::new(FULL_FEE_DISCOUNT.get() / 100 * percent);
-        let matches_with =
-            |fee_discount| swap_with(fee_discount).is_some_and(|swap| self.is_matched_by(&swap));
-        if matches_with(None) || !matches_with(Some(percent(MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT))) {
-            return None;
+        let improved_other_amount = match self.best_other_amount {
+            Amount::AmountOut(amount_out) => {
+                Amount::AmountOut(amount_out + amount_out.div_ceil(LAST_LOOK_IMPROVEMENT_DIVISOR))
+            }
+            Amount::AmountIn(amount_in) => {
+                Amount::AmountIn(amount_in - amount_in.div_ceil(LAST_LOOK_IMPROVEMENT_DIVISOR))
+            }
+        };
+        for target_amount in [improved_other_amount, self.best_other_amount] {
+            let reaches_with = |fee_discount| {
+                swap_with(fee_discount).is_some_and(|swap| self.reaches(target_amount, &swap))
+            };
+            if reaches_with(None) {
+                return None;
+            }
+            if reaches_with(Some(percent(MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT))) {
+                let percents = (1..=MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT).collect::<Vec<_>>();
+                let first_reaching = percents.partition_point(|&discount_percent| {
+                    !reaches_with(Some(percent(discount_percent)))
+                });
+                return Some(percent(percents[first_reaching]));
+            }
         }
-        let percents = (1..=MAX_LAST_LOOK_FEE_DISCOUNT_PERCENT).collect::<Vec<_>>();
-        let first_matching = percents
-            .partition_point(|&discount_percent| !matches_with(Some(percent(discount_percent))));
-        Some(percent(percents[first_matching]))
+        None
     }
 
-    /// Whether the route of the swap gets at least as much net of its costs as the best
-    /// other quote
-    fn is_matched_by(&self, swap: &SwapEstimate) -> bool {
-        let route_amount = match self.best_other_amount {
+    /// Whether the route of the swap gets at least as much net of its costs as `target_amount`
+    /// with the costs of the best other quote
+    fn reaches(&self, target_amount: Amount, swap: &SwapEstimate) -> bool {
+        let route_amount = match target_amount {
             // The referral fees come out of the input of both
             Amount::AmountOut(_) => Amount::AmountOut(swap.estimated_amount),
             // The engine takes the referral fees and the oracle's fee on top of what the
@@ -94,7 +111,7 @@ impl LastLook {
             route_amount,
             route_cost.saturating_add(swap_gas_cost),
             prices,
-        ) >= net_amount(self.best_other_amount, self.best_other_cost, prices)
+        ) >= net_amount(target_amount, self.best_other_cost, prices)
     }
 }
 
@@ -161,22 +178,45 @@ mod tests {
     }
 
     #[test]
-    fn matches_the_best_other_quote_with_the_smallest_whole_percent() {
+    fn beats_the_best_other_quote_by_a_basis_point_with_the_smallest_whole_percent() {
         let fee_discount = |best_amount_out| {
             last_look(Amount::AmountOut(best_amount_out), "{}")
                 .fee_discount(estimated_amount_out_with)
                 .map(FeeDiscountFraction::get)
         };
-        assert_eq!(fee_discount(1_000), None);
-        assert_eq!(fee_discount(1_001), Some(10_000));
-        assert_eq!(fee_discount(1_050), Some(500_000));
+        assert_eq!(fee_discount(999), None);
+        assert_eq!(fee_discount(1_000), Some(10_000));
+        assert_eq!(fee_discount(1_050), Some(510_000));
+        assert_eq!(fee_discount(1_098), Some(990_000));
+        // Only matches when no discount beats it
         assert_eq!(fee_discount(1_099), Some(990_000));
         // Not worth giving away when it still isn't the best
         assert_eq!(fee_discount(1_100), None);
     }
 
     #[test]
-    fn exact_out_matches_with_the_referral_fees_on_top() {
+    fn improvement_is_a_basis_point_of_the_best_other_quote() {
+        let fee_discount = |best_amount_out| {
+            last_look(Amount::AmountOut(best_amount_out), "{}")
+                .fee_discount(|fee_discount| {
+                    Some(SwapEstimate {
+                        estimated_amount: 1_000_000 + 100 * percent_of(fee_discount),
+                        gas: Gas::from_ggas(5, 5),
+                        oracle_fee: None,
+                    })
+                })
+                .map(FeeDiscountFraction::get)
+        };
+        assert_eq!(fee_discount(999_900), None);
+        assert_eq!(fee_discount(999_901), Some(10_000));
+        assert_eq!(fee_discount(1_000_000), Some(10_000));
+        assert_eq!(fee_discount(1_000_001), Some(20_000));
+        // 1,009,800 with its basis point is out of reach, so it's only matched
+        assert_eq!(fee_discount(1_009_800), Some(980_000));
+    }
+
+    #[test]
+    fn exact_out_beats_with_the_referral_fees_on_top() {
         let referral_fees = r#"{"ref.near":0.01}"#;
         let fee_discount = |best_amount_in| {
             last_look(Amount::AmountIn(best_amount_in), referral_fees)
@@ -191,14 +231,15 @@ mod tests {
         };
         let with_fees =
             |amount_in| amount_in_with_referral_fees(&referral_fees.parse().unwrap(), amount_in);
-        assert_eq!(fee_discount(with_fees(1_100)), None);
-        assert_eq!(fee_discount(with_fees(1_050)), Some(500_000));
-        // 1,038 with 12 of fees on top
-        assert_eq!(fee_discount(1_050), Some(620_000));
+        assert_eq!(fee_discount(with_fees(1_100) + 1), None);
+        assert_eq!(fee_discount(with_fees(1_100)), Some(10_000));
+        assert_eq!(fee_discount(with_fees(1_050) + 1), Some(500_000));
+        // 1,037 with 12 of fees on top
+        assert_eq!(fee_discount(1_050), Some(630_000));
     }
 
     #[test]
-    fn matches_net_of_the_costs_of_both_routes() {
+    fn beats_net_of_the_costs_of_both_routes() {
         let costing = |prices| LastLook {
             best_other_amount: Amount::AmountOut(1_050),
             best_other_cost: UNIT.saturating_mul(10),
@@ -219,11 +260,12 @@ mod tests {
             near_price_raw: 1.into(),
             quoted_token_price_raw: 10u64.pow(9).into(),
         }));
-        // 1,050 - 10 of the best other quote, and 20 for the route and 5 for the swap's gas
-        assert_eq!(fee_discount(&with_prices, false), Some(650_000));
-        assert_eq!(fee_discount(&with_prices, true), Some(750_000));
+        // 1,051 - 10 of the best other quote with its basis point, and 20 for the route and 5 for
+        // the swap's gas
+        assert_eq!(fee_discount(&with_prices, false), Some(660_000));
+        assert_eq!(fee_discount(&with_prices, true), Some(760_000));
         // Amounts alone without prices
-        assert_eq!(fee_discount(&costing(None), true), Some(500_000));
+        assert_eq!(fee_discount(&costing(None), true), Some(510_000));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use amp_dex_types::{
     PricesRequest, RouteFraction, SwapFees, SwapRoute, TokenAmount,
 };
 use intear_dex_common::{AssetId, SwapRequestAmount};
-use near_min_api::types::{Balance, BlockHeight};
+use near_min_api::types::{Balance, BlockHeight, NearGas};
 use near_sdk::PublicKeyHandle;
 use swap_router_types::{
     hook::{HookPool, HookPools, HookSwapRoute, OracleFees as HookOracleFees, PoolState},
@@ -26,9 +26,14 @@ use tracing::warn;
 use crate::intear_dex::{self, OracleFees};
 
 pub const QOQ_DEX_ID: &str = "slimedragon.near/amp";
+pub const ORACLE_URL: &str = "https://qoq-oracle.intear.tech";
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
 
 const SWAP_GAS: Gas = Gas::from_ggas(6_560, 6_560);
+/// What a swap burns less when Intear DEX already swapped on Qoq in the call, which loads its swap
+/// code once. Simulated on mainnet state, a second swap through the fixed-price pool burnt 2.75
+/// Tgas, and through the oracle's pool 3.65.
+pub const REPEATED_SWAP_SAVING: NearGas = NearGas::from_ggas(5_430);
 const ORACLE_HOP_GAS: Gas = Gas::from_ggas(5_420, 5_420);
 const FIXED_PRICE_HOP_GAS: Gas = Gas::from_ggas(1_620, 1_620);
 

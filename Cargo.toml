@@ -42,6 +42,7 @@ intear-dex-types = { git = "https://github.com/INTEARnear/dex" }
 intear-dex-common = { git = "https://github.com/INTEARnear/dex" }
 xyk-dex-types = { git = "https://github.com/INTEARnear/dex" }
 otc-dex-types = { git = "https://github.com/INTEARnear/dex" }
+amp-dex-types = { git = "https://github.com/INTEARnear/dex" }
 libloading = "0.9.0"
 inindexer = { git = "https://github.com/INTEARnear/inindexer" }
 trade-indexer = { git = "https://github.com/INTEARnear/trade-indexer" }

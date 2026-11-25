@@ -1,5 +1,5 @@
 use bigdecimal::Zero;
-use intear_dex_common::AssetId;
+use intear_dex_common::{AssetId, RouteFraction, FULL_ROUTE_FRACTION};
 use near_min_api::types::NearToken;
 use near_sdk::json_types::{Base64VecU8, U128};
 use swap_router_types::{
@@ -11,8 +11,8 @@ use swap_router_types::{
 use crate::{
     calls::{
         CallBlueprint, IntearDexOperations, IntearDexOracleRequest, IntearDexQuoteImprovementFee,
-        IntearDexSwapOperation, IntearDexSwapOption, IntearDexSwapStep, IntearDexWithdrawAmount,
-        IntearDexWithdrawal,
+        IntearDexSwapBranch, IntearDexSwapOperation, IntearDexSwapOption, IntearDexSwapStep,
+        IntearDexWithdrawAmount, IntearDexWithdrawal,
     },
     route::{RouteBlueprint, RouteStep},
     shared_utils::{
@@ -99,11 +99,13 @@ fn intear_dex_asset(token_id: &TokenId, amount_hint: u128) -> Option<AssetId> {
     }
 }
 
+/// A step of a swap on DEXes one after another: its asset in and out and the option it swaps on
+pub type ChainedSwap = (AssetId, AssetId, IntearDexSwapOption);
+
 /// A swap on Intear DEX for an [`IntearDexTrade`]: on one DEX, on the first of several that
-/// fills it, or on DEXes one after another
+/// fills it, on DEXes one after another, or split between several
 pub struct IntearDexSwap {
-    /// Each after the first swaps what the one before it gave
-    steps: Vec<IntearDexSwapStep>,
+    branches: Vec<IntearDexSwapBranch>,
     /// Of the first option, as in [`HookQuote`]
     estimated_amount: u128,
     /// The least the swap gives, or the most it takes, as in [`HookQuote`]
@@ -123,14 +125,17 @@ impl IntearDexSwap {
             discount: quote.discount,
             oracle_request: oracle_request_of(&quote),
             fee_discount: quote.fee_discount,
-            steps: vec![single_step(trade, vec![swap_option(quote)])],
+            branches: vec![whole(
+                quote.estimated_amount.0,
+                vec![single_step(trade, vec![swap_option(quote)])],
+            )],
         }
     }
 
     /// Swaps on `steps` one after another, each of an asset in and out and the option it swaps
     /// on. Amounts are as in [`HookQuote`], of the whole swap.
     pub fn chain(
-        steps: Vec<(AssetId, AssetId, IntearDexSwapOption)>,
+        steps: Vec<ChainedSwap>,
         estimated_amount: u128,
         worst_case_amount: u128,
         discount: Option<U128>,
@@ -138,12 +143,32 @@ impl IntearDexSwap {
         fee_discount: Option<QuoteFeeDiscount>,
     ) -> Self {
         Self {
-            steps: steps
+            branches: vec![whole(estimated_amount, chained_steps(steps))],
+            estimated_amount,
+            worst_case_amount,
+            discount,
+            oracle_request,
+            fee_discount,
+        }
+    }
+
+    /// Swaps on each branch one after another, of its fraction of the amount, and as `chain` its
+    /// steps. Only exact-in swaps have branches.
+    pub fn split(
+        branches: Vec<(u32, u128, Vec<ChainedSwap>)>,
+        estimated_amount: u128,
+        worst_case_amount: u128,
+        discount: Option<U128>,
+        oracle_request: Option<IntearDexOracleRequest>,
+        fee_discount: Option<QuoteFeeDiscount>,
+    ) -> Self {
+        Self {
+            branches: branches
                 .into_iter()
-                .map(|(asset_in, asset_out, option)| IntearDexSwapStep {
-                    asset_in: intear_asset(asset_in),
-                    asset_out: intear_asset(asset_out),
-                    options: vec![option],
+                .map(|(fraction, estimated_amount, steps)| IntearDexSwapBranch {
+                    fraction: RouteFraction::new(fraction),
+                    estimated_amount,
+                    steps: chained_steps(steps),
                 })
                 .collect(),
             estimated_amount,
@@ -254,16 +279,21 @@ impl IntearDexSwap {
             discount: best.discount,
             oracle_request: best_oracle_request,
             fee_discount: best.fee_discount,
-            steps: vec![single_step(
-                trade,
-                quotes.into_iter().map(swap_option).collect(),
+            branches: vec![whole(
+                best.estimated_amount.0,
+                vec![single_step(
+                    trade,
+                    quotes.into_iter().map(swap_option).collect(),
+                )],
             )],
         })
     }
 
     /// The assets that the swap goes through between its input and output
     fn intermediate_assets(&self) -> impl Iterator<Item = &IntearAssetId> {
-        self.steps[1..].iter().map(|step| &step.asset_in)
+        self.branches
+            .iter()
+            .flat_map(|branch| branch.steps[1..].iter().map(|step| &step.asset_in))
     }
 }
 
@@ -289,10 +319,36 @@ impl IntearDexSwap {
         self.fee_discount
     }
 
+    pub fn branches(&self) -> &[IntearDexSwapBranch] {
+        &self.branches
+    }
+
     /// Of the steps, in order
     pub fn options(&self) -> impl Iterator<Item = &IntearDexSwapOption> {
-        self.steps.iter().flat_map(|step| &step.options)
+        self.branches
+            .iter()
+            .flat_map(|branch| branch.steps.iter().flat_map(|step| &step.options))
     }
+}
+
+/// All of the amount, through `steps`
+fn whole(estimated_amount: u128, steps: Vec<IntearDexSwapStep>) -> IntearDexSwapBranch {
+    IntearDexSwapBranch {
+        fraction: FULL_ROUTE_FRACTION,
+        estimated_amount,
+        steps,
+    }
+}
+
+fn chained_steps(steps: Vec<ChainedSwap>) -> Vec<IntearDexSwapStep> {
+    steps
+        .into_iter()
+        .map(|(asset_in, asset_out, option)| IntearDexSwapStep {
+            asset_in: intear_asset(asset_in),
+            asset_out: intear_asset(asset_out),
+            options: vec![option],
+        })
+        .collect()
 }
 
 /// The only step of a swap of the trade
@@ -497,7 +553,7 @@ pub fn route(
         swap: IntearDexSwapOperation {
             amount: swap_amount,
             constraint,
-            steps: swap.steps,
+            branches: swap.branches,
             oracle_request: swap.oracle_request.map(Box::new),
             quote_improvement_fee,
         },
@@ -587,7 +643,7 @@ mod tests {
 
     use super::*;
     use crate::calls::RheaOutput;
-    use crate::route::resolve;
+    use crate::route::{resolve, RouteGas};
     use crate::shared_utils::{TestNetworkView, WRAP_NEAR};
     use crate::types::{Gas, QuoteFees, Slippage};
 
@@ -715,13 +771,21 @@ mod tests {
             swap: IntearDexSwapOperation {
                 amount,
                 constraint,
-                steps: vec![IntearDexSwapStep {
-                    asset_in,
-                    asset_out,
-                    options: vec![IntearDexSwapOption {
-                        dex_id: PLACH_DEX_ID.parse().unwrap(),
-                        message: plach_message(),
-                        gas: PLACH_SWAP_GAS,
+                branches: vec![IntearDexSwapBranch {
+                    fraction: FULL_ROUTE_FRACTION,
+                    // Of the quote of `test_route`
+                    estimated_amount: match amount {
+                        Amount::AmountIn(_) => 80,
+                        Amount::AmountOut(_) => 100,
+                    },
+                    steps: vec![IntearDexSwapStep {
+                        asset_in,
+                        asset_out,
+                        options: vec![IntearDexSwapOption {
+                            dex_id: PLACH_DEX_ID.parse().unwrap(),
+                            message: plach_message(),
+                            gas: PLACH_SWAP_GAS,
+                        }],
                     }],
                 }],
                 oracle_request: None,
@@ -816,11 +880,15 @@ mod tests {
         let Some(RouteStep::Call(call)) = route.steps.last() else {
             panic!("The route doesn't end with a call");
         };
-        let gas = call.gas().needs_attached;
-        let Action::FunctionCall(function_call) = call.clone().into_action() else {
+        let gas = call.planned_gas();
+        let Action::FunctionCall(function_call) = call.clone().into_action(gas.needs_attached)
+        else {
             panic!("Calls are function calls");
         };
-        (serde_json::from_slice(&function_call.args).unwrap(), gas)
+        (
+            serde_json::from_slice(&function_call.args).unwrap(),
+            gas.needs_attached,
+        )
     }
 
     /// Gas attached to swap on DEXes that need `swap_attached` with `deposit_near`, which burn
@@ -1667,8 +1735,11 @@ mod tests {
         let with_oracle_request = resolved(burning_no_gas(true)).await;
 
         assert_eq!(
-            plach.gas().estimated_burn.as_gas(),
-            without_oracle_request.gas().estimated_burn.as_gas()
+            RouteGas::planned(&plach).total().estimated_burn.as_gas(),
+            RouteGas::planned(&without_oracle_request)
+                .total()
+                .estimated_burn
+                .as_gas()
                 + PLACH_SWAP_GAS.estimated_burn.as_gas()
         );
         assert_eq!(
@@ -1677,7 +1748,12 @@ mod tests {
         );
         assert_eq!(plach.token_output, without_oracle_request.token_output);
         assert!(
-            with_oracle_request.gas().estimated_burn > without_oracle_request.gas().estimated_burn
+            RouteGas::planned(&with_oracle_request)
+                .total()
+                .estimated_burn
+                > RouteGas::planned(&without_oracle_request)
+                    .total()
+                    .estimated_burn
         );
     }
 

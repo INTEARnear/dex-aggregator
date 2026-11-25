@@ -110,7 +110,7 @@ async fn route(
         })
         .await?;
 
-    let (amount_in, pool_ids, swap, estimated_amount, worst_case_amount, swap_gas, fees) =
+    let (amount_in, pool_ids, swap, estimated_amount, worst_case_amount, swap_gas, work, fees) =
         match response {
             RouteApiResponse::ExactIn { route, .. } => (
                 route.amount_in.0,
@@ -121,6 +121,7 @@ async fn route(
                 Amount::AmountOut(route.amount_out.0),
                 Amount::AmountOut(route.min_amount_out.0),
                 route.swap_gas,
+                route.work,
                 exact_in_fees,
             ),
             RouteApiResponse::ExactOut { route, .. } => {
@@ -153,6 +154,7 @@ async fn route(
                     Amount::AmountIn(route.amount_in.0 + fee_amount),
                     Amount::AmountIn(route.max_amount_in.0 + fee_amount),
                     route.swap_gas,
+                    route.work,
                     fees,
                 )
             }
@@ -166,6 +168,7 @@ async fn route(
         token_out: token_out.clone(),
         swap,
         swap_gas,
+        work,
         output: if unwrapping_near {
             RheaOutput::Near {
                 trader_account_id: request.trader_account_id.clone(),
@@ -272,6 +275,7 @@ mod tests {
                         min_amount_out: U128(79),
                         amount_out: U128(80),
                         swap_gas: SWAP_GAS,
+                        work: dcl::DclWork::default(),
                     },
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
@@ -285,6 +289,7 @@ mod tests {
                         max_amount_in: U128(101),
                         amount_out: U128(80),
                         swap_gas: SWAP_GAS,
+                        work: dcl::DclWork::default(),
                     },
                     contract_in: token_in.clone(),
                     contract_out: token_out.clone(),
@@ -351,6 +356,7 @@ mod tests {
             token_out: account(token_out),
             swap,
             swap_gas: SWAP_GAS,
+            work: dcl::DclWork::default(),
             output,
             referral_id: account(DEFAULT_REFERRER_ID),
         })

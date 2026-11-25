@@ -3,7 +3,7 @@ mod storage;
 use self::storage::StoredPool;
 pub use self::storage::watch;
 
-use near_min_api::types::{Balance, BlockHeight};
+use near_min_api::types::{Balance, BlockHeight, NearGas};
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -304,6 +304,9 @@ pub fn build_indexed_pools(state: &AccountState) -> Result<Pools, anyhow::Error>
 }
 
 const SWAP_GAS: Gas = Gas::from_ggas(5_470, 5_470);
+/// What a swap burns less when Intear DEX already swapped on Plach in the call, which loads its swap
+/// code once. Simulated on mainnet state, a second swap through a pool burnt 2.29 Tgas.
+pub const REPEATED_SWAP_SAVING: NearGas = NearGas::from_ggas(4_100);
 const HOP_GAS: Gas = Gas::from_ggas(920, 920);
 const REPEATED_HOP_GAS: Gas = Gas::from_ggas(360, 360);
 

@@ -12,6 +12,7 @@ use near_min_api::utils::dec_format;
 use smallvec::SmallVec;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -503,6 +504,8 @@ async fn get_pools() -> Result<Arc<Pools>, anyhow::Error> {
 }
 
 const HOP_GAS: Gas = Gas::from_ggas(2_540, 2_540);
+/// What the route search weighs each hop by, which the router fits to what simulated swaps burnt
+static SEARCH_HOP_GAS: AtomicU64 = AtomicU64::new(HOP_GAS.estimated_burn.as_gas());
 const STABLE_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_070, 1_070);
 const RATED_POOL_GAS: Gas = Gas::from_ggas(1_530, 1_530);
 const RATED_POOL_TOKEN_GAS: Gas = Gas::from_ggas(1_290, 1_290);
@@ -604,6 +607,10 @@ pub struct Request {
     pub token_out_price_raw: BigDecimal,
 }
 
+pub fn set_search_hop_gas(gas: NearGas) {
+    SEARCH_HOP_GAS.store(gas.as_gas(), Ordering::Relaxed);
+}
+
 /// Finds a route on the newest pools
 pub async fn find_path(request: Request) -> Result<SplitRouteApiResponse, anyhow::Error> {
     let pools = get_pools().await?;
@@ -632,7 +639,7 @@ pub fn find_path_in(
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            HOP_GAS.estimated_burn,
+            NearGas::from_gas(SEARCH_HOP_GAS.load(Ordering::Relaxed)),
             &request.near_price_raw,
             &request.token_out_price_raw,
         )?,

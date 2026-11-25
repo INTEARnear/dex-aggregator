@@ -19,15 +19,14 @@ use swap_router_types::{
     last_look::{with_tear_fee_discount, LastLook, SwapEstimate},
     types::{CostPrices, Gas},
 };
-use tokio::sync::Semaphore;
 use tracing::warn;
 
 use super::{
-    inteardex::{trade_after_oracle_fee, IntearDexSwap},
+    inteardex::{trade_after_oracle_fee, ChainedSwap, IntearDexSwap},
     pools::{HookPool, PoolsGraphOf, PoolsScope, RoutingPools},
 };
 use crate::{
-    calls::{IntearDexOracleRequest, IntearDexSwapOption},
+    calls::{swaps_burn, IntearDexOracleRequest, IntearDexSwapOption},
     Amount, SwapRequest,
 };
 
@@ -37,9 +36,6 @@ const SETTINGS: Settings = Settings {
     allow_unused_input: false,
     keep_shorter_routes: true,
 };
-const MAX_SEARCHES_RUNNING: usize = 64;
-
-static SEARCHES_RUNNING: Semaphore = Semaphore::const_new(MAX_SEARCHES_RUNNING);
 
 /// What routes through pools are found for
 pub struct PoolRoutesRequest {
@@ -61,32 +57,34 @@ pub struct PoolRoutesRequest {
 pub struct PoolRoutes {
     /// Of routes on one DEX, which can be fallbacks of each other
     pub quotes: Vec<HookQuote>,
-    /// Of routes on several DEXes one after another
+    /// Of routes on several DEXes one after another or split between them
     pub chains: Vec<IntearDexSwap>,
 }
 
-/// [`find`] on a blocking thread. None when too many run, it takes too long or it panics.
+/// [`find`] on a blocking thread. None when it takes too long or it panics.
 pub async fn find_in_background(
     pools: Arc<RoutingPools>,
     snapshot: Option<usize>,
     request: PoolRoutesRequest,
 ) -> PoolRoutes {
-    let Ok(search_running) = SEARCHES_RUNNING.try_acquire() else {
-        return PoolRoutes::default();
-    };
-    let routes = tokio::task::spawn_blocking(move || {
-        let _search_running = search_running;
-        find(&pools, snapshot, &request)
-    });
+    let trade = request.trade.clone();
+    let routes = tokio::task::spawn_blocking(move || find(&pools, snapshot, &request));
     match tokio::time::timeout(HOOK_ANSWER_TIMEOUT, routes).await {
         Ok(Ok(routes)) => routes,
         // The panic is logged where it happened
-        Ok(Err(_)) | Err(_) => PoolRoutes::default(),
+        Ok(Err(_)) => PoolRoutes::default(),
+        Err(_) => {
+            warn!(
+                "Routes through pools of hooks took over {HOOK_ANSWER_TIMEOUT:?} to find, leaving \
+                 them out of {trade:?}"
+            );
+            PoolRoutes::default()
+        }
     }
 }
 
 /// Routes through the pools of the hook of `snapshot`, an index in [`RoutingPools::snapshots`],
-/// or of every hook: the best one through pools that ask no oracle, and the best one through the
+/// or of every hook: the best ones through pools that ask no oracle, and the best ones through the
 /// pools of each oracle, which the route pays in the asset in or in what a swap of it buys
 pub fn find(
     pools: &RoutingPools,
@@ -116,53 +114,75 @@ pub fn find(
         .chain(with_oracles)
     {
         let asks_oracle = oracle.is_some();
-        let Some(route) = found_route(pools, &scope, &trade, oracle, request) else {
-            continue;
-        };
-        // Through pools that ask no oracle, it's found without one
-        if asks_oracle && route.oracle_request.is_none() {
-            continue;
-        }
-        match <[_; 1]>::try_from(route.swaps) {
-            Ok([(_, _, swap)]) => routes.quotes.push(HookQuote {
-                dex_id: swap.dex_id,
-                message: swap.message,
-                estimated_amount: U128(route.estimated_amount),
-                worst_case_amount: U128(route.worst_case_amount),
-                gas: swap.gas,
-                discount: route.discount.map(U128),
-                oracle_request: route
-                    .oracle_request
-                    .map(|(oracle_request, _)| oracle_request),
-                fee_discount: route.fee_discount,
-            }),
-            Err(swaps) => routes.chains.push(IntearDexSwap::chain(
-                swaps
-                    .into_iter()
-                    .map(|(asset_in, asset_out, swap)| {
-                        let option = IntearDexSwapOption {
-                            dex_id: swap.dex_id,
-                            message: swap.message,
-                            gas: swap.gas,
-                        };
-                        (asset_in, asset_out, option)
-                    })
-                    .collect(),
-                route.estimated_amount,
-                route.worst_case_amount,
-                route.discount.map(U128),
-                route
-                    .oracle_request
-                    .map(|(request, dex_id)| IntearDexOracleRequest { dex_id, request }),
-                route.fee_discount,
-            )),
+        for route in found_routes(pools, &scope, &trade, oracle, request) {
+            // Through pools that ask no oracle, it's found without one
+            if asks_oracle && route.oracle_request.is_none() {
+                continue;
+            }
+            let oracle_request = route
+                .oracle_request
+                .map(|(request, dex_id)| IntearDexOracleRequest { dex_id, request });
+            match <[_; 1]>::try_from(route.branches) {
+                Ok([branch]) => match <[_; 1]>::try_from(branch.swaps) {
+                    Ok([(_, _, swap)]) => routes.quotes.push(HookQuote {
+                        dex_id: swap.dex_id,
+                        message: swap.message,
+                        estimated_amount: U128(route.estimated_amount),
+                        worst_case_amount: U128(route.worst_case_amount),
+                        gas: swap.gas,
+                        discount: route.discount.map(U128),
+                        oracle_request: oracle_request.map(|oracle_request| oracle_request.request),
+                        fee_discount: route.fee_discount,
+                    }),
+                    Err(swaps) => routes.chains.push(IntearDexSwap::chain(
+                        swap_options(swaps),
+                        route.estimated_amount,
+                        route.worst_case_amount,
+                        route.discount.map(U128),
+                        oracle_request,
+                        route.fee_discount,
+                    )),
+                },
+                Err(branches) => routes.chains.push(IntearDexSwap::split(
+                    branches
+                        .into_iter()
+                        .map(|branch| {
+                            (
+                                branch.fraction,
+                                branch.estimated_amount,
+                                swap_options(branch.swaps),
+                            )
+                        })
+                        .collect(),
+                    route.estimated_amount,
+                    route.worst_case_amount,
+                    route.discount.map(U128),
+                    oracle_request,
+                    route.fee_discount,
+                )),
+            }
         }
     }
     routes
 }
 
+fn swap_options(swaps: Vec<(AssetId, AssetId, HookSwap)>) -> Vec<ChainedSwap> {
+    swaps
+        .into_iter()
+        .map(|(asset_in, asset_out, swap)| {
+            let option = IntearDexSwapOption {
+                dex_id: swap.dex_id,
+                message: swap.message,
+                gas: swap.gas,
+            };
+            (asset_in, asset_out, option)
+        })
+        .collect()
+}
+
 /// How a route pays an oracle: with `cost` of the trade's asset in, the oracle's fee or the most
 /// that `swap` swaps to buy it
+#[derive(Clone)]
 struct OracleFeePayment {
     cost: Balance,
     swap: Option<OracleFeeSwap>,
@@ -207,15 +227,18 @@ fn oracle_fee_payment(
                 snapshot: None,
                 oracle_key: None,
             };
-            let route = found_route(
+            let route = found_routes(
                 pools,
                 &all_pools_without_oracles,
                 &fee_request.trade,
                 None,
                 &fee_request,
-            )?;
+            )
+            .into_iter()
+            .next()?;
             // Exact-out routes are through one hook
-            let [(_, _, swap)] = <[_; 1]>::try_from(route.swaps).ok()?;
+            let [branch] = <[_; 1]>::try_from(route.branches).ok()?;
+            let [(_, _, swap)] = <[_; 1]>::try_from(branch.swaps).ok()?;
             let gas_cost = pathfinder::gas_cost(
                 swap.gas.estimated_burn,
                 &prices.near_price_raw,
@@ -237,10 +260,9 @@ fn oracle_fee_payment(
         .map(|(_, payment)| payment)
 }
 
-/// A route through pools, as the swaps of its steps on their DEXes
+/// A route through pools, as the swaps of its branches on their DEXes
 struct FoundRoute {
-    /// Of the asset in and out of each step
-    swaps: Vec<(AssetId, AssetId, HookSwap)>,
+    branches: Vec<FoundBranch>,
     estimated_amount: Balance,
     worst_case_amount: Balance,
     /// What the TEAR staker's fee discount saves
@@ -251,52 +273,80 @@ struct FoundRoute {
     fee_discount: Option<QuoteFeeDiscount>,
 }
 
-/// The best route through the pools of `scope` for `trade`, which is after paying `oracle`
-fn found_route(
+/// Swaps of the share of the amount that the route splits to the branch
+struct FoundBranch {
+    /// Of [`FULL_ROUTE_FRACTION`]
+    fraction: u32,
+    /// Of the asset in and out of each step
+    swaps: Vec<(AssetId, AssetId, HookSwap)>,
+    estimated_amount: Balance,
+}
+
+/// The best routes through the pools of `scope` for `trade`, which is after paying `oracle`
+fn found_routes(
     pools: &RoutingPools,
     scope: &PoolsScope,
     trade: &IntearDexTrade,
     oracle: Option<(PublicKeyHandle, OracleFeePayment)>,
     request: &PoolRoutesRequest,
-) -> Option<FoundRoute> {
+) -> Vec<FoundRoute> {
     let amount = match trade.amount {
         Amount::AmountIn(amount_in) => QuoteAmount::ExactIn(amount_in),
         Amount::AmountOut(amount_out) => QuoteAmount::ExactOut(amount_out),
     };
-    let SearchedRoute {
+    best_routes(pools, scope, trade, amount, &request.prices)
+        .into_iter()
+        .filter_map(|searched| found_route(pools, searched, amount, trade, oracle.clone(), request))
+        .collect()
+}
+
+fn found_route(
+    pools: &RoutingPools,
+    SearchedRoute {
         pools_graph, route, ..
-    } = best_route(pools, scope, trade, amount, &request.prices)?;
+    }: SearchedRoute,
+    amount: QuoteAmount,
+    trade: &IntearDexTrade,
+    oracle: Option<(PublicKeyHandle, OracleFeePayment)>,
+    request: &PoolRoutesRequest,
+) -> Option<FoundRoute> {
     let graph = &pools_graph.graph;
 
-    let swaps = route.swaps(pools, graph)?;
+    let branch_swaps = route.swaps(pools, graph)?;
     let oracle_fee_swap_gas = oracle
         .as_ref()
         .and_then(|(_, payment)| payment.swap.as_ref())
         .map(|swap| swap.gas);
+    let swaps = || branch_swaps.iter().flatten().map(|(_, _, swap)| swap);
+    // As the planned gas of the route has it, which its simulation is measured against: a swap on
+    // a DEX that the call already swapped on burns less
+    let swaps_gas = Gas {
+        estimated_burn: swaps_burn(swaps().map(|swap| (&swap.dex_id, swap.gas.estimated_burn))),
+        needs_attached: swaps().map(|swap| swap.gas).sum::<Gas>().needs_attached,
+    };
     let last_look_fee_discount = request.last_look.as_ref().and_then(|last_look| {
         last_look.fee_discount(|fee_discount| {
-            let estimated_amount = route.emulate(graph, amount, fee_discount)?;
+            let estimated_amount = total_of(&route.emulate(graph, amount, fee_discount)?)?;
             // The engine checks the discount once for all the swaps
             let fee_discount_gas = fee_discount.map(|_| FEE_DISCOUNT_GAS);
-            let swaps_gas = swaps
-                .iter()
-                .map(|(_, _, swap)| swap.gas)
-                .chain(oracle_fee_swap_gas)
-                .chain(fee_discount_gas)
-                .sum::<Gas>();
             Some(SwapEstimate {
                 estimated_amount,
-                gas: swaps_gas,
+                gas: [swaps_gas]
+                    .into_iter()
+                    .chain(oracle_fee_swap_gas)
+                    .chain(fee_discount_gas)
+                    .sum(),
                 oracle_fee: oracle.as_ref().map(|(_, payment)| payment.cost),
             })
         })
     });
     let fee_discount = with_tear_fee_discount(last_look_fee_discount, request.tear_fee_discount);
-    let estimated_amount = route.emulate(graph, amount, fee_discount)?;
+    let emulated = route.emulate(graph, amount, fee_discount)?;
+    let estimated_amount = total_of(&emulated)?;
     // Only what the TEAR staker's discount adds is shown as the discount
     let discount = match request.tear_fee_discount {
         Some(_) => {
-            let counted_from = route.emulate(graph, amount, last_look_fee_discount)?;
+            let counted_from = total_of(&route.emulate(graph, amount, last_look_fee_discount)?)?;
             Some(estimated_amount.abs_diff(counted_from))
         }
         None => None,
@@ -310,8 +360,9 @@ fn found_route(
             pathfinder::with_slippage(estimated_amount, BASIS_POINTS + slippage_bp)
         }
     };
-    let oracle_requests = swaps
+    let oracle_requests = branch_swaps
         .iter()
+        .flatten()
         .filter_map(|(_, _, swap)| Some((swap.oracle_request.clone()?, swap.dex_id.clone())))
         .collect::<Vec<_>>();
     let oracle_request = match (oracle_requests.as_slice(), oracle) {
@@ -328,8 +379,19 @@ fn found_route(
         // One oracle request starts the operations, for one DEX to read
         _ => return None,
     };
+    let branches = route
+        .branches
+        .iter()
+        .zip(branch_swaps)
+        .zip(emulated)
+        .map(|((branch, swaps), estimated_amount)| FoundBranch {
+            fraction: branch.fraction,
+            swaps,
+            estimated_amount,
+        })
+        .collect();
     Some(FoundRoute {
-        swaps,
+        branches,
         estimated_amount,
         worst_case_amount,
         discount,
@@ -344,46 +406,56 @@ fn found_route(
 /// A route found in a graph of pools
 struct SearchedRoute<'a> {
     pools_graph: PoolsGraphOf<'a>,
-    route: StepsRoute,
+    route: BranchedRoute,
     /// The output for exact in, the input for exact out
     amount: Balance,
     /// Whether it has every part of the split route that the search found
     complete: bool,
 }
 
-/// The best route through the pools of `scope`. When some parts of the split route found through
-/// the pools of several hooks can't be swapped together with the others, the route through each
-/// hook's pools alone can be better than the rest of the parts.
-fn best_route<'a>(
+/// The best route through the pools of `scope` that swaps as one, and the split route found
+/// through the pools of several hooks with its parts split between them. When some parts of the
+/// split route can't be swapped together with the others, the route through each hook's pools
+/// alone can be better than the rest of the parts.
+fn best_routes<'a>(
     pools: &'a RoutingPools,
     scope: &PoolsScope,
     trade: &IntearDexTrade,
     amount: QuoteAmount,
     prices: &CostPrices,
-) -> Option<SearchedRoute<'a>> {
-    let searched = searched_route(pools, scope, trade, amount, prices);
-    if scope.snapshot.is_some() || searched.as_ref().is_some_and(|searched| searched.complete) {
-        return searched;
-    }
-    (0..pools.snapshots.len())
-        .filter_map(|snapshot| {
-            let scope = PoolsScope {
-                snapshot: Some(snapshot),
-                oracle_key: scope.oracle_key.clone(),
-            };
-            searched_route(pools, &scope, trade, amount, prices)
-        })
-        .chain(searched)
-        .max_by(|searched, other| more_for(amount, searched.amount, other.amount))
+) -> Vec<SearchedRoute<'a>> {
+    let (searched, split) = match searched_route(pools, scope, trade, amount, prices) {
+        Some((searched, split)) => (Some(searched), split),
+        None => (None, None),
+    };
+    let alone = if scope.snapshot.is_some()
+        || searched.as_ref().is_some_and(|searched| searched.complete)
+    {
+        searched
+    } else {
+        (0..pools.snapshots.len())
+            .filter_map(|snapshot| {
+                let scope = PoolsScope {
+                    snapshot: Some(snapshot),
+                    oracle_key: scope.oracle_key.clone(),
+                };
+                searched_route(pools, &scope, trade, amount, prices).map(|(searched, _)| searched)
+            })
+            .chain(searched)
+            .max_by(|searched, other| more_for(amount, searched.amount, other.amount))
+    };
+    alone.into_iter().chain(split).collect()
 }
 
+/// The best of the routes that swap as one, and the parts of an exact-in split route split
+/// between their hooks when they can't be swapped as one
 fn searched_route<'a>(
     pools: &'a RoutingPools,
     scope: &PoolsScope,
     trade: &IntearDexTrade,
     amount: QuoteAmount,
     prices: &CostPrices,
-) -> Option<SearchedRoute<'a>> {
+) -> Option<(SearchedRoute<'a>, Option<SearchedRoute<'a>>)> {
     let pools_graph = pools.graph(scope)?;
     let graph = &pools_graph.graph;
     let token_in = graph.token_index(&pools.token_index(&trade.asset_in)?)?;
@@ -405,14 +477,229 @@ fn searched_route<'a>(
         hop_cost,
     )
     .ok()?;
-    let (route, emulated, complete) =
-        StepsRoute::best_of(pools, scope, graph, &split_route, amount, hop_cost)?;
-    Some(SearchedRoute {
+    let parts_by_shape = parts_by_shape(pools, graph, &split_route);
+    let complete = parts_by_shape.len() == 1;
+    let split = match amount {
+        QuoteAmount::ExactIn(amount_in) if !complete => split_between_hooks(
+            pools,
+            scope,
+            graph,
+            parts_by_shape.clone(),
+            amount_in,
+            hop_cost,
+            prices,
+        )
+        .and_then(|(route, emulated)| {
+            Some(SearchedRoute {
+                pools_graph: pools.graph(scope)?,
+                route,
+                amount: emulated,
+                complete: true,
+            })
+        }),
+        _ => None,
+    };
+    let (route, emulated) =
+        StepsRoute::best_of(pools, scope, graph, parts_by_shape, amount, hop_cost)?;
+    let searched = SearchedRoute {
         pools_graph,
-        route,
+        route: BranchedRoute::whole(route),
         amount: emulated,
         complete,
-    })
+    };
+    Some((searched, split))
+}
+
+/// The steps of a part of a split route, and its weight in percent
+type Part = (Vec<Step>, u32);
+
+/// Parts of a split route can only be swapped together when they go through the same hooks and
+/// tokens between them, so the parts of each of those shapes
+fn parts_by_shape(
+    pools: &RoutingPools,
+    graph: &Graph<HookPool>,
+    split_route: &search::SplitRoute,
+) -> Vec<Vec<Part>> {
+    let mut parts_by_shape = Vec::<(Vec<(usize, u32, u32)>, Vec<Part>)>::new();
+    for part in &split_route.parts {
+        let steps = steps_of(pools, graph, &part.route.hops);
+        let shape = steps
+            .iter()
+            .map(|step| (step.snapshot, step.token_in, step.token_out))
+            .collect::<Vec<_>>();
+        let part = (steps, part.weight_percentage);
+        match parts_by_shape
+            .iter_mut()
+            .find(|(other_shape, _)| *other_shape == shape)
+        {
+            Some((_, parts)) => parts.push(part),
+            None => parts_by_shape.push((shape, vec![part])),
+        }
+    }
+    parts_by_shape.into_iter().map(|(_, parts)| parts).collect()
+}
+
+/// The parts of an exact-in split route that can't be swapped as one, split between their hooks,
+/// with what they give. The search weighs the hops of each part, but each branch is a swap of its own, so the
+/// lightest branch is left out while the others give more without it, net of what their swaps
+/// burn. None when one branch is left.
+fn split_between_hooks(
+    pools: &RoutingPools,
+    scope: &PoolsScope,
+    graph: &Graph<HookPool>,
+    mut parts_by_shape: Vec<Vec<Part>>,
+    amount_in: Balance,
+    hop_cost: Balance,
+    prices: &CostPrices,
+) -> Option<(BranchedRoute, Balance)> {
+    let net_of = |parts_by_shape: &[Vec<Part>]| -> Option<(BranchedRoute, Balance, Balance)> {
+        let route = BranchedRoute::split(pools, scope, graph, parts_by_shape, amount_in, hop_cost)?;
+        let emulated = total_of(&route.emulate(graph, QuoteAmount::ExactIn(amount_in), None)?)?;
+        let swaps = route.swaps(pools, graph)?;
+        let burn = swaps_burn(
+            swaps
+                .iter()
+                .flatten()
+                .map(|(_, _, swap)| (&swap.dex_id, swap.gas.estimated_burn)),
+        );
+        let gas_cost =
+            pathfinder::gas_cost(burn, &prices.near_price_raw, &prices.quoted_token_price_raw)
+                .ok()?;
+        Some((route, emulated, emulated.saturating_sub(gas_cost)))
+    };
+    let (mut route, mut emulated, mut net) = net_of(&parts_by_shape)?;
+    while parts_by_shape.len() > 1 {
+        let lightest = parts_by_shape
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, parts)| weight_of(parts))
+            .map(|(index, _)| index)?;
+        let mut without = parts_by_shape.clone();
+        without.remove(lightest);
+        match net_of(&without) {
+            Some((route_without, emulated_without, net_without)) if net_without >= net => {
+                (parts_by_shape, route, emulated, net) =
+                    (without, route_without, emulated_without, net_without);
+            }
+            _ => break,
+        }
+    }
+    (parts_by_shape.len() > 1).then_some((route, emulated))
+}
+
+/// Of the parts, in percent
+fn weight_of(parts: &[Part]) -> Balance {
+    parts.iter().map(|(_, weight)| Balance::from(*weight)).sum()
+}
+
+/// Routes that split the amount, swapped one after another, each on its fraction of it
+struct BranchedRoute {
+    branches: Vec<Branch>,
+}
+
+struct Branch {
+    route: StepsRoute,
+    /// Of [`FULL_ROUTE_FRACTION`]
+    fraction: u32,
+}
+
+impl BranchedRoute {
+    /// Of one route, which swaps all of the amount
+    fn whole(route: StepsRoute) -> Self {
+        Self {
+            branches: vec![Branch {
+                route,
+                fraction: FULL_ROUTE_FRACTION.get(),
+            }],
+        }
+    }
+
+    /// The parts of each shape as a branch, with the share of `amount_in` that their weights have,
+    /// and the later steps of each found for what it swaps
+    fn split(
+        pools: &RoutingPools,
+        scope: &PoolsScope,
+        graph: &Graph<HookPool>,
+        parts_by_shape: &[Vec<Part>],
+        amount_in: Balance,
+        hop_cost: Balance,
+    ) -> Option<Self> {
+        let fractions = fractions_of(
+            &parts_by_shape
+                .iter()
+                .map(|parts| weight_of(parts))
+                .collect::<Vec<_>>(),
+        )?;
+        let split = RouteFraction::split(
+            TokenAmount::new(amount_in),
+            fractions
+                .iter()
+                .map(|&fraction| RouteFraction::new(fraction)),
+        );
+        let branches = parts_by_shape
+            .iter()
+            .zip(fractions)
+            .zip(split)
+            .map(|((parts, fraction), branch_amount_in)| {
+                let (route, _) = StepsRoute::of_parts(
+                    pools,
+                    scope,
+                    graph,
+                    parts.clone(),
+                    QuoteAmount::ExactIn(branch_amount_in.get()),
+                    hop_cost,
+                )?;
+                Some(Branch { route, fraction })
+            })
+            .collect::<Option<_>>()?;
+        Some(Self { branches })
+    }
+
+    /// What each branch swaps, after the ones before it
+    fn emulate(
+        &self,
+        graph: &Graph<HookPool>,
+        amount: QuoteAmount,
+        fee_discount: Option<FeeDiscountFraction>,
+    ) -> Option<Vec<Balance>> {
+        let mut pools_delta = PoolsDelta::default();
+        let split = RouteFraction::split(
+            TokenAmount::new(amount.value()),
+            self.branches
+                .iter()
+                .map(|branch| RouteFraction::new(branch.fraction)),
+        );
+        self.branches
+            .iter()
+            .zip(split)
+            .map(|(branch, branch_amount)| {
+                branch.route.emulate(
+                    graph,
+                    with_value(amount, branch_amount.get()),
+                    fee_discount,
+                    &mut pools_delta,
+                )
+            })
+            .collect()
+    }
+
+    /// The swaps of each branch
+    fn swaps(
+        &self,
+        pools: &RoutingPools,
+        graph: &Graph<HookPool>,
+    ) -> Option<Vec<Vec<(AssetId, AssetId, HookSwap)>>> {
+        self.branches
+            .iter()
+            .map(|branch| branch.route.swaps(pools, graph))
+            .collect()
+    }
+}
+
+fn total_of(amounts: &[Balance]) -> Option<Balance> {
+    amounts
+        .iter()
+        .try_fold(0u128, |total, amount| total.checked_add(*amount))
 }
 
 /// A route through the pools of hooks, as steps on one hook's pools each, every step swapping
@@ -422,6 +709,7 @@ struct StepsRoute {
 }
 
 /// Routes on the pools of one hook, between the same tokens
+#[derive(Clone)]
 struct Step {
     /// Index in [`RoutingPools::snapshots`]
     snapshot: usize,
@@ -432,6 +720,7 @@ struct Step {
 }
 
 /// Pools one after another, which swap a fraction of what the step swaps
+#[derive(Clone)]
 struct StepRoute {
     hops: Vec<Hop>,
     /// Of [`FULL_ROUTE_FRACTION`]
@@ -439,41 +728,22 @@ struct StepRoute {
 }
 
 impl StepsRoute {
-    /// Parts of a split route can only be swapped together when they go through the same hooks
-    /// and tokens between them, so of the parts that do, the ones that swap best. A route of an
-    /// exact-out swap is through one hook, since only exact-in swaps can swap what the one before
-    /// them gave. With what it swaps, and whether it has every part.
+    /// Of the parts of each shape as a route, the one that swaps best. A route of an exact-out swap
+    /// is through one hook, since only exact-in swaps can swap what the one before them gave. With
+    /// what it swaps.
     fn best_of(
         pools: &RoutingPools,
         scope: &PoolsScope,
         graph: &Graph<HookPool>,
-        split_route: &search::SplitRoute,
+        parts_by_shape: Vec<Vec<Part>>,
         amount: QuoteAmount,
         hop_cost: Balance,
-    ) -> Option<(Self, Balance, bool)> {
-        let mut parts_by_shape = Vec::<(Vec<(usize, u32, u32)>, Vec<(Vec<Step>, u32)>)>::new();
-        for part in &split_route.parts {
-            let steps = steps_of(pools, graph, &part.route.hops);
-            let shape = steps
-                .iter()
-                .map(|step| (step.snapshot, step.token_in, step.token_out))
-                .collect::<Vec<_>>();
-            let part = (steps, part.weight_percentage);
-            match parts_by_shape
-                .iter_mut()
-                .find(|(other_shape, _)| *other_shape == shape)
-            {
-                Some((_, parts)) => parts.push(part),
-                None => parts_by_shape.push((shape, vec![part])),
-            }
-        }
-        let complete = parts_by_shape.len() == 1;
+    ) -> Option<(Self, Balance)> {
         parts_by_shape
             .into_iter()
-            .filter(|(shape, _)| shape.len() == 1 || matches!(amount, QuoteAmount::ExactIn(_)))
-            .filter_map(|(_, parts)| Self::of_parts(pools, scope, graph, parts, amount, hop_cost))
+            .filter(|parts| parts[0].0.len() == 1 || matches!(amount, QuoteAmount::ExactIn(_)))
+            .filter_map(|parts| Self::of_parts(pools, scope, graph, parts, amount, hop_cost))
             .max_by(|(_, emulated), (_, other)| more_for(amount, *emulated, *other))
-            .map(|(route, emulated)| (route, emulated, complete))
     }
 
     /// Parts through the same hooks and tokens between them, as one route, with what it swaps.
@@ -485,7 +755,7 @@ impl StepsRoute {
         pools: &RoutingPools,
         scope: &PoolsScope,
         graph: &Graph<HookPool>,
-        parts: Vec<(Vec<Step>, u32)>,
+        parts: Vec<Part>,
         amount: QuoteAmount,
         hop_cost: Balance,
     ) -> Option<(Self, Balance)> {
@@ -567,8 +837,8 @@ impl StepsRoute {
         graph: &Graph<HookPool>,
         amount: QuoteAmount,
         fee_discount: Option<FeeDiscountFraction>,
+        pools_delta: &mut PoolsDelta<HookPool>,
     ) -> Option<Balance> {
-        let mut pools_delta = PoolsDelta::default();
         self.steps
             .iter()
             .try_fold(amount.value(), |step_amount, step| {
@@ -576,7 +846,7 @@ impl StepsRoute {
                     graph,
                     with_value(amount, step_amount),
                     fee_discount,
-                    &mut pools_delta,
+                    pools_delta,
                 )
             })
     }
@@ -830,7 +1100,8 @@ fn fractions_of(amounts: &[Balance]) -> Option<Vec<u32>> {
 mod tests {
     use std::ffi::{c_char, c_void, CStr, CString};
 
-    use near_min_api::types::NearToken;
+    use bigdecimal::BigDecimal;
+    use near_min_api::types::{NearGas, NearToken};
     use near_sdk::json_types::Base64VecU8;
     use swap_router_types::hook::{
         HookPool as HookPoolInfo, HookPools, IntearDexRouteCosts, OracleFees, PoolState,
@@ -1184,15 +1455,17 @@ mod tests {
     }
 
     #[test]
-    fn last_look_discounts_the_fees_of_every_step_to_match_the_best_other_quote() {
+    fn last_look_discounts_the_fees_of_every_step_to_beat_the_best_other_quote() {
         let pools = routing_pools(false);
         let undiscounted = out(NEAR_TEAR, out(USDC_NEAR, 1_000_000, 0), 0);
+        let best_other_amount_out = undiscounted + 50;
+        let beating_amount_out = best_other_amount_out + best_other_amount_out.div_ceil(10_000);
         let routes = find(
             &pools,
             None,
             &PoolRoutesRequest {
                 last_look: Some(LastLook {
-                    best_other_amount: Amount::AmountOut(undiscounted + 50),
+                    best_other_amount: Amount::AmountOut(best_other_amount_out),
                     best_other_cost: NearToken::from_yoctonear(0),
                     referral_fees: Default::default(),
                     route_costs: IntearDexRouteCosts {
@@ -1206,7 +1479,7 @@ mod tests {
             },
         );
         let chain = &routes.chains[0];
-        // The smallest whole percent that matches, which the operations are signed for, so it's
+        // The smallest whole percent that beats it by 0.01%, which the operations are signed for, so it's
         // taken off the pools of every step
         let QuoteFeeDiscount {
             fee_discount,
@@ -1224,8 +1497,8 @@ mod tests {
                 fee_discount,
             )
         };
-        assert!(with(fee_discount) >= undiscounted + 50);
-        assert!(with(fee_discount - 10_000) < undiscounted + 50);
+        assert!(with(fee_discount) >= beating_amount_out);
+        assert!(with(fee_discount - 10_000) < beating_amount_out);
         assert_eq!(chain.estimated_amount(), with(fee_discount));
         // Only a TEAR staker's discount is shown
         assert_eq!(chain.discount(), None);
@@ -1409,14 +1682,126 @@ mod tests {
             None,
             &request("usdc", "tear", Amount::AmountIn(usdc_in)),
         );
-        let estimated_amount = match (routes.quotes.as_slice(), routes.chains.as_slice()) {
-            ([quote], []) => quote.estimated_amount.0,
-            ([], [chain]) => chain.estimated_amount(),
-            _ => panic!("Not one route"),
+        let [estimated_amount] = swapped_as_one(&routes)[..] else {
+            panic!("Not one route that swaps as one");
         };
         let direct = out(USDC_TEAR, usdc_in, 0);
         let through_near = out(NEAR_TEAR, out(USDC_NEAR, usdc_in, 0), 0);
         assert!(estimated_amount >= direct.max(through_near));
+    }
+
+    /// The estimated amounts of the routes that aren't split
+    fn swapped_as_one(routes: &PoolRoutes) -> Vec<u128> {
+        routes
+            .quotes
+            .iter()
+            .map(|quote| quote.estimated_amount.0)
+            .chain(
+                routes
+                    .chains
+                    .iter()
+                    .filter(|chain| chain.branches().len() == 1)
+                    .map(IntearDexSwap::estimated_amount),
+            )
+            .collect()
+    }
+
+    /// The direct pool of USDC/TEAR on Plach, and USDC/NEAR on Plach then NEAR/TEAR on Qoq, whose
+    /// hops burn `hop_gas`
+    fn pools_of_two_routes_through_two_hooks(hop_gas: NearGas) -> RoutingPools {
+        let pool = |tokens, reserves| HookPoolInfo {
+            hop_gas,
+            ..pool(tokens, reserves, None)
+        };
+        RoutingPools::of_snapshots(vec![
+            snapshot(
+                "Plach",
+                "slimedragon.near/xyk",
+                HookPools {
+                    pools: vec![
+                        pool(["usdc", "near"], USDC_NEAR),
+                        pool(["usdc", "tear"], [1_000_000_000, 6_000_000_000]),
+                    ],
+                    oracle_fees: vec![],
+                },
+            ),
+            snapshot(
+                "Qoq",
+                "slimedragon.near/amp",
+                HookPools {
+                    pools: vec![pool(["near", "tear"], NEAR_TEAR)],
+                    oracle_fees: vec![],
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn parts_through_several_hooks_are_split_between_them() {
+        let routes = find(
+            &pools_of_two_routes_through_two_hooks(NearGas::from_tgas(2)),
+            None,
+            &request("usdc", "tear", Amount::AmountIn(300_000_000)),
+        );
+        let [split] = routes
+            .chains
+            .iter()
+            .filter(|chain| chain.branches().len() > 1)
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Not one split route");
+        };
+        let best_swapped_as_one = swapped_as_one(&routes).into_iter().max().unwrap();
+        assert!(split.estimated_amount() > best_swapped_as_one);
+        let branches = split.branches();
+        assert_eq!(
+            branches
+                .iter()
+                .map(|branch| branch.fraction.get())
+                .sum::<u32>(),
+            FULL_ROUTE_FRACTION.get()
+        );
+        assert_eq!(
+            branches
+                .iter()
+                .map(|branch| branch.estimated_amount)
+                .sum::<u128>(),
+            split.estimated_amount()
+        );
+    }
+
+    #[test]
+    fn a_branch_that_gives_less_than_its_swaps_burn_is_left_out() {
+        // Hops that burn next to nothing, so the search splits the amount whatever gas costs
+        let pools = pools_of_two_routes_through_two_hooks(NearGas::from_gas(1));
+        let request = request("usdc", "tear", Amount::AmountIn(300_000_000));
+        let routes = find(&pools, None, &request);
+        let split = routes
+            .chains
+            .iter()
+            .find(|chain| chain.branches().len() > 1)
+            .unwrap();
+        let gain = split.estimated_amount() - swapped_as_one(&routes).into_iter().max().unwrap();
+        // The swaps of the test hooks burn 5 Tgas, and a repeated one on Plach 0.9: at this price
+        // any branch's swaps cost more than the split gives
+        let near_price_raw = BigDecimal::from(gain)
+            / BigDecimal::from(pathfinder::MIN_GAS_PRICE.as_yoctonear() * 500_000_000_000);
+        let request = PoolRoutesRequest {
+            prices: CostPrices {
+                near_price_raw: near_price_raw.clone(),
+                quoted_token_price_raw: 1.into(),
+            },
+            asset_in_prices: Some(CostPrices {
+                near_price_raw,
+                quoted_token_price_raw: 1.into(),
+            }),
+            ..request
+        };
+        let routes = find(&pools, None, &request);
+        assert!(routes
+            .chains
+            .iter()
+            .all(|chain| chain.branches().len() == 1));
     }
 
     #[test]

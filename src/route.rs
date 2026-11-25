@@ -1,5 +1,5 @@
 use futures_util::future::join_all;
-use near_min_api::types::{AccountId, Action, Balance, NearToken};
+use near_min_api::types::{AccountId, Balance, NearGas, NearToken};
 
 use tracing::info;
 
@@ -60,8 +60,9 @@ pub enum RouteStep {
         token_id: AccountId,
         receiver_ids: Vec<AccountId>,
     },
-    /// Registers the assets the trader has no balance of on Intear DEX, and the asset of each fee
-    /// receiver that it lacks, with the storage they lack
+    /// Registers the assets the trader has no balance of on Intear DEX, and the asset of each other
+    /// receiver that it lacks, with the storage they lack: fee receivers, and the referrer that
+    /// takes what can't be sent to the trader
     RegisterOnIntearDexIfNeeded {
         trader_account_id: AccountId,
         asset_ids: Vec<IntearAssetId>,
@@ -81,15 +82,54 @@ pub struct ResolvedRoute {
     pub fee_calls: Vec<CallBlueprint>,
 }
 
-impl ResolvedRoute {
-    pub fn gas(&self) -> Gas {
-        self.calls
+/// What each call of a route needs attached, in the order of its calls and of its fee calls, and
+/// what they all burn
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteGas {
+    pub calls: Vec<NearGas>,
+    pub fee_calls: Vec<NearGas>,
+    pub estimated_burn: NearGas,
+}
+
+impl RouteGas {
+    /// The planned gas of each call, of a route that isn't simulated
+    pub fn planned(route: &ResolvedRoute) -> Self {
+        let calls = route
+            .calls
             .iter()
-            .chain(&self.fee_calls)
-            .map(CallBlueprint::gas)
-            .sum()
+            .map(CallBlueprint::planned_gas)
+            .collect::<Vec<_>>();
+        let fee_calls = route
+            .fee_calls
+            .iter()
+            .map(CallBlueprint::planned_gas)
+            .collect::<Vec<_>>();
+        Self {
+            estimated_burn: calls
+                .iter()
+                .chain(&fee_calls)
+                .copied()
+                .sum::<Gas>()
+                .estimated_burn,
+            calls: calls.iter().map(|gas| gas.needs_attached).collect(),
+            fee_calls: fee_calls.iter().map(|gas| gas.needs_attached).collect(),
+        }
     }
 
+    pub fn total(&self) -> Gas {
+        let attached = self
+            .calls
+            .iter()
+            .chain(&self.fee_calls)
+            .map(|gas| gas.as_gas());
+        Gas {
+            estimated_burn: self.estimated_burn,
+            needs_attached: NearGas::from_gas(attached.sum()),
+        }
+    }
+}
+
+impl ResolvedRoute {
     pub fn storage_deposits(&self) -> NearToken {
         self.calls
             .iter()
@@ -107,10 +147,13 @@ impl ResolvedRoute {
     }
 
     /// The fee transactions are last
-    pub fn into_execution_instructions(self) -> Vec<ExecutionInstruction> {
+    pub fn into_execution_instructions(self, gas: RouteGas) -> Vec<ExecutionInstruction> {
         [
-            into_transactions(self.calls, false),
-            into_transactions(self.fee_calls, true),
+            into_transactions(self.calls.into_iter().zip(gas.calls).collect(), false),
+            into_transactions(
+                self.fee_calls.into_iter().zip(gas.fee_calls).collect(),
+                true,
+            ),
         ]
         .concat()
     }
@@ -234,31 +277,37 @@ async fn resolve_step(network: &impl NetworkView, step: RouteStep) -> Option<Vec
     }
 }
 
+/// Of calls that aren't simulated, with the gas they're planned to need attached
+pub fn with_planned_gas(calls: Vec<CallBlueprint>) -> Vec<(CallBlueprint, NearGas)> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let attached = call.planned_gas().needs_attached;
+            (call, attached)
+        })
+        .collect()
+}
+
 /// Calls to the same receiver that follow each other go in one transaction
+pub fn in_same_transaction(call: &CallBlueprint, next: &CallBlueprint) -> bool {
+    call.receiver_id() == next.receiver_id()
+}
+
+/// Each call with the gas it attaches
 pub fn into_transactions(
-    calls: Vec<CallBlueprint>,
+    calls: Vec<(CallBlueprint, NearGas)>,
     is_fee_transaction: bool,
 ) -> Vec<ExecutionInstruction> {
-    let mut transactions: Vec<(AccountId, Vec<Action>)> = Vec::new();
-    for call in calls {
-        let receiver_id = call.receiver_id();
-        let action = call.into_action();
-        match transactions.last_mut() {
-            Some((previous_receiver_id, actions)) if *previous_receiver_id == receiver_id => {
-                actions.push(action)
-            }
-            _ => transactions.push((receiver_id, vec![action])),
-        }
-    }
-    transactions
-        .into_iter()
-        .map(
-            |(receiver_id, actions)| ExecutionInstruction::NearTransaction {
-                receiver_id,
-                actions,
-                is_fee_transaction,
-            },
-        )
+    calls
+        .chunk_by(|(call, _), (next, _)| in_same_transaction(call, next))
+        .map(|transaction| ExecutionInstruction::NearTransaction {
+            receiver_id: transaction[0].0.receiver_id(),
+            actions: transaction
+                .iter()
+                .map(|(call, attached)| call.clone().into_action(*attached))
+                .collect(),
+            is_fee_transaction,
+        })
         .collect()
 }
 
@@ -323,16 +372,19 @@ mod tests {
     fn calls_to_the_same_receiver_that_follow_each_other_share_a_transaction() {
         assert!(into_transactions(vec![], false).is_empty());
         assert_eq!(
-            shape(&into_transactions(vec![wrap(1), wrap(2), wrap(3)], false)),
+            shape(&into_transactions(
+                with_planned_gas(vec![wrap(1), wrap(2), wrap(3)]),
+                false
+            )),
             [("wrap.near", 3, false)]
         );
         assert_eq!(
             shape(&into_transactions(
-                vec![
+                with_planned_gas(vec![
                     wrap(1),
                     storage_deposit("ft", NearToken::from_millinear(1)),
                     wrap(2),
-                ],
+                ]),
                 false
             )),
             [
@@ -346,8 +398,9 @@ mod tests {
     #[test]
     fn fee_calls_are_their_own_transactions_after_the_others() {
         let route = resolved_route(vec![wrap(1)], vec![fee_transfer(2), fee_transfer(3)]);
+        let gas = RouteGas::planned(&route);
         assert_eq!(
-            shape(&route.into_execution_instructions()),
+            shape(&route.into_execution_instructions(gas)),
             [("wrap.near", 1, false), ("wrap.near", 2, true)]
         );
     }
@@ -372,11 +425,12 @@ mod tests {
         assert_eq!(route.fee_amount(), 10);
         // The fee calls' gas counts too
         assert_eq!(
-            route.gas(),
-            Gas::from_ggas(2_300, 20_000) * 2
+            RouteGas::planned(&route).total(),
+            Gas::from_ggas(1_910, 11_910)
                 + Gas::from_ggas(3_540, 4_000)
-                + Gas::from_ggas(1_610, 2_500)
-                + Gas::from_ggas(1_900, 20_000) * 2
+                + Gas::from_ggas(1_606, 11_606)
+                + Gas::from_ggas(1_573, 11_573)
+                + Gas::from_ggas(2_180, 12_180) * 2
         );
     }
 }

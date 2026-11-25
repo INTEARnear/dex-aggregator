@@ -7,12 +7,14 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use bigdecimal::BigDecimal;
 use futures_util::FutureExt;
 use near_min_api::{
-    types::{BlockHeight, Finality},
+    types::{BlockHeight, Finality, NearToken},
     QueryFinality, RpcClient,
 };
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     env,
     future::Future,
@@ -24,7 +26,7 @@ use std::{
 };
 use tokio::task::{AbortHandle, JoinHandle};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use swap_router_types::{
@@ -40,7 +42,7 @@ use crate::{
         pool_routes::{self, PoolRoutes, PoolRoutesRequest},
     },
     rate_limit::{ClientIp, RateLimiter},
-    route::{resolve, ResolvedRoute, RouteBlueprint},
+    route::{resolve, ResolvedRoute, RouteBlueprint, RouteGas},
     shared_utils::{
         base_token, convert_to, final_block_hash, price_raw, BaseTokenId, Mainnet, NetworkView,
         RPC_CLIENT,
@@ -61,6 +63,8 @@ mod providers;
 mod rate_limit;
 mod route;
 mod shared_utils;
+mod simulated_gas;
+mod simulated_holdings;
 mod subscription;
 mod tear_stakes;
 mod token_infos;
@@ -221,7 +225,7 @@ async fn find_routes(
     } else {
         let block_height = Mainnet
             .current_block_height()
-            .inspect_err(|err| tracing::warn!("No block height for hooks: {err}"))
+            .inspect_err(|err| warn!("No block height for hooks: {err}"))
             .ok();
         let trade = hooks::inteardex::trade_of_request(&Mainnet, request);
         trade.zip(block_height)
@@ -238,7 +242,10 @@ async fn find_routes(
             let started_at = Instant::now();
             let route = tokio::select! {
                 route = AssertUnwindSafe(provider.route(request_cloned)).catch_unwind() => route.ok().flatten(),
-                _ = tokio::time::sleep(Duration::from_millis(60_000)) => None,
+                _ = tokio::time::sleep(Duration::from_millis(60_000)) => {
+                    warn!("{} took over 60s to route, leaving it out", provider.dex_id());
+                    None
+                }
             };
             ((provider.dex_id(), started_at.elapsed()), route)
         }));
@@ -256,9 +263,16 @@ async fn find_routes(
         }
     );
     // Hooks' quotes have no route without the route their costs are of
-    let hook_trade = hook_trade_and_block_height
-        .zip(hook_route_costs)
-        .map(|((trade, block_height), route_costs)| (trade, block_height, route_costs));
+    let hook_trade = match (hook_trade_and_block_height, hook_route_costs) {
+        (Some((trade, block_height)), Some(route_costs)) => {
+            Some((trade, block_height, route_costs))
+        }
+        (Some((trade, _)), None) => {
+            warn!("No costs of Intear DEX's routes, leaving out the quotes of hooks for {trade:?}");
+            None
+        }
+        (None, _) => None,
+    };
     let (mut dex_durations, routes): (HashMap<_, _>, Vec<_>) = routes
         .into_iter()
         .map(|result| result.expect("Route tasks catch panics and are only aborted after this"))
@@ -270,12 +284,17 @@ async fn find_routes(
         }
     }))
     .await;
-    let mut quotes = resolved_routes
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|route| quote_of_route(route, signing.clone()))
-        .collect::<Vec<_>>();
+    let mut quotes = futures_util::future::join_all(
+        resolved_routes
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|route| quote_of_route(request, route, signing.clone())),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     sort_quotes(request, &mut quotes);
 
     // Pools of hooks are routed through together, and through one hook's alone when it's asked
@@ -336,7 +355,7 @@ async fn find_routes(
             if !swaps.is_empty() {
                 let hook_quote =
                     best_intear_dex_quote(hook.dex_id(), request, trade, swaps, &signing).await;
-                quotes.extend(hook_quote);
+                quotes.extend(hook_quote.map(|hook_quote| hook_quote.quote));
                 sort_quotes(request, &mut quotes);
             }
             dex_durations.insert(hook.dex_id(), started_at.elapsed());
@@ -345,33 +364,72 @@ async fn find_routes(
     if intear_dex_requested {
         let intear_dex_quote = match &hook_trade {
             Some((trade, block_height, route_costs)) => {
-                let mut swaps = Vec::new();
-                if let Some(routing_pools) = routing_pools {
-                    let last_look = LastLook::of(&quotes, &request.fees, route_costs);
-                    let found = pool_routes(
-                        routing_pools,
-                        None,
-                        request,
-                        trade,
-                        *block_height,
-                        route_costs,
-                        last_look,
-                    )
-                    .await;
-                    intear_dex_hook_quotes.extend(found.quotes);
-                    swaps.extend(found.chains);
-                }
-                swaps.extend(IntearDexSwap::fallback_queue(trade, intear_dex_hook_quotes));
-                if swaps.is_empty() {
-                    None
-                } else {
-                    best_intear_dex_quote(DexId::IntearDex, request, trade, swaps, &signing).await
+                let other_quotes = &quotes;
+                let signing = &signing;
+                let quote_with_costs = |route_costs: IntearDexRouteCosts| {
+                    let routing_pools = routing_pools.clone();
+                    let mut hook_quotes = intear_dex_hook_quotes.clone();
+                    async move {
+                        let mut swaps = Vec::new();
+                        if let Some(routing_pools) = routing_pools {
+                            let last_look = LastLook::of(other_quotes, &request.fees, &route_costs);
+                            let found = pool_routes(
+                                routing_pools,
+                                None,
+                                request,
+                                trade,
+                                *block_height,
+                                &route_costs,
+                                last_look,
+                            )
+                            .await;
+                            hook_quotes.extend(found.quotes);
+                            swaps.extend(found.chains);
+                        }
+                        swaps.extend(IntearDexSwap::fallback_queue(trade, hook_quotes));
+                        if swaps.is_empty() {
+                            None
+                        } else {
+                            best_intear_dex_quote(DexId::IntearDex, request, trade, swaps, signing)
+                                .await
+                        }
+                    }
+                };
+                let first_look = quote_with_costs(route_costs.clone()).await;
+                let underestimate = first_look.as_ref().and_then(|intear_dex_quote| {
+                    let last_look = LastLook::of(other_quotes, &request.fees, route_costs)?;
+                    last_look_underestimate(intear_dex_quote, &last_look)
+                });
+                match underestimate {
+                    Some(underestimate) => {
+                        info!(
+                            "Intear DEX's route burns {} yoctoNEAR more than the last look \
+                             weighed it with, looking again",
+                            underestimate.as_yoctonear()
+                        );
+                        let second_look = quote_with_costs(IntearDexRouteCosts {
+                            without_oracle_request: route_costs
+                                .without_oracle_request
+                                .saturating_add(underestimate),
+                            with_oracle_request: route_costs
+                                .with_oracle_request
+                                .saturating_add(underestimate),
+                            ..route_costs.clone()
+                        })
+                        .await;
+                        // A second look that can't match gives no discount, less than the first
+                        let prices = cost_prices(request);
+                        [first_look, second_look].into_iter().flatten().min_by_key(
+                            |intear_dex_quote| quote_rank(&intear_dex_quote.quote, prices.as_ref()),
+                        )
+                    }
+                    None => first_look,
                 }
             }
             None => None,
         };
         dex_durations.insert(DexId::IntearDex, intear_dex_started_at.elapsed());
-        quotes.extend(intear_dex_quote);
+        quotes.extend(intear_dex_quote.map(|intear_dex_quote| intear_dex_quote.quote));
         sort_quotes(request, &mut quotes);
     }
 
@@ -392,6 +450,7 @@ async fn pool_routes(
     last_look: Option<LastLook>,
 ) -> PoolRoutes {
     let Some(prices) = route_costs.prices.clone() else {
+        info!("No prices to weigh what hops cost, leaving routes through pools out of {trade:?}");
         return PoolRoutes::default();
     };
     let tear_fee_discount = trade
@@ -414,6 +473,13 @@ async fn pool_routes(
     .await
 }
 
+/// A quote of a route on Intear DEX, with the gas fee that its route was planned to burn, which
+/// the last look weighs routes with
+struct IntearDexQuote {
+    quote: Quote,
+    planned_gas_usage: NearToken,
+}
+
 /// The one quote of the DEX: of the best of the routes of the swaps on Intear DEX
 async fn best_intear_dex_quote(
     dex_id: DexId,
@@ -421,7 +487,7 @@ async fn best_intear_dex_quote(
     trade: &IntearDexTrade,
     swaps: Vec<IntearDexSwap>,
     signing: &Option<SigningContext>,
-) -> Option<Quote> {
+) -> Option<IntearDexQuote> {
     let routes = hooks::routes(dex_id, request, trade, swaps);
     let resolved_routes = futures_util::future::join_all(
         routes
@@ -429,13 +495,58 @@ async fn best_intear_dex_quote(
             .map(|route| resolve_route(request, route)),
     )
     .await;
-    let mut quotes = resolved_routes
+    let quotes =
+        futures_util::future::join_all(resolved_routes.into_iter().flatten().map(|route| async {
+            let planned_gas_usage = pathfinder::MIN_GAS_PRICE.saturating_mul(
+                RouteGas::planned(&route)
+                    .total()
+                    .estimated_burn
+                    .as_gas()
+                    .into(),
+            );
+            let quote = quote_of_route(request, route, signing.clone()).await?;
+            Some(IntearDexQuote {
+                quote,
+                planned_gas_usage,
+            })
+        }))
+        .await;
+    let prices = cost_prices(request);
+    quotes
         .into_iter()
         .flatten()
-        .map(|route| quote_of_route(route, signing.clone()))
-        .collect::<Vec<_>>();
-    sort_quotes(request, &mut quotes);
-    quotes.into_iter().next()
+        .min_by_key(|intear_dex_quote| quote_rank(&intear_dex_quote.quote, prices.as_ref()))
+}
+
+/// What the route of Intear DEX's quote burns over what the last look weighed it with, when the
+/// quote matches the best other quote by its planned gas but not by what its simulation measured.
+/// The last look matches with the smallest discount that it needs by the planned gas, so the
+/// route falls just under the best other quote when it burns more. None when the quote matches
+/// as measured, or doesn't even as planned.
+fn last_look_underestimate(
+    intear_dex_quote: &IntearDexQuote,
+    last_look: &LastLook,
+) -> Option<NearToken> {
+    let IntearDexQuote {
+        quote,
+        planned_gas_usage,
+    } = intear_dex_quote;
+    let prices = last_look.route_costs.prices.as_ref();
+    let best_other_net_amount = types::net_amount(
+        last_look.best_other_amount,
+        last_look.best_other_cost,
+        prices,
+    );
+    let matches_with_gas_usage = |gas_usage: NearToken| {
+        types::net_amount(
+            quote.route.estimated_amount,
+            gas_usage.saturating_add(quote.storage_deposits),
+            prices,
+        ) >= best_other_net_amount
+    };
+    (matches_with_gas_usage(*planned_gas_usage)
+        && !matches_with_gas_usage(quote.estimated_gas_usage))
+    .then(|| quote.estimated_gas_usage.saturating_sub(*planned_gas_usage))
 }
 
 /// The route with its output converted to the requested token location, and what its steps need
@@ -449,7 +560,9 @@ async fn intear_dex_route_costs(
     let cost_of_route = |asks_oracle| async move {
         let swap = IntearDexSwap::burning_no_gas(trade, asks_oracle);
         let route = hooks::inteardex::route(DexId::IntearDex, request, trade, swap)?;
-        let quote = quote_of_route(resolve_route(request, route).await?, None);
+        let route = resolve_route(request, route).await?;
+        let gas = RouteGas::planned(&route);
+        let quote = quote_with_gas(route, gas, None);
         Some(
             quote
                 .estimated_gas_usage
@@ -503,8 +616,27 @@ async fn resolve_route(request: &SwapRequest, mut route: RouteBlueprint) -> Opti
     resolved_route
 }
 
-fn quote_of_route(route: ResolvedRoute, signing: Option<SigningContext>) -> Quote {
-    let gas = route.gas();
+/// With what its calls burn, simulated as the trader. None when that can't be found out in time.
+async fn quote_of_route(
+    request: &SwapRequest,
+    route: ResolvedRoute,
+    signing: Option<SigningContext>,
+) -> Option<Quote> {
+    let gas = simulated_gas::route_gas(
+        &route,
+        request.trader_account_id.as_ref(),
+        &request.token_in,
+    )
+    .await?;
+    Some(quote_with_gas(route, gas, signing))
+}
+
+fn quote_with_gas(
+    route: ResolvedRoute,
+    route_gas: RouteGas,
+    signing: Option<SigningContext>,
+) -> Quote {
+    let gas = route_gas.total();
     Quote {
         estimated_max_gas_cost: pathfinder::MIN_GAS_PRICE
             .saturating_mul(gas.needs_attached.as_gas().into()),
@@ -521,7 +653,7 @@ fn quote_of_route(route: ResolvedRoute, signing: Option<SigningContext>) -> Quot
             token_output: route.token_output.clone(),
             discount: route.discount,
             deprecated_needs_unwrap_always_false: false,
-            execution_instructions: route.into_execution_instructions(),
+            execution_instructions: route.into_execution_instructions(route_gas),
         },
     }
 }
@@ -534,15 +666,21 @@ fn sort_quotes(request: &SwapRequest, quotes: &mut [Quote]) {
             "No price to weigh the costs of routes against their amounts, comparing amounts only"
         );
     }
-    quotes.sort_by_cached_key(|quote| {
-        std::cmp::Reverse(types::net_amount(
-            quote.route.estimated_amount,
-            quote
-                .estimated_gas_usage
-                .saturating_add(quote.storage_deposits),
-            prices.as_ref(),
-        ))
-    });
+    quotes.sort_by_cached_key(|quote| quote_rank(quote, prices.as_ref()));
+}
+
+/// Lower is better: what the quote gets net of its costs, and of quotes that get the same, Intear
+/// DEX's first, as its last look matches the best other quote
+fn quote_rank(quote: &Quote, prices: Option<&CostPrices>) -> (Reverse<BigDecimal>, bool) {
+    let net_amount = types::net_amount(
+        quote.route.estimated_amount,
+        quote
+            .estimated_gas_usage
+            .saturating_add(quote.storage_deposits),
+        prices,
+    );
+    let of_another_dex = !matches!(quote.route.dex_id, DexId::IntearDex | DexId::Hook(_));
+    (Reverse(net_amount), of_another_dex)
 }
 
 /// Costs are in NEAR, the amounts in the token whose amount is quoted
@@ -653,20 +791,120 @@ async fn main() {
         ));
 
     let bind_address = env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-
-    let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
-
-    info!("Server running on http://{}", bind_address);
+    let serve = async {
+        // A quote before then would leave out of its routes the pools that aren't in yet
+        info!("Waiting for the pools of every DEX and hook, and for every hook to take prices");
+        let mut pools_updated = pathfinder::pools_updated();
+        tokio::join!(
+            async {
+                pools_updated
+                    .wait_for(|height| *height > 0)
+                    .await
+                    .expect("The sender is static");
+            },
+            hooks::prices_taken(),
+        );
+        let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
+        info!("Server running on http://{}", bind_address);
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    };
 
     // dexes need the indexer to run, and indexer without http does nothing, so stop when first one crashes
     tokio::select! {
-        result = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        ) => result.unwrap(),
+        result = serve => result.unwrap(),
         error = pathfinder::run(Arc::new(shared_utils::RPC_CLIENT.clone()), hooks::indexed()) => {
             error!("Pool indexing stopped: {error:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(dex_id: DexId, amount_out: u128, gas_usage: u128) -> Quote {
+        Quote {
+            route: Route {
+                estimated_amount: Amount::AmountOut(amount_out),
+                worst_case_amount: Amount::AmountOut(amount_out),
+                dex_id,
+                execution_instructions: vec![],
+                deprecated_needs_unwrap_always_false: false,
+                token_output: TokenId::Near,
+                discount: None,
+            },
+            estimated_max_gas_cost: NearToken::from_yoctonear(gas_usage),
+            estimated_gas_usage: NearToken::from_yoctonear(gas_usage),
+            storage_deposits: NearToken::from_yoctonear(0),
+            fee_amount: 0,
+            signing: None,
+            quote_id: None,
+        }
+    }
+
+    /// A yoctoNEAR of costs is a unit of the amounts
+    fn prices() -> CostPrices {
+        CostPrices {
+            near_price_raw: 1.into(),
+            quoted_token_price_raw: 1.into(),
+        }
+    }
+
+    #[test]
+    fn intear_dex_ranks_first_of_quotes_that_get_the_same() {
+        let ranked = |quotes: [Quote; 2]| {
+            let mut quotes = quotes;
+            quotes.sort_by_cached_key(|quote| quote_rank(quote, Some(&prices())));
+            quotes.map(|quote| quote.route.dex_id)
+        };
+        assert_eq!(
+            ranked([
+                quote(DexId::Rhea, 1_000, 10),
+                quote(DexId::IntearDex, 1_005, 15)
+            ]),
+            [DexId::IntearDex, DexId::Rhea]
+        );
+        assert_eq!(
+            ranked([
+                quote(DexId::IntearDex, 1_004, 15),
+                quote(DexId::Rhea, 1_000, 10)
+            ]),
+            [DexId::Rhea, DexId::IntearDex]
+        );
+    }
+
+    #[test]
+    fn the_last_look_looks_again_for_what_the_route_burns_over_its_plan() {
+        let last_look = LastLook {
+            best_other_amount: Amount::AmountOut(1_000),
+            best_other_cost: NearToken::from_yoctonear(10),
+            referral_fees: Default::default(),
+            route_costs: IntearDexRouteCosts {
+                without_oracle_request: NearToken::from_yoctonear(5),
+                with_oracle_request: NearToken::from_yoctonear(8),
+                gas_price: NearToken::from_yoctonear(1),
+                prices: Some(prices()),
+            },
+        };
+        let underestimate = |amount_out, gas_usage, planned_gas_usage| {
+            let intear_dex_quote = IntearDexQuote {
+                quote: quote(DexId::IntearDex, amount_out, gas_usage),
+                planned_gas_usage: NearToken::from_yoctonear(planned_gas_usage),
+            };
+            last_look_underestimate(&intear_dex_quote, &last_look).map(|cost| cost.as_yoctonear())
+        };
+        // Matched by its plan of 10, it gets 989 net of the 13 it burns, against 990
+        assert_eq!(underestimate(1_002, 13, 10), Some(3));
+        assert_eq!(underestimate(1_001, 12, 10), Some(2));
+        assert_eq!(underestimate(1_003, 13, 10), None);
+        // Under the best other quote even by its plan, which looking again wouldn't change
+        assert_eq!(underestimate(995, 13, 10), None);
+        // Over its plan, but still at least as good
+        assert_eq!(underestimate(1_010, 13, 10), None);
     }
 }

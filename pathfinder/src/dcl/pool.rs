@@ -53,12 +53,12 @@ pub struct Pool {
     /// Limit orders changed by simulated swaps
     filled_orders: BTreeMap<i32, (Balance, Balance)>,
     /// Steps of the swaps simulated on this pool
-    work: Work,
+    work: DclWork,
 }
 
 /// Steps the contract takes in swaps, which their gas depends on
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Work {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DclWork {
     /// Swaps within a range of the same liquidity
     pub ranges: u64,
     /// Liquidity endpoints crossed
@@ -162,12 +162,12 @@ impl Pool {
             protocol_fee_rate: init.protocol_fee_rate,
             tax_charged: 0,
             filled_orders: BTreeMap::new(),
-            work: Work::default(),
+            work: DclWork::default(),
         })
     }
 
     /// Steps of the swaps simulated on this pool since it was built
-    pub fn work(&self) -> Work {
+    pub fn work(&self) -> DclWork {
         self.work
     }
 

@@ -11,6 +11,7 @@ use near_min_api::utils::dec_format;
 use ruint::aliases::U256;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -22,7 +23,8 @@ use swap_router_types::{indexed::AccountState, types::Gas};
 use tracing::{error, info, warn};
 
 use self::math::{SwapResult, as_u128, mul_div_floor};
-use self::pool::{Pool, PoolInit, PoolTax, Work};
+pub use self::pool::DclWork;
+use self::pool::{Pool, PoolInit, PoolTax};
 
 use crate::search::{self, Graph, MaxHops, PoolsDelta, QuoteAmount, Route, Settings};
 
@@ -54,6 +56,8 @@ pub struct ExactInRoute {
     pub amount_out: U128,
     /// What `ft_on_transfer` burns for the route
     pub swap_gas: Gas,
+    /// The steps that the swap takes through the points of its pools, which its gas depends on
+    pub work: DclWork,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -65,6 +69,8 @@ pub struct ExactOutRoute {
     pub amount_out: U128,
     /// What `ft_on_transfer` burns for the route
     pub swap_gas: Gas,
+    /// The steps that the swap takes through the points of its pools, which its gas depends on
+    pub work: DclWork,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -320,6 +326,9 @@ fn apply_slippage(amount: Balance, numerator: u128) -> SwapResult<Balance> {
 const SWAP_GAS: Gas = Gas::from_ggas(7_300, 7_300);
 const HOP_GAS: Gas = Gas::from_ggas(1_500, 1_500);
 const RANGE_GAS: Gas = Gas::from_ggas(3_100, 3_100);
+/// What the route search weighs each hop by, which the router fits to what simulated swaps burnt
+static SEARCH_HOP_GAS: AtomicU64 =
+    AtomicU64::new(HOP_GAS.estimated_burn.as_gas() + RANGE_GAS.estimated_burn.as_gas());
 const CROSSING_GAS: Gas = Gas::from_ggas(1_000, 1_000);
 const ORDER_GAS: Gas = Gas::from_ggas(1_800, 1_800);
 const BITMAP_WORD_GAS: Gas = Gas::from_ggas(60, 60);
@@ -331,18 +340,22 @@ const MID_RANGE_END_GAS: Gas = Gas::from_ggas(2_600, 2_600);
 const GAS_MARGIN: NearGas = NearGas::from_tgas(8);
 const GAS_MARGIN_PERCENT: u64 = 30;
 
-fn swap_gas(route: &Route, pools_delta: &PoolsDelta<Pool>) -> Gas {
-    let work = route
+/// Of every hop of the route
+fn work_of(route: &Route, pools_delta: &PoolsDelta<Pool>) -> DclWork {
+    route
         .hops
         .iter()
         .map(|hop| pools_delta.get(&hop.pool).unwrap().work())
-        .fold(Work::default(), |total, work| Work {
+        .fold(DclWork::default(), |total, work| DclWork {
             ranges: total.ranges + work.ranges,
             crossings: total.crossings + work.crossings,
             orders: total.orders + work.orders,
             words: total.words + work.words,
             mid_range_ends: total.mid_range_ends + work.mid_range_ends,
-        });
+        })
+}
+
+fn swap_gas(route: &Route, work: DclWork) -> Gas {
     (SWAP_GAS
         + HOP_GAS * route.hops.len() as u64
         + RANGE_GAS * work.ranges
@@ -376,6 +389,7 @@ fn to_api_response(
             let amount_out = route
                 .emulate_exact_in(graph, amount_in, &mut pools_delta)
                 .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
+            let work = work_of(route, &pools_delta);
             Ok(RouteApiResponse::ExactIn {
                 route: ExactInRoute {
                     pools,
@@ -385,7 +399,8 @@ fn to_api_response(
                         SLIPPAGE_DENOMINATOR - slippage_bp,
                     )?),
                     amount_out: U128(amount_out),
-                    swap_gas: swap_gas(route, &pools_delta),
+                    swap_gas: swap_gas(route, work),
+                    work,
                 },
                 contract_in: graph.token(token_in).clone(),
                 contract_out: graph.token(token_out).clone(),
@@ -399,13 +414,15 @@ fn to_api_response(
                 .emulate_exact_out(graph, amount_out, &mut pools_delta)
                 .ok_or_else(|| anyhow::anyhow!("Failed to emulate route"))?;
             let max_amount_in = apply_slippage(amount_in, SLIPPAGE_DENOMINATOR + slippage_bp)?;
+            let work = work_of(route, &pools_delta);
             Ok(RouteApiResponse::ExactOut {
                 route: ExactOutRoute {
                     pools,
                     amount_in: U128(amount_in),
                     max_amount_in: U128(max_amount_in),
                     amount_out: U128(amount_out),
-                    swap_gas: swap_gas(route, &pools_delta),
+                    swap_gas: swap_gas(route, work),
+                    work,
                 },
                 contract_in: graph.token(token_in).clone(),
                 contract_out: graph.token(token_out).clone(),
@@ -426,6 +443,10 @@ pub struct Request {
     pub slippage: BigDecimal,
     pub near_price_raw: BigDecimal,
     pub quoted_token_price_raw: BigDecimal,
+}
+
+pub fn set_search_hop_gas(gas: NearGas) {
+    SEARCH_HOP_GAS.store(gas.as_gas(), Ordering::Relaxed);
 }
 
 /// Finds a route on the newest pools
@@ -456,7 +477,7 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         request.max_hops,
         SETTINGS,
         crate::gas_cost(
-            (HOP_GAS + RANGE_GAS).estimated_burn,
+            NearGas::from_gas(SEARCH_HOP_GAS.load(Ordering::Relaxed)),
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,

@@ -42,7 +42,7 @@ impl Hook for Qoq {
     fn init() -> Result<Self, String> {
         Ok(Self {
             pools: RwLock::default(),
-            oracle_prices: OraclePricesFeed::start("https://qoq-oracle.intear.tech".to_string())?,
+            oracle_prices: OraclePricesFeed::start(pathfinder::qoq::ORACLE_URL.to_string())?,
             snapshot: Mutex::default(),
         })
     }

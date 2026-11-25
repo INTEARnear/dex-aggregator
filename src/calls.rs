@@ -1,4 +1,7 @@
-use intear_dex_common::{AssetId, DexId, SwapRequestAmount, TokenAmount};
+use std::collections::HashSet;
+
+use bigdecimal::num_bigint::BigUint;
+use intear_dex_common::{AssetId, DexId, RouteFraction, SwapRequestAmount, TokenAmount};
 use intear_dex_types::{
     DirectWithdrawAmount, Operation, OracleFeeSwap, QuoteImprovementFee, SwapAdvancedMode,
     SwapOperationAmount, SwapOption, WithdrawAmount,
@@ -8,6 +11,7 @@ use near_min_api::types::{
     NearToken,
 };
 use near_sdk::json_types::Base64VecU8;
+use pathfinder::dcl::DclWork;
 use swap_router_types::{
     fee_discount::{FeeDiscounter, FEE_DISCOUNT_GAS},
     hook::{OracleRequest, QuoteFeeDiscount},
@@ -67,6 +71,7 @@ pub enum CallBlueprint {
         token_out: AccountId,
         swap: RheaDclSwap,
         swap_gas: Gas,
+        work: DclWork,
         output: RheaOutput,
         referral_id: AccountId,
     },
@@ -197,14 +202,25 @@ pub struct IntearDexSwapOperation {
     pub amount: Amount,
     /// The least output of an exact-in swap, or the most input of an exact-out one
     pub constraint: Balance,
-    /// In order, each after the first swapping what the one before it gave. Only exact-in swaps
-    /// have more than one.
-    pub steps: Vec<IntearDexSwapStep>,
+    /// One after another, each swapping its share of `amount`. Only exact-in swaps have more than
+    /// one.
+    pub branches: Vec<IntearDexSwapBranch>,
     /// What the operations ask before the swap, for the options that read the response, for the
     /// oracle's fee in the asset in, which `amount` and `constraint` are after. Boxed, as it's
     /// most of the size of a call that has one.
     pub oracle_request: Option<Box<IntearDexOracleRequest>>,
     pub quote_improvement_fee: Option<IntearDexQuoteImprovementFee>,
+}
+
+/// Swaps of a share of a swap's amount
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntearDexSwapBranch {
+    pub fraction: RouteFraction,
+    /// What the swap's estimated amount has of the branch
+    pub estimated_amount: Balance,
+    /// In order, each after the first swapping what the one before it gave. Only exact-in swaps
+    /// have more than one.
+    pub steps: Vec<IntearDexSwapStep>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,11 +240,16 @@ pub struct IntearDexSwapStep {
 
 impl IntearDexSwapOperation {
     pub fn asset_in(&self) -> &IntearAssetId {
-        &self.steps.first().expect("A swap has steps").asset_in
+        &self.steps().next().expect("A swap has steps").asset_in
     }
 
     pub fn asset_out(&self) -> &IntearAssetId {
-        &self.steps.last().expect("A swap has steps").asset_out
+        &self.steps().last().expect("A swap has steps").asset_out
+    }
+
+    /// Of every branch
+    pub fn steps(&self) -> impl Iterator<Item = &IntearDexSwapStep> {
+        self.branches.iter().flat_map(|branch| &branch.steps)
     }
 }
 
@@ -280,27 +301,28 @@ fn ft_transfer_call_gas(token_id: &AccountId) -> Gas {
     Gas::from_ggas(estimated_burn, 50_000)
 }
 
-/// Registering an account, simulated on mainnet state for a token of each contract code, burns 1.4
-/// to 9.4 (meta-pool.near) Tgas
-fn storage_deposit_gas(token_id: &AccountId) -> Gas {
-    let estimated_burn = match token_id.as_str() {
-        "meta-pool.near" => 9_900,
-        _ => 2_300,
-    };
-    Gas::from_ggas(estimated_burn, 20_000)
-}
-
-/// `ft_transfer`, simulated on mainnet state for a token of each contract code, burns 1.5 to 9.4
-/// (meta-pool.near) Tgas.
-/// The others are medians of what the router's swaps of two days on mainnet burnt.
-fn ft_transfer_gas(token_id: &AccountId) -> Gas {
-    let estimated_burn = match token_id.as_str() {
-        "meta-pool.near" => 9_700,
-        "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1" => 2_320,
-        _ => 1_900,
-    };
-    Gas::from_ggas(estimated_burn, 20_000)
-}
+/// What a NEP-141 transfer burns, with 10 Tgas attached on top: the median of the 50 tokens with
+/// the most volume in the week to 2026-11-24, simulated on mainnet state. 9 in 10 of them burnt
+/// 1.91 to 2.69 Tgas, and stNEAR 9.73.
+const FT_TRANSFER_GAS: Gas = Gas::from_ggas(2_180, 12_180);
+/// What a NEP-141 storage deposit burns, with 10 Tgas attached on top: the median of the same
+/// tokens. 9 in 10 of them burnt 1.65 to 2.62 Tgas.
+const FT_STORAGE_DEPOSIT_GAS: Gas = Gas::from_ggas(1_910, 11_910);
+/// What wrap.near's near_deposit and storage_deposit add to the transaction of a swap of native
+/// NEAR on Rhea or Rhea DCL, which batches them with the swap, with 10 Tgas attached on top. On
+/// mainnet state, they added the same for 3 to 300 NEAR.
+const WRAP_NEAR_DEPOSIT_GAS: Gas = Gas::from_ggas(1_606, 11_606);
+const WRAP_NEAR_STORAGE_DEPOSIT_GAS: Gas = Gas::from_ggas(1_573, 11_573);
+/// What a transfer of a trader's balance on Rhea burns, with 10 Tgas attached on top
+const RHEA_MFT_TRANSFER_GAS: Gas = Gas::from_ggas(3_590, 13_590);
+/// Attached on top of what the transaction of a swap burnt when it was simulated
+const SWAP_MARGIN: NearGas = NearGas::from_tgas(100);
+/// Attached on top of what the transaction of a deposit into or a withdrawal out of a DEX burnt
+/// when it was simulated, which reserve gas for the callbacks of their transfers
+const TRANSFER_MARGIN: NearGas = NearGas::from_tgas(50);
+/// Attached on top of what the transaction of wrapping, unwrapping, storage or a NEP-141 transfer
+/// burnt when it was simulated
+const CALL_MARGIN: NearGas = NearGas::from_tgas(10);
 
 /// Not burnt, attached so a call doesn't run out of gas when it burns more than estimated
 const GAS_MARGIN: Gas = Gas::from_ggas(0, 3_000);
@@ -364,38 +386,182 @@ impl CallBlueprint {
         }
     }
 
-    /// Source: sandbox on mainnet state. What's attached is capped at [`MAX_CALL_GAS`].
-    pub fn gas(&self) -> Gas {
+    /// The call with a hundredth of the least output of its swap, 99% slippage, so that its
+    /// simulation doesn't fail when the pools moved since its quote, but does when the swap gives
+    /// next to nothing. What an oracle's fee swap must get stays, as the oracle takes it.
+    pub fn with_99_percent_slippage(mut self) -> Self {
+        let slipped = |least_output: Balance| least_output / 100;
+        match &mut self {
+            CallBlueprint::InputNep141TransferCallRheaSwap { actions, .. }
+            | CallBlueprint::RheaSwap { actions, .. } => {
+                for action in actions {
+                    action.min_amount_out = slipped(action.min_amount_out);
+                }
+            }
+            CallBlueprint::InputNep141TransferCallRheaDclSwap {
+                swap: RheaDclSwap::ExactIn { min_amount_out },
+                ..
+            } => *min_amount_out = slipped(*min_amount_out),
+            CallBlueprint::InputNep141TransferCallIntearDex { operations, .. }
+            | CallBlueprint::IntearDexExecuteOperations { operations }
+            | CallBlueprint::IntearDexDepositNear {
+                operations: Some(operations),
+                ..
+            } => {
+                if let Amount::AmountIn(_) = operations.swap.amount {
+                    operations.swap.constraint = slipped(operations.swap.constraint);
+                }
+                for withdrawal in &mut operations.withdrawals {
+                    if let IntearDexWithdrawAmount::Full {
+                        at_least: Some(at_least),
+                    } = &mut withdrawal.amount
+                    {
+                        *at_least = slipped(*at_least);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The call with 100 times the most input of its exact-out swap and of the swap that buys its
+    /// oracle's fee, sending what they may take more of, so that its simulation doesn't fail when
+    /// the pools moved since its quote. Wrapping NEAR wraps 100 times as much, for the swap after
+    /// it. Amounts saturate, so the simulation fails on what the trader can't send.
+    pub fn with_100x_max_input(mut self) -> Self {
+        let hundredfold = |max_input: Balance| max_input.saturating_mul(100);
+        // What the swaps of the operations may take more of
+        let raise_max_inputs = |operations: &mut IntearDexOperations| {
+            let swap = &mut operations.swap;
+            let exact_out_max_input = match swap.amount {
+                Amount::AmountOut(_) => Some(&mut swap.constraint),
+                Amount::AmountIn(_) => None,
+            };
+            let oracle_fee_swap_max_input = swap
+                .oracle_request
+                .as_mut()
+                .filter(|oracle_request| oracle_request.request.fee_swap.is_some())
+                .map(|oracle_request| &mut oracle_request.request.fee.0);
+            exact_out_max_input
+                .into_iter()
+                .chain(oracle_fee_swap_max_input)
+                .map(|max_input| {
+                    let raised = hundredfold(*max_input);
+                    let raised_by = raised - *max_input;
+                    *max_input = raised;
+                    raised_by
+                })
+                .fold(0, Balance::saturating_add)
+        };
+        match &mut self {
+            CallBlueprint::InputNep141TransferCallRheaDclSwap {
+                amount,
+                swap: RheaDclSwap::ExactOut { .. },
+                ..
+            } => *amount = hundredfold(*amount),
+            CallBlueprint::InputNep141TransferCallIntearDex {
+                amount, operations, ..
+            } => *amount = amount.saturating_add(raise_max_inputs(operations)),
+            CallBlueprint::IntearDexDepositNear {
+                amount,
+                operations: Some(operations),
+            } => {
+                *amount =
+                    amount.saturating_add(NearToken::from_yoctonear(raise_max_inputs(operations)));
+            }
+            CallBlueprint::WrapNear { amount } => *amount = amount.saturating_mul(100),
+            _ => {}
+        }
+        self
+    }
+
+    /// What the call burns and needs attached without a simulation, the same for every token, and
+    /// for wrap.near's deposits of native NEAR. None for the calls that simulations measure.
+    pub fn fixed_gas(&self) -> Option<Gas> {
+        match self {
+            CallBlueprint::WrapNear { .. } => Some(WRAP_NEAR_DEPOSIT_GAS),
+            CallBlueprint::Nep141StorageDeposit { token_id, .. }
+                if token_id.as_str() == WRAP_NEAR =>
+            {
+                Some(WRAP_NEAR_STORAGE_DEPOSIT_GAS)
+            }
+            CallBlueprint::Nep141StorageDeposit { .. } => Some(FT_STORAGE_DEPOSIT_GAS),
+            CallBlueprint::InputNep141FeeTransfer { .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { .. } => Some(FT_TRANSFER_GAS),
+            CallBlueprint::InputRheaFeeMftTransfer { .. } => Some(RHEA_MFT_TRANSFER_GAS),
+            _ => None,
+        }
+    }
+
+    /// Attached on top of what the call's transaction burnt when it was simulated
+    pub fn margin(&self) -> NearGas {
+        match self {
+            CallBlueprint::InputNep141TransferCallRheaSwap { .. }
+            | CallBlueprint::InputNep141TransferCallRheaDclSwap { .. }
+            | CallBlueprint::InputNep141TransferCallIntearDex { .. }
+            | CallBlueprint::RheaSwap { .. }
+            | CallBlueprint::IntearDexDepositNear {
+                operations: Some(_),
+                ..
+            }
+            | CallBlueprint::IntearDexExecuteOperations { .. } => SWAP_MARGIN,
+            CallBlueprint::Nep141DepositOnRhea { .. }
+            | CallBlueprint::Nep141DepositOnIntearDex { .. }
+            | CallBlueprint::RheaWithdraw { .. }
+            | CallBlueprint::IntearDexWithdraw { .. } => TRANSFER_MARGIN,
+            CallBlueprint::Nep141StorageDeposit { .. }
+            | CallBlueprint::InputNep141FeeTransfer { .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { .. }
+            | CallBlueprint::InputRheaFeeMftTransfer { .. }
+            | CallBlueprint::WrapNear { .. }
+            | CallBlueprint::UnwrapNear { .. }
+            | CallBlueprint::RheaStorageDeposit { .. }
+            | CallBlueprint::RheaRegisterTokens { .. }
+            | CallBlueprint::RheaDclStorageDeposit { .. }
+            | CallBlueprint::IntearDexStorageDeposit { .. }
+            | CallBlueprint::IntearDexRegisterAssets { .. }
+            | CallBlueprint::IntearDexDepositNear {
+                operations: None, ..
+            } => CALL_MARGIN,
+        }
+    }
+
+    /// Of calls that aren't simulated: the next steps after a swap, and the routes on Intear DEX
+    /// without a swap, which the last look weighs routes on Intear DEX with. Source: sandbox on
+    /// mainnet state. What's attached is capped at [`MAX_CALL_GAS`].
+    pub fn planned_gas(&self) -> Gas {
         let gas = match self {
-            CallBlueprint::Nep141StorageDeposit { token_id, .. } => storage_deposit_gas(token_id),
+            CallBlueprint::Nep141StorageDeposit { .. }
+            | CallBlueprint::WrapNear { .. }
+            | CallBlueprint::InputNep141FeeTransfer { .. }
+            | CallBlueprint::QuoteImprovementFeeTransfer { .. }
+            | CallBlueprint::InputRheaFeeMftTransfer { .. } => {
+                self.fixed_gas().expect("these calls are of fixed gas")
+            }
             CallBlueprint::Nep141DepositOnRhea { token_id, .. } => {
                 ft_transfer_call_gas(token_id) + Gas::from_ggas(2_890, 2_500)
             }
             CallBlueprint::Nep141DepositOnIntearDex { token_id, .. } => {
                 ft_transfer_call_gas(token_id) + Gas::from_ggas(3_670, 3_300)
             }
-            // In one transaction with the call to wrap.near after it, which spends the wrapped NEAR
-            CallBlueprint::WrapNear { .. } => Gas::from_ggas(1_610, 2_500),
             CallBlueprint::UnwrapNear {
                 trader_account_id, ..
             } => Gas::from_ggas(1_900, 2_500) + near_receive_gas(trader_account_id.as_ref()),
             CallBlueprint::InputNep141TransferCallRheaSwap {
                 token_id,
-                actions,
                 swap_gas,
                 output,
                 ..
             } => {
-                let token_out = &actions.last().expect("Swaps have actions").token_out;
                 ft_transfer_call_gas(token_id)
                     + Gas::from_ggas(4_700, 4_700)
                     + *swap_gas
-                    + rhea_output_gas(output, token_out)
+                    + rhea_output_gas(output)
                     + GAS_MARGIN
             }
             CallBlueprint::InputNep141TransferCallRheaDclSwap {
                 token_id,
-                token_out,
                 swap_gas,
                 output,
                 ..
@@ -403,7 +569,7 @@ impl CallBlueprint {
                 // DCL reserves the same gas for sending either output
                 let output_gas = match output {
                     RheaOutput::Nep141 => {
-                        Gas::from_ggas(2_510, 31_800) + burn_only(ft_transfer_gas(token_out))
+                        Gas::from_ggas(2_510, 31_800) + burn_only(FT_TRANSFER_GAS)
                     }
                     RheaOutput::Near { trader_account_id } => {
                         Gas::from_ggas(4_790, 31_800)
@@ -421,10 +587,6 @@ impl CallBlueprint {
                     + Gas::from_ggas(2_430, 2_600)
                     + operations.gas_with_deposit()
             }
-            CallBlueprint::InputNep141FeeTransfer { token_id, .. }
-            | CallBlueprint::QuoteImprovementFeeTransfer { token_id, .. } => {
-                ft_transfer_gas(token_id)
-            }
             CallBlueprint::RheaStorageDeposit { .. } => Gas::from_ggas(2_610, 3_000),
             CallBlueprint::RheaRegisterTokens { token_ids } => {
                 Gas::from_ggas(2_500, 3_000) + Gas::from_ggas(500, 500) * token_ids.len() as u64
@@ -432,10 +594,9 @@ impl CallBlueprint {
             CallBlueprint::RheaSwap { swap_gas, .. } => {
                 Gas::from_ggas(2_800, 2_800) + *swap_gas + GAS_MARGIN
             }
-            CallBlueprint::InputRheaFeeMftTransfer { .. } => Gas::from_ggas(3_590, 4_000),
-            CallBlueprint::RheaWithdraw {
-                token_id, output, ..
-            } => Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output, token_id),
+            CallBlueprint::RheaWithdraw { output, .. } => {
+                Gas::from_ggas(3_700, 3_700) + rhea_output_gas(output)
+            }
             CallBlueprint::RheaDclStorageDeposit { .. } => Gas::from_ggas(3_540, 4_000),
             CallBlueprint::IntearDexStorageDeposit { .. } => Gas::from_ggas(2_790, 3_500),
             CallBlueprint::IntearDexRegisterAssets { asset_ids, .. } => {
@@ -528,8 +689,7 @@ impl CallBlueprint {
         }
     }
 
-    pub fn into_action(self) -> Action {
-        let gas = self.gas();
+    pub fn into_action(self, attached: NearGas) -> Action {
         let one_yocto = NearToken::from_yoctonear(1);
         let (method_name, args, deposit) = match self {
             CallBlueprint::Nep141StorageDeposit {
@@ -800,7 +960,7 @@ impl CallBlueprint {
         Action::FunctionCall(Box::new(FunctionCallAction {
             method_name: method_name.to_string(),
             args: serde_json::to_vec(&args).unwrap(),
-            gas: gas.attached(),
+            gas: near_min_api::types::Gas(attached),
             deposit,
         }))
     }
@@ -808,12 +968,18 @@ impl CallBlueprint {
 
 impl IntearDexOperations {
     fn gas(&self) -> Gas {
-        let swap_gas = self
-            .swap
-            .steps
-            .iter()
-            .map(IntearDexSwapStep::gas)
-            .sum::<Gas>();
+        let swap_gas = Gas {
+            estimated_burn: swaps_burn(self.swap.steps().map(|step| {
+                let option = &step.options[0];
+                (&option.dex_id, option.gas.estimated_burn)
+            })),
+            needs_attached: self
+                .swap
+                .steps()
+                .map(IntearDexSwapStep::gas)
+                .sum::<Gas>()
+                .needs_attached,
+        };
         let withdrawals_gas = self
             .withdrawals
             .iter()
@@ -856,59 +1022,78 @@ impl IntearDexOperations {
 
     fn engine_args(&self) -> serde_json::Value {
         let swap = &self.swap;
-        let last_step = swap.steps.len() - 1;
-        let quote_improvement_fee =
-            swap.quote_improvement_fee
-                .as_ref()
-                .map(|fee| QuoteImprovementFee {
-                    quote_expected_amount: TokenAmount::new(fee.quote_expected_amount),
-                    quote_improvement_receiver: fee.quote_improvement_receiver.clone(),
-                });
-        let swap_operations = swap.steps.iter().enumerate().map(|(index, step)| {
-            let asset_in = AssetId::from(&step.asset_in);
-            let asset_out = AssetId::from(&step.asset_out);
-            let amount = match index {
-                0 => SwapOperationAmount::Amount(match swap.amount {
-                    Amount::AmountIn(amount) => {
-                        SwapRequestAmount::ExactIn(TokenAmount::new(amount))
-                    }
-                    Amount::AmountOut(amount) => {
-                        SwapRequestAmount::ExactOut(TokenAmount::new(amount))
-                    }
-                }),
-                _ => SwapOperationAmount::OutputOfLastIn,
-            };
-            // Of the output of the last step, which the quote estimates
-            let constraint = (index == last_step).then(|| TokenAmount::new(swap.constraint));
-            let quote_improvement_fee =
-                quote_improvement_fee.clone().filter(|_| index == last_step);
-            match step.options.as_slice() {
-                [option] => Operation::SwapSimple {
-                    dex_id: option.dex_id.clone(),
-                    message: option.message.clone(),
-                    asset_in,
-                    asset_out,
-                    amount,
-                    constraint,
-                    quote_improvement_fee,
-                },
-                options => Operation::SwapAdvanced {
-                    asset_in,
-                    asset_out,
-                    amount,
-                    constraint,
-                    quote_improvement_fee,
-                    options: options
-                        .iter()
-                        .map(|option| SwapOption {
-                            dex_id: option.dex_id.clone(),
-                            message: option.message.clone(),
-                        })
-                        .collect(),
-                    mode: SwapAdvancedMode::FallbackQueue,
-                },
+        let branch_amounts = match swap.amount {
+            Amount::AmountIn(amount) => RouteFraction::split(
+                TokenAmount::new(amount),
+                swap.branches.iter().map(|branch| branch.fraction),
+            )
+            .into_iter()
+            .map(SwapRequestAmount::ExactIn)
+            .collect::<Vec<_>>(),
+            Amount::AmountOut(amount) => {
+                assert_eq!(swap.branches.len(), 1, "Only exact-in swaps have branches");
+                vec![SwapRequestAmount::ExactOut(TokenAmount::new(amount))]
             }
-        });
+        };
+        // Each branch gets the share of the constraint and of the quote improvement fee's
+        // expected amount that it has of the quote's estimate, which add up to them
+        let estimated_amount = swap
+            .branches
+            .iter()
+            .map(|branch| branch.estimated_amount)
+            .sum::<Balance>();
+        let shares_of = |amount: Balance| {
+            let mut shares = swap
+                .branches
+                .iter()
+                .map(|branch| {
+                    Balance::try_from(
+                        BigUint::from(amount) * branch.estimated_amount
+                            / BigUint::from(estimated_amount),
+                    )
+                    .expect("A branch's share is at most the whole")
+                })
+                .collect::<Vec<_>>();
+            shares[0] += amount - shares.iter().sum::<Balance>();
+            shares
+        };
+        let constraints = shares_of(swap.constraint);
+        let quote_improvement_fees = match &swap.quote_improvement_fee {
+            Some(fee) => shares_of(fee.quote_expected_amount)
+                .into_iter()
+                .map(|quote_expected_amount| {
+                    Some(QuoteImprovementFee {
+                        quote_expected_amount: TokenAmount::new(quote_expected_amount),
+                        quote_improvement_receiver: fee.quote_improvement_receiver.clone(),
+                    })
+                })
+                .collect(),
+            None => vec![None; swap.branches.len()],
+        };
+        let swap_operations = swap
+            .branches
+            .iter()
+            .zip(branch_amounts)
+            .zip(constraints)
+            .zip(quote_improvement_fees)
+            .flat_map(
+                |(((branch, branch_amount), constraint), quote_improvement_fee)| {
+                    let last_step = branch.steps.len() - 1;
+                    branch.steps.iter().enumerate().map(move |(index, step)| {
+                        swap_operation(
+                            step,
+                            match index {
+                                0 => SwapOperationAmount::Amount(branch_amount),
+                                _ => SwapOperationAmount::OutputOfLastIn,
+                            },
+                            // Of the output of the last step, which the quote estimates
+                            (index == last_step).then(|| TokenAmount::new(constraint)),
+                            quote_improvement_fee.clone().filter(|_| index == last_step),
+                        )
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
         let withdrawals = self
             .withdrawals
             .iter()
@@ -977,6 +1162,63 @@ impl IntearDexOperations {
     }
 }
 
+/// What swaps one after another in a call burn, each on its DEX: a swap on a DEX that the call
+/// already swapped on burns less, as Intear DEX loads the swap code of each DEX once per call
+pub fn swaps_burn<'a>(swaps: impl IntoIterator<Item = (&'a DexId, NearGas)>) -> NearGas {
+    let qoq_dex_id: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
+    let plach_dex_id: DexId = pathfinder::plach::PLACH_DEX_ID.parse().unwrap();
+    let mut swapped_on = HashSet::new();
+    swaps
+        .into_iter()
+        .map(|(dex_id, burn)| match swapped_on.insert(dex_id) {
+            true => burn,
+            false if *dex_id == qoq_dex_id => {
+                burn.saturating_sub(pathfinder::qoq::REPEATED_SWAP_SAVING)
+            }
+            false if *dex_id == plach_dex_id => {
+                burn.saturating_sub(pathfinder::plach::REPEATED_SWAP_SAVING)
+            }
+            false => burn,
+        })
+        .fold(NearGas::from_gas(0), NearGas::saturating_add)
+}
+
+fn swap_operation(
+    step: &IntearDexSwapStep,
+    amount: SwapOperationAmount,
+    constraint: Option<TokenAmount>,
+    quote_improvement_fee: Option<QuoteImprovementFee>,
+) -> Operation {
+    let asset_in = AssetId::from(&step.asset_in);
+    let asset_out = AssetId::from(&step.asset_out);
+    match step.options.as_slice() {
+        [option] => Operation::SwapSimple {
+            dex_id: option.dex_id.clone(),
+            message: option.message.clone(),
+            asset_in,
+            asset_out,
+            amount,
+            constraint,
+            quote_improvement_fee,
+        },
+        options => Operation::SwapAdvanced {
+            asset_in,
+            asset_out,
+            amount,
+            constraint,
+            quote_improvement_fee,
+            options: options
+                .iter()
+                .map(|option| SwapOption {
+                    dex_id: option.dex_id.clone(),
+                    message: option.message.clone(),
+                })
+                .collect(),
+            mode: SwapAdvancedMode::FallbackQueue,
+        },
+    }
+}
+
 impl IntearDexSwapStep {
     fn gas(&self) -> Gas {
         let qoq_dex_id: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
@@ -1032,10 +1274,10 @@ fn burn_only(gas: Gas) -> Gas {
     }
 }
 
-/// Of Rhea sending `token_id` out of the signer's balance
-fn rhea_output_gas(output: &RheaOutput, token_id: &AccountId) -> Gas {
+/// Of Rhea sending a token out of the signer's balance
+fn rhea_output_gas(output: &RheaOutput) -> Gas {
     match output {
-        RheaOutput::Nep141 => Gas::from_ggas(2_170, 26_800) + burn_only(ft_transfer_gas(token_id)),
+        RheaOutput::Nep141 => Gas::from_ggas(2_170, 26_800) + burn_only(FT_TRANSFER_GAS),
         // Rhea attaches no gas to the transfer of NEAR
         RheaOutput::Near { trader_account_id } => {
             Gas::from_ggas(4_460, 31_800) + burn_only(near_receive_gas(trader_account_id.as_ref()))
@@ -1049,9 +1291,7 @@ fn intear_dex_sending_out_gas(asset: &IntearAssetId, trader_account_id: Option<&
         // after_withdraw burnt 2.34 Tgas on mainnet
         IntearAssetId::Near => Gas::from_ggas(2_340, 5_900) + near_receive_gas(trader_account_id),
         // The DEX attaches 10 Tgas to ft_transfer
-        IntearAssetId::Nep141(token_id) => {
-            Gas::from_ggas(2_340, 16_800) + burn_only(ft_transfer_gas(token_id))
-        }
+        IntearAssetId::Nep141(_) => Gas::from_ggas(2_340, 16_800) + burn_only(FT_TRANSFER_GAS),
     }
 }
 
@@ -1082,6 +1322,8 @@ pub fn near_receive_gas(trader_account_id: Option<&AccountId>) -> Gas {
 
 #[cfg(test)]
 mod tests {
+    use near_sdk::json_types::U128;
+
     use super::*;
 
     fn account(id: &str) -> AccountId {
@@ -1094,7 +1336,8 @@ mod tests {
 
     /// The method, JSON args and deposit of the call
     fn encoded(call: CallBlueprint) -> (String, serde_json::Value, NearToken) {
-        let Action::FunctionCall(function_call) = call.into_action() else {
+        let attached = call.planned_gas().needs_attached;
+        let Action::FunctionCall(function_call) = call.into_action(attached) else {
             panic!("Calls are function calls");
         };
         (
@@ -1113,13 +1356,17 @@ mod tests {
             swap: IntearDexSwapOperation {
                 amount: Amount::AmountIn(100),
                 constraint: 79,
-                steps: vec![IntearDexSwapStep {
-                    asset_in: IntearAssetId::Near,
-                    asset_out: IntearAssetId::Nep141(account("ft")),
-                    options: vec![IntearDexSwapOption {
-                        dex_id: "slimedragon.near/xyk".parse().unwrap(),
-                        message: Base64VecU8(vec![1, 0, 0, 0]),
-                        gas: Gas::from_ggas(34_000, 34_000),
+                branches: vec![IntearDexSwapBranch {
+                    fraction: intear_dex_common::FULL_ROUTE_FRACTION,
+                    estimated_amount: 80,
+                    steps: vec![IntearDexSwapStep {
+                        asset_in: IntearAssetId::Near,
+                        asset_out: IntearAssetId::Nep141(account("ft")),
+                        options: vec![IntearDexSwapOption {
+                            dex_id: "slimedragon.near/xyk".parse().unwrap(),
+                            message: Base64VecU8(vec![1, 0, 0, 0]),
+                            gas: Gas::from_ggas(34_000, 34_000),
+                        }],
                     }],
                 }],
                 oracle_request: None,
@@ -1206,15 +1453,15 @@ mod tests {
             referral_id: account("ref.near"),
         };
         assert_eq!(
-            rhea_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(18_640, 88_900)
+            rhea_swap(RheaOutput::Nep141).planned_gas(),
+            Gas::from_ggas(18_920, 90_000)
         );
         assert_eq!(
             rhea_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
-            .gas(),
-            gas(19_253_182_562_500, 93_900_000_000_000)
+            .planned_gas(),
+            gas(19_253_182_562_500, 95_000_000_000_000)
         );
         assert_eq!(
             CallBlueprint::RheaSwap {
@@ -1222,7 +1469,7 @@ mod tests {
                 swap_gas: Gas::from_ggas(5_500, 5_500),
                 referral_id: account("ref.near"),
             }
-            .gas(),
+            .planned_gas(),
             Gas::from_ggas(8_300, 11_300)
         );
 
@@ -1233,18 +1480,19 @@ mod tests {
             token_out: account("ft"),
             swap: RheaDclSwap::ExactIn { min_amount_out: 79 },
             swap_gas: Gas::from_ggas(20_000, 20_000),
+            work: DclWork::default(),
             output,
             referral_id: account("ref.near"),
         };
         assert_eq!(
-            rhea_dcl_swap(RheaOutput::Nep141).gas(),
-            Gas::from_ggas(28_780, 101_800)
+            rhea_dcl_swap(RheaOutput::Nep141).planned_gas(),
+            Gas::from_ggas(29_060, 101_800)
         );
         assert_eq!(
             rhea_dcl_swap(RheaOutput::Near {
                 trader_account_id: Some(trader())
             })
-            .gas(),
+            .planned_gas(),
             gas(29_383_182_562_500, 101_800_000_000_000)
         );
 
@@ -1253,22 +1501,22 @@ mod tests {
                 amount: NearToken::from_yoctonear(100),
                 operations: Some(intear_operations(vec![withdraw_ft()])),
             }
-            .gas(),
-            Gas::from_ggas(41_660, 67_000)
+            .planned_gas(),
+            Gas::from_ggas(41_940, 67_000)
         );
         assert_eq!(
             CallBlueprint::IntearDexDepositNear {
                 amount: NearToken::from_yoctonear(100),
                 operations: Some(intear_operations(vec![withdraw_ft(), withdraw_near()])),
             }
-            .gas(),
-            gas(44_723_182_562_500, 73_623_182_562_500)
+            .planned_gas(),
+            gas(45_003_182_562_500, 73_623_182_562_500)
         );
         assert_eq!(
             CallBlueprint::IntearDexExecuteOperations {
                 operations: intear_operations(vec![]),
             }
-            .gas(),
+            .planned_gas(),
             Gas::from_ggas(37_480, 49_700)
         );
         assert_eq!(
@@ -1277,7 +1525,7 @@ mod tests {
                 amount: 100,
                 operations: intear_operations(vec![withdraw_near()]),
             }
-            .gas(),
+            .planned_gas(),
             gas(44_023_182_562_500, 105_323_182_562_500)
         );
     }
@@ -1286,15 +1534,121 @@ mod tests {
     fn qoq_swap_options_get_their_own_margin() {
         let plach_only = intear_operations(vec![]);
         let mut with_qoq = intear_operations(vec![]);
-        with_qoq.swap.steps[0].options.push(IntearDexSwapOption {
-            dex_id: pathfinder::qoq::QOQ_DEX_ID.parse().unwrap(),
-            message: Base64VecU8(vec![2, 0, 0, 0]),
-            gas: Gas::from_ggas(24_800, 24_800),
-        });
+        with_qoq.swap.branches[0].steps[0]
+            .options
+            .push(IntearDexSwapOption {
+                dex_id: pathfinder::qoq::QOQ_DEX_ID.parse().unwrap(),
+                message: Base64VecU8(vec![2, 0, 0, 0]),
+                gas: Gas::from_ggas(24_800, 24_800),
+            });
         // 24.8 Tgas, 4 Tgas and 15% of 24.8 Tgas
         assert_eq!(
             with_qoq.gas().needs_attached.as_gas() - plach_only.gas().needs_attached.as_gas(),
             NearGas::from_ggas(32_520).as_gas()
+        );
+    }
+
+    #[test]
+    fn a_swap_on_a_dex_that_the_call_already_swapped_on_burns_less() {
+        let qoq: DexId = pathfinder::qoq::QOQ_DEX_ID.parse().unwrap();
+        let plach: DexId = pathfinder::plach::PLACH_DEX_ID.parse().unwrap();
+        let other: DexId = "someone.near/dex".parse().unwrap();
+        let burn = swaps_burn([
+            (&qoq, NearGas::from_ggas(12_000)),
+            (&plach, NearGas::from_ggas(6_400)),
+            (&plach, NearGas::from_ggas(6_400)),
+            (&qoq, NearGas::from_ggas(8_200)),
+            (&other, NearGas::from_ggas(5_000)),
+            (&other, NearGas::from_ggas(5_000)),
+        ]);
+        assert_eq!(
+            burn,
+            NearGas::from_ggas(12_000 + 6_400 + (6_400 - 4_100) + (8_200 - 5_430) + 5_000 + 5_000)
+        );
+    }
+
+    #[test]
+    fn branches_swap_their_shares_of_the_amount_and_the_constraint() {
+        let step = |asset_in, asset_out, dex| IntearDexSwapStep {
+            asset_in,
+            asset_out,
+            options: vec![IntearDexSwapOption {
+                dex_id: format!("slimedragon.near/{dex}").parse().unwrap(),
+                message: Base64VecU8(vec![1, 0, 0, 0]),
+                gas: Gas::from_ggas(10_000, 10_000),
+            }],
+        };
+        let ft = || IntearAssetId::Nep141(account("ft"));
+        let usdc = || IntearAssetId::Nep141(account("usdc"));
+        let mut operations = intear_operations(vec![withdraw_ft()]);
+        operations.swap.amount = Amount::AmountIn(1_001);
+        operations.swap.quote_improvement_fee = Some(IntearDexQuoteImprovementFee {
+            quote_expected_amount: 81,
+            quote_improvement_receiver: account("app.near"),
+        });
+        operations.swap.branches = vec![
+            IntearDexSwapBranch {
+                fraction: RouteFraction::new(700_000),
+                estimated_amount: 61,
+                steps: vec![step(IntearAssetId::Near, ft(), "xyk")],
+            },
+            IntearDexSwapBranch {
+                fraction: RouteFraction::new(300_000),
+                estimated_amount: 20,
+                steps: vec![
+                    step(IntearAssetId::Near, usdc(), "xyk"),
+                    step(usdc(), ft(), "amp"),
+                ],
+            },
+        ];
+        let args = operations.engine_args();
+        let swaps = args["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|operation| operation.get("SwapSimple"))
+            .map(|swap| {
+                (
+                    swap["dex_id"].as_str().unwrap(),
+                    swap["amount"].clone(),
+                    swap["constraint"].clone(),
+                    swap["quote_improvement_fee"]["quote_expected_amount"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // The rounding remainders go to the first branch, so the shares add up to the whole
+        assert_eq!(
+            swaps,
+            [
+                (
+                    "slimedragon.near/xyk",
+                    serde_json::json!({ "Amount": { "ExactIn": "701" } }),
+                    serde_json::json!("60"),
+                    serde_json::json!("61"),
+                ),
+                (
+                    "slimedragon.near/xyk",
+                    serde_json::json!({ "Amount": { "ExactIn": "300" } }),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                ),
+                (
+                    "slimedragon.near/amp",
+                    serde_json::json!("OutputOfLastIn"),
+                    serde_json::json!("19"),
+                    serde_json::json!("20"),
+                ),
+            ]
+        );
+        assert_eq!(
+            operations.gas().needs_attached.as_gas()
+                - intear_operations(vec![withdraw_ft()])
+                    .gas()
+                    .needs_attached
+                    .as_gas()
+                - NearGas::from_ggas(600).as_gas(),
+            // Three swaps of 10 Tgas and their margins of 4 Tgas and 15%, instead of one of 34
+            NearGas::from_ggas(3 * 15_500 - 43_100).as_gas()
         );
     }
 
@@ -1304,7 +1658,7 @@ mod tests {
             CallBlueprint::RheaRegisterTokens {
                 token_ids: vec![account("ft")],
             }
-            .gas(),
+            .planned_gas(),
             Gas::from_ggas(3_000, 3_500)
         );
         assert_eq!(
@@ -1312,7 +1666,7 @@ mod tests {
                 asset_ids: vec![IntearAssetId::Nep141(account("ft"))],
                 for_account: None,
             }
-            .gas(),
+            .planned_gas(),
             Gas::from_ggas(3_290, 4_110)
         );
         assert_eq!(
@@ -1320,7 +1674,7 @@ mod tests {
                 asset_ids: vec![IntearAssetId::Near, IntearAssetId::Nep141(account("ft"))],
                 for_account: None,
             }
-            .gas(),
+            .planned_gas(),
             Gas::from_ggas(3_630, 4_450)
         );
     }
@@ -1373,6 +1727,160 @@ mod tests {
         assert_eq!(
             withdraw(RheaOutput::Nep141).1["skip_unwrap_near"],
             serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn simulated_swaps_get_a_hundredth_of_their_least_output() {
+        let rhea_swap = |actions| CallBlueprint::RheaSwap {
+            actions,
+            swap_gas: Gas::from_ggas(20_000, 20_000),
+            referral_id: account("ref.near"),
+        };
+        let mut slipped_actions = rhea_actions();
+        slipped_actions[1].min_amount_out = 0;
+        assert_eq!(
+            rhea_swap(rhea_actions()).with_99_percent_slippage(),
+            rhea_swap(slipped_actions)
+        );
+
+        let rhea_dcl_swap = |swap| CallBlueprint::InputNep141TransferCallRheaDclSwap {
+            token_id: account("wrap.near"),
+            amount: 100,
+            pool_ids: vec!["wrap.near|ft|100".to_string()],
+            token_out: account("ft"),
+            swap,
+            swap_gas: Gas::from_ggas(20_000, 20_000),
+            work: DclWork::default(),
+            output: RheaOutput::Nep141,
+            referral_id: account("ref.near"),
+        };
+        assert_eq!(
+            rhea_dcl_swap(RheaDclSwap::ExactIn {
+                min_amount_out: 7_900
+            })
+            .with_99_percent_slippage(),
+            rhea_dcl_swap(RheaDclSwap::ExactIn { min_amount_out: 79 })
+        );
+        let exact_out = rhea_dcl_swap(RheaDclSwap::ExactOut { amount_out: 80 });
+        assert_eq!(exact_out.clone().with_99_percent_slippage(), exact_out);
+
+        let mut operations = intear_operations(vec![withdraw_ft(), withdraw_near()]);
+        operations.swap.constraint = 7_900;
+        operations.withdrawals[0].amount = IntearDexWithdrawAmount::Full {
+            at_least: Some(7_900),
+        };
+        let CallBlueprint::IntearDexExecuteOperations { operations } =
+            CallBlueprint::IntearDexExecuteOperations { operations }.with_99_percent_slippage()
+        else {
+            unreachable!();
+        };
+        assert_eq!(operations.swap.constraint, 79);
+        assert_eq!(
+            operations.withdrawals[0].amount,
+            IntearDexWithdrawAmount::Full { at_least: Some(79) }
+        );
+        assert_eq!(
+            operations.withdrawals[1].amount,
+            IntearDexWithdrawAmount::Full { at_least: None }
+        );
+    }
+
+    #[test]
+    fn simulated_swaps_may_take_100_times_their_most_input() {
+        let rhea_dcl_swap = |amount, swap| CallBlueprint::InputNep141TransferCallRheaDclSwap {
+            token_id: account("wrap.near"),
+            amount,
+            pool_ids: vec!["wrap.near|ft|100".to_string()],
+            token_out: account("ft"),
+            swap,
+            swap_gas: Gas::from_ggas(20_000, 20_000),
+            work: DclWork::default(),
+            output: RheaOutput::Nep141,
+            referral_id: account("ref.near"),
+        };
+        let exact_out = RheaDclSwap::ExactOut { amount_out: 80 };
+        assert_eq!(
+            rhea_dcl_swap(101, exact_out.clone()).with_100x_max_input(),
+            rhea_dcl_swap(10_100, exact_out)
+        );
+        let exact_in = rhea_dcl_swap(100, RheaDclSwap::ExactIn { min_amount_out: 79 });
+        assert_eq!(exact_in.clone().with_100x_max_input(), exact_in);
+        assert_eq!(
+            CallBlueprint::WrapNear {
+                amount: NearToken::from_near(3)
+            }
+            .with_100x_max_input(),
+            CallBlueprint::WrapNear {
+                amount: NearToken::from_near(300)
+            }
+        );
+
+        let with_oracle_fee = |mut operations: IntearDexOperations, fee_swap| {
+            operations.swap.oracle_request = Some(Box::new(IntearDexOracleRequest {
+                dex_id: "slimedragon.near/amp".parse().unwrap(),
+                request: OracleRequest {
+                    oracle_key: "ed25519:11111111111111111111111111111111".parse().unwrap(),
+                    request: Base64VecU8(vec![]),
+                    fee: U128(25),
+                    fee_swap,
+                },
+            }));
+            operations
+        };
+        let fee_swap = swap_router_types::hook::OracleFeeSwap {
+            dex_id: "slimedragon.near/xyk".parse().unwrap(),
+            message: Base64VecU8(vec![1, 0, 0, 0]),
+            gas: Gas::from_ggas(5_000, 6_000),
+            fee: (AssetId::Nep141(account("usdc.near")), U128(1_000)),
+        };
+        let deposit_near = |amount, operations| CallBlueprint::IntearDexDepositNear {
+            amount: NearToken::from_yoctonear(amount),
+            operations: Some(operations),
+        };
+
+        // Of at most 101 for the swap and 25 for the oracle's fee
+        let mut exact_out = intear_operations(vec![withdraw_ft(), withdraw_near()]);
+        exact_out.swap.amount = Amount::AmountOut(80);
+        exact_out.swap.constraint = 101;
+        let exact_out = with_oracle_fee(exact_out, Some(fee_swap.clone()));
+        let mut raised = exact_out.clone();
+        raised.swap.constraint = 10_100;
+        raised.swap.oracle_request.as_mut().unwrap().request.fee = U128(2_500);
+        assert_eq!(
+            deposit_near(126, exact_out).with_100x_max_input(),
+            deposit_near(12_600, raised)
+        );
+
+        // Of exactly 100 for the swap after the oracle's fee
+        let exact_in = with_oracle_fee(
+            intear_operations(vec![withdraw_ft(), withdraw_near()]),
+            Some(fee_swap),
+        );
+        let mut raised = exact_in.clone();
+        raised.swap.oracle_request.as_mut().unwrap().request.fee = U128(2_500);
+        assert_eq!(
+            deposit_near(125, exact_in.clone()).with_100x_max_input(),
+            deposit_near(2_600, raised)
+        );
+
+        // The oracle takes its fee in the asset in, without a swap
+        let fee_in_asset_in = deposit_near(
+            125,
+            with_oracle_fee(intear_operations(vec![withdraw_ft()]), None),
+        );
+        assert_eq!(
+            fee_in_asset_in.clone().with_100x_max_input(),
+            fee_in_asset_in
+        );
+
+        // Swaps the trader's balances on Intear DEX
+        let execute_operations = CallBlueprint::IntearDexExecuteOperations {
+            operations: exact_in,
+        };
+        assert_eq!(
+            execute_operations.clone().with_100x_max_input(),
+            execute_operations
         );
     }
 
@@ -1564,6 +2072,7 @@ mod tests {
                 token_out: account("ft"),
                 swap,
                 swap_gas: Gas::from_ggas(20_000, 20_000),
+                work: DclWork::default(),
                 output: RheaOutput::Nep141,
                 referral_id: account("ref.near"),
             });

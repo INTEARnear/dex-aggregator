@@ -26,11 +26,12 @@ use trade_indexer::{receipt_events, ReceiptEvent};
 use crate::{
     calls::CallBlueprint,
     providers::rhea::RHEA_CONTRACT_ID,
-    route::{into_transactions, resolve_steps, RouteStep},
+    route::{into_transactions, resolve_steps, with_planned_gas, RouteStep},
     shared_utils::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
         RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
+    simulated_gas,
     types::{
         Amount, BalanceChange, DexId, ExecutionInstruction, IntearAssetId, OutcomeRequest,
         OutcomeWaitUntil, Quote, Route, SwapOutcome, SwapRequest, TokenId,
@@ -635,8 +636,9 @@ async fn wait_for_execution(
         // The RPC itself waits for the execution, so it's cut off at the deadline too
         match tokio::time::timeout_at(deadline, chain.executed_transaction(tx_hash)).await {
             Ok(Ok(Some(view))) => {
+                simulated_gas::record_executed(&view);
                 return ExecutedTransaction::from_view(&view)
-                    .map_err(|err| (StatusCode::BAD_GATEWAY, err))
+                    .map_err(|err| (StatusCode::BAD_GATEWAY, err));
             }
             Ok(Ok(None)) => pending_reason = "still executing".to_string(),
             Ok(Err(err)) => pending_reason = err,
@@ -1131,7 +1133,7 @@ async fn quote_improvement_transfer(
             "Failed to build paying the quote improvement fee".to_string(),
         )
     })?;
-    Ok(into_transactions(calls, true))
+    Ok(into_transactions(with_planned_gas(calls), true))
 }
 
 /// Checks the request, then waits for its transactions to execute, or only for their swaps with
@@ -1357,7 +1359,7 @@ async fn outcome_of(
             .filter(|(_, change)| *change != 0)
             .map(|(token, change)| BalanceChange { token, change })
             .collect(),
-        next_steps: into_transactions(next_steps, false),
+        next_steps: into_transactions(with_planned_gas(next_steps), false),
         error,
         settled: true,
         quote_improvement_fee: None,

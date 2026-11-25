@@ -9,10 +9,11 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     fs::{File, OpenOptions},
     io::{ErrorKind, Write},
+    mem,
     net::IpAddr,
     panic::{catch_unwind, AssertUnwindSafe},
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +29,7 @@ use swap_router_types::{
     },
     indexed::{AccountState, Watch},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
@@ -40,7 +41,6 @@ use crate::{
 
 const HOOK_DIRECTORY: &str = "hooks";
 const HOOK_TIMES_FILE: &str = "hook-times.txt";
-const MAX_CALLS_RUNNING: usize = 64;
 
 type InitFunction = unsafe extern "C" fn() -> *mut c_char;
 type WatchesFunction = unsafe extern "C" fn() -> *mut c_char;
@@ -81,13 +81,14 @@ struct HookPlugin {
 pub struct Hook {
     plugin: HookPlugin,
     watches: Vec<Watch>,
-    calls_running: Arc<Semaphore>,
     /// Keeps the plugin's functions loaded
     _library: Library,
 }
 
 static LOADED_HOOKS: OnceLock<Vec<Hook>> = OnceLock::new();
 static HOOK_TIMES: OnceLock<Mutex<File>> = OnceLock::new();
+/// Whether every hook has taken prices
+static PRICES_TAKEN: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
 
 pub fn request_details(ip: IpAddr, uri: &Uri, headers: &HeaderMap) -> RequestDetails {
     RequestDetails {
@@ -197,7 +198,6 @@ fn load_hook(path: &Path) -> Hook {
     let hook = Hook {
         plugin,
         watches,
-        calls_running: Arc::new(Semaphore::new(MAX_CALLS_RUNNING)),
         _library: library,
     };
     info!("Loaded hook {} from {}", hook.dex_id(), path.display());
@@ -224,6 +224,15 @@ pub fn indexed() -> Vec<IndexedHook> {
             }
         })
         .collect()
+}
+
+/// Once every hook has taken prices, which a hook may need to quote its pools
+pub async fn prices_taken() {
+    PRICES_TAKEN
+        .subscribe()
+        .wait_for(|taken| *taken)
+        .await
+        .expect("The sender is static");
 }
 
 /// Gives each hook the prices that changed since it last took them, after every refresh of the
@@ -270,6 +279,9 @@ pub async fn follow_prices(network: impl NetworkView) {
                     ),
                 }
             }
+            if taken_by_hook.iter().all(|taken| !taken.is_empty()) {
+                PRICES_TAKEN.send_if_modified(|all_taken| !mem::replace(all_taken, true));
+            }
         }
         tokio::time::sleep(TOKEN_INFOS_REFRESH_INTERVAL).await;
     }
@@ -281,7 +293,7 @@ impl Hook {
     }
 
     /// The quotes the hook adds on top of `quotes` for the Intear DEX trade of the request. None
-    /// when it's busy, takes too long or panics.
+    /// when it takes too long or panics.
     pub async fn quotes(
         &self,
         request: &SwapRequest,
@@ -291,9 +303,6 @@ impl Hook {
         quotes: &[Quote],
         route_costs: &IntearDexRouteCosts,
     ) -> Vec<HookQuote> {
-        let Ok(call_running) = self.calls_running.clone().try_acquire_owned() else {
-            return vec![];
-        };
         let input = serde_json::to_string(&HookInput {
             request: Cow::Borrowed(request_details),
             swap_request: Cow::Borrowed(request),
@@ -306,7 +315,6 @@ impl Hook {
         let plugin = self.plugin.clone();
         let timed_request = request.clone();
         let answer = tokio::task::spawn_blocking(move || {
-            let _call_running = call_running;
             let started_at = Instant::now();
             let hook_quotes = run_hook(&plugin, input);
             record_hook_time(&plugin, &timed_request, started_at.elapsed(), &hook_quotes);
@@ -315,7 +323,15 @@ impl Hook {
         match tokio::time::timeout(HOOK_ANSWER_TIMEOUT, answer).await {
             Ok(Ok(hook_quotes)) => hook_quotes,
             // The panic is logged where it happened
-            Ok(Err(_)) | Err(_) => vec![],
+            Ok(Err(_)) => vec![],
+            Err(_) => {
+                warn!(
+                    "{} took over {HOOK_ANSWER_TIMEOUT:?} to quote, leaving its quotes out of \
+                     {trade:?}",
+                    self.plugin.name
+                );
+                vec![]
+            }
         }
     }
 }
