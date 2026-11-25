@@ -79,6 +79,13 @@ const SETTINGS: Settings = Settings {
     keep_shorter_routes: true,
 };
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(10);
+/// Searches split the amount in 1% steps, so they leave out a pool that can't take a step of a
+/// large amount, like a curve pool near its reserves, however much it gives. Rhea refunds the input
+/// that the actions don't swap, so a tenth of the amount is searched too, and a tenth of that,
+/// while they get more net of their hops.
+const NARROWING_DIVISOR: Balance = 10;
+/// A smaller amount is only searched when price impact takes this much of what the route gets
+const NARROWING_PRICE_IMPACT_BP: u128 = 100;
 
 type U256 = ruint::aliases::U256;
 type U384 = ruint::Uint<384, 6>;
@@ -539,18 +546,43 @@ fn swap_gas(split_route: &SplitRoute, graph: &Graph<Pool>) -> Gas {
         .with_margin(GAS_MARGIN, GAS_MARGIN_PERCENT)
 }
 
+/// Whether `split_route` gets [`NARROWING_PRICE_IMPACT_BP`] less for `amount_in` than its heaviest
+/// route would at the rate it swaps a hundredth of it, which a route through pools too thin for the
+/// amount does
+fn loses_to_price_impact(
+    graph: &Graph<Pool>,
+    split_route: &SplitRoute,
+    amount_in: Balance,
+) -> Result<bool, anyhow::Error> {
+    let amount_out = split_route.emulate_total(graph, QuoteAmount::ExactIn(amount_in))?;
+    let Some(hundredth_amount_out) = split_route.parts[0].route.emulate_exact_in(
+        graph,
+        amount_in / 100,
+        &mut PoolsDelta::default(),
+    ) else {
+        return Ok(false);
+    };
+    Ok(U256::from(amount_out) * U256::from(crate::BASIS_POINTS)
+        < U256::from(hundredth_amount_out)
+            * U256::from(100)
+            * U256::from(crate::BASIS_POINTS - NARROWING_PRICE_IMPACT_BP))
+}
+
+/// Of `split_route` found for `split_amount_in` of the `total_amount_in`, which Rhea refunds the
+/// rest of
 fn exact_in_response(
     split_route: &SplitRoute,
     graph: &Graph<Pool>,
     token_in: &AccountId,
     token_out: &AccountId,
     total_amount_in: Balance,
+    split_amount_in: Balance,
     slippage_bp: u128,
 ) -> Result<SplitRouteApiResponse, anyhow::Error> {
     let mut routes_resp = Vec::new();
     let mut total_estimated_out: Balance = 0;
     let mut pools_delta = PoolsDelta::default();
-    let amount_parts = split_exactly(total_amount_in, &split_route.parts);
+    let amount_parts = split_exactly(split_amount_in, &split_route.parts);
     for (part, amount_part) in split_route.parts.iter().zip(amount_parts) {
         let estimated_out = part
             .route
@@ -630,26 +662,49 @@ pub fn find_path_in(
     ) else {
         anyhow::bail!("No routes found");
     };
-    let amount = QuoteAmount::ExactIn(request.amount_in);
-    let split_route = search::route(
-        graph,
-        token_in,
-        token_out,
-        amount,
-        request.max_hops,
-        SETTINGS,
-        crate::gas_cost(
-            NearGas::from_gas(SEARCH_HOP_GAS.load(Ordering::Relaxed)),
-            &request.near_price_raw,
-            &request.token_out_price_raw,
-        )?,
+    let hop_cost = crate::gas_cost(
+        NearGas::from_gas(SEARCH_HOP_GAS.load(Ordering::Relaxed)),
+        &request.near_price_raw,
+        &request.token_out_price_raw,
     )?;
+    let search_for = |amount_in| {
+        search::route(
+            graph,
+            token_in,
+            token_out,
+            QuoteAmount::ExactIn(amount_in),
+            request.max_hops,
+            SETTINGS,
+            hop_cost,
+        )
+    };
+    let net_amount_out = |split_route: &SplitRoute, amount_in| {
+        let amount_out = split_route.emulate_total(graph, QuoteAmount::ExactIn(amount_in))?;
+        let hops_cost = hop_cost.saturating_mul(split_route.hops() as Balance);
+        Ok::<_, anyhow::Error>(amount_out.saturating_sub(hops_cost))
+    };
+    let mut split_amount_in = request.amount_in;
+    let mut split_route = search_for(split_amount_in)?;
+    let mut split_net_amount_out = net_amount_out(&split_route, split_amount_in)?;
+    while loses_to_price_impact(graph, &split_route, split_amount_in)? {
+        let narrower_amount_in = split_amount_in / NARROWING_DIVISOR;
+        let Ok(narrower_route) = search_for(narrower_amount_in) else {
+            break;
+        };
+        let narrower_net_amount_out = net_amount_out(&narrower_route, narrower_amount_in)?;
+        if narrower_net_amount_out <= split_net_amount_out {
+            break;
+        }
+        (split_amount_in, split_route, split_net_amount_out) =
+            (narrower_amount_in, narrower_route, narrower_net_amount_out);
+    }
     let response = exact_in_response(
         &split_route,
         graph,
         &request.token_in,
         &request.token_out,
         request.amount_in,
+        split_amount_in,
         slippage_bp,
     )?;
     info!(
@@ -805,6 +860,60 @@ mod tests {
         );
         assert!(pool.quote(1, 0, 4305575812476891564929063436).is_none());
         assert!(pool.quote(1, 0, 4461406343133028890162344986).is_none());
+    }
+
+    #[test]
+    fn a_curve_pool_that_cant_take_a_step_of_the_amount_swaps_with_less_of_it() {
+        let nbtc: AccountId = "nbtc.bridge.near".parse().unwrap();
+        let wnear: AccountId = "wrap.near".parse().unwrap();
+        let tokens: Arc<[AccountId]> = [nbtc.clone(), wnear.clone()].into();
+        // Pool 5949 takes up to 4,305 NEAR, under 1% of the amount, the other one 0.01 BTC for 1
+        // NEAR
+        let pools = Pools {
+            block_height: 220410272,
+            updated_at: Instant::now(),
+            graph: Graph::new(vec![
+                Pool {
+                    id: 5949,
+                    tokens: tokens.clone(),
+                    detail: PoolDetailInfo::DegenPoolInfo(degen_5949()).with_invariant(),
+                },
+                Pool {
+                    id: 1,
+                    tokens,
+                    detail: PoolDetailInfo::SimplePoolInfo(SimplePoolInfo {
+                        amounts: [1_000_000, 10u128.pow(24)].into_iter().collect(),
+                        total_fee: 30,
+                    }),
+                },
+            ]),
+        };
+        let response = find_path_in(
+            &pools,
+            &Request {
+                token_in: wnear,
+                token_out: nbtc,
+                amount_in: 1_000_000 * 10u128.pow(24),
+                max_hops: MaxHops::Four,
+                slippage: "0.005".parse().unwrap(),
+                near_price_raw: "2.877e-24".parse().unwrap(),
+                token_out_price_raw: "9e-4".parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let swapped = response
+            .routes
+            .iter()
+            .map(|route| (route.pools[0].pool_id, route.amount_in))
+            .collect::<Vec<_>>();
+        // A hundredth of the amount, as a whole, only gets under 0.01 BTC of the other pool. The
+        // rest of the input is refunded.
+        assert_eq!(response.amount_out, 10779161);
+        assert_eq!(
+            swapped,
+            [(1, 5_700 * 10u128.pow(24)), (5949, 4_300 * 10u128.pow(24))]
+        );
+        assert_eq!(response.amount_in, 1_000_000 * 10u128.pow(24));
     }
 
     #[test]

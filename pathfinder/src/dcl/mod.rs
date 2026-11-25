@@ -469,7 +469,7 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         anyhow::bail!("No routes found");
     };
 
-    let split_route = search::route(
+    let routes = search::best_routes(
         graph,
         token_in,
         token_out,
@@ -481,9 +481,42 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
             &request.near_price_raw,
             &request.quoted_token_price_raw,
         )?,
-    )?;
+    );
+    // The search weighs every hop the same, but what a swap burns mostly depends on the points it
+    // crosses, which the best routes are weighed by instead
+    let mut best: Option<(i128, &Route)> = None;
+    for route in &routes {
+        let mut pools_delta = PoolsDelta::default();
+        let swapped = match request.amount {
+            QuoteAmount::ExactIn(amount_in) => {
+                route.emulate_exact_in(graph, amount_in, &mut pools_delta)
+            }
+            QuoteAmount::ExactOut(amount_out) => route
+                .emulate_exact_out(graph, amount_out, &mut pools_delta)
+                .map(|(amount_in, _)| amount_in),
+        };
+        let Some(swapped) = swapped.filter(|swapped| *swapped > 0) else {
+            continue;
+        };
+        let gas = swap_gas(route, work_of(route, &pools_delta)).estimated_burn;
+        let gas_cost = crate::gas_cost(
+            gas,
+            &request.near_price_raw,
+            &request.quoted_token_price_raw,
+        )?;
+        let net = match request.amount {
+            QuoteAmount::ExactIn(_) => i128::try_from(swapped)? - i128::try_from(gas_cost)?,
+            QuoteAmount::ExactOut(_) => -i128::try_from(swapped)? - i128::try_from(gas_cost)?,
+        };
+        if best.is_none_or(|(best_net, _)| net > best_net) {
+            best = Some((net, route));
+        }
+    }
+    let Some((_, route)) = best else {
+        anyhow::bail!("No routes found");
+    };
     let data = to_api_response(
-        &split_route.parts[0].route,
+        route,
         graph,
         token_in,
         token_out,
@@ -502,4 +535,100 @@ pub fn find_path_in(pools: &Pools, request: &Request) -> Result<RouteApiResponse
         ),
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dcl::math::{LEFT_MOST_POINT, RIGHT_MOST_POINT};
+
+    /// Of x.near and y.near at a price of 1, with `liquidity` at the current point
+    fn pool(
+        fee: u32,
+        point_delta: i32,
+        segments: Vec<(i32, i32, Balance)>,
+        liquidity: Balance,
+    ) -> Pool {
+        Pool::new(
+            PoolInit {
+                id: format!("x.near|y.near|{fee}"),
+                token_x: "x.near".parse().unwrap(),
+                token_y: "y.near".parse().unwrap(),
+                fee,
+                point_delta,
+                tax: None,
+                current_point: 0,
+                current_point_is_endpoint: true,
+                liquidity,
+                liquidity_x: 0,
+                fee_charged_x: 0,
+                fee_charged_y: 0,
+                protocol_fee_rate: 2000,
+            },
+            segments,
+            [],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn routes_are_weighed_by_the_points_their_swaps_cross() {
+        let liquidity = 5 * 10u128.pow(23);
+        // Liquidity that changes at every point below the current one, so a swap crosses each
+        let fragmented = [(LEFT_MOST_POINT, -200, 0)]
+            .into_iter()
+            .chain((-200i32..0).map(|left| {
+                let liquidity = liquidity + (left % 2).unsigned_abs() as u128;
+                (left, left + 1, liquidity)
+            }))
+            .chain([(0, 200, liquidity), (200, RIGHT_MOST_POINT, 0)])
+            .collect();
+        let wide_liquidity = 8 * 10u128.pow(23);
+        let wide = vec![
+            (LEFT_MOST_POINT, -8000, 0),
+            (-8000, 8000, wide_liquidity),
+            (8000, RIGHT_MOST_POINT, 0),
+        ];
+        let pools = Pools::new(
+            vec![
+                pool(100, 1, fragmented, liquidity),
+                pool(400, 8, wide, wide_liquidity),
+            ],
+            1,
+        );
+        let graph = &pools.graph;
+        let x = graph.token_index(&"x.near".parse().unwrap()).unwrap();
+        let y = graph.token_index(&"y.near".parse().unwrap()).unwrap();
+        let chosen = |amount_in| {
+            let request = Request {
+                token_in: "x.near".parse().unwrap(),
+                token_out: "y.near".parse().unwrap(),
+                amount: QuoteAmount::ExactIn(amount_in),
+                max_hops: MaxHops::Four,
+                slippage: "0.005".parse().unwrap(),
+                near_price_raw: "3e-24".parse().unwrap(),
+                quoted_token_price_raw: "3e-24".parse().unwrap(),
+            };
+            match find_path_in(&pools, &request).unwrap() {
+                RouteApiResponse::ExactIn { route, .. } => {
+                    (route.pools[0].pool_id.clone(), route.work.crossings)
+                }
+                RouteApiResponse::ExactOut { .. } => unreachable!(),
+            }
+        };
+        let found_by_the_search = |amount_in| {
+            let amount = QuoteAmount::ExactIn(amount_in);
+            let split_route =
+                search::route(graph, x, y, amount, MaxHops::Four, SETTINGS, 0).unwrap();
+            let pool = split_route.parts[0].route.hops[0].pool;
+            graph.pools()[pool].data.id.clone()
+        };
+        // 5 x crosses 9 points of the fee 100 pool for 0.00057 y more than the fee 400 pool gives,
+        // which burns 34 Tgas, 0.0034 y, less
+        let five = 5 * 10u128.pow(24);
+        assert_eq!(found_by_the_search(five), "x.near|y.near|100");
+        assert_eq!(chosen(five), ("x.near|y.near|400".to_string(), 0));
+        // 1 x crosses one point for 0.00027 y more, which is worth its 1.2 Tgas
+        assert_eq!(chosen(10u128.pow(24)), ("x.near|y.near|100".to_string(), 1));
+    }
 }

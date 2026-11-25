@@ -15,7 +15,7 @@ use near_min_api::{
     types::{
         near_account_id::AccountType,
         near_crypto::{PublicKey, PublicKeyHandle},
-        AccountId, Action, ActionView, BlockHeight, BlockId, BlockReference, CryptoHash,
+        AccountId, Action, BlockHeight, BlockId, BlockReference, CryptoHash,
         ExecutionOutcomeWithIdView, ExecutionStatusView, FinalExecutionOutcomeWithReceiptView,
         Finality, FunctionCallAction, NearGas, NearToken, NonceMode, Transaction, TransactionNonce,
         TransactionV1,
@@ -756,40 +756,6 @@ fn slope(points: &[(u64, u64)]) -> Option<NearGas> {
         .map(NearGas::from_gas)
 }
 
-/// Compares what an executed transaction burnt with what transactions of its shape were measured
-/// to burn, which it then counts as
-pub fn record_executed(executed: &FinalExecutionOutcomeWithReceiptView) {
-    let transaction = &executed.final_outcome.transaction;
-    let call_shapes = transaction
-        .actions
-        .iter()
-        .map(|action| match action {
-            ActionView::FunctionCall {
-                method_name, args, ..
-            } => Some(shape(
-                &transaction.receiver_id,
-                method_name,
-                args,
-                Some(&transaction.signer_id),
-            )),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(call_shapes) = call_shapes else {
-        return;
-    };
-    let Ok(burnt) = total_burnt(executed) else {
-        return;
-    };
-    let shape = transaction_shape(call_shapes, Some(&transaction.signer_id));
-    let mut measured = MEASURED.lock().unwrap();
-    let Some(measured) = measured.get_mut(&shape) else {
-        return;
-    };
-    measured.burnt = burnt;
-    measured.at = Instant::now();
-}
-
 #[cfg(test)]
 mod tests {
     use pathfinder::dcl::DclWork;
@@ -971,9 +937,9 @@ mod tests {
             measured_as(NearGas::from_tgas(7)),
             (
                 RouteGas {
-                    calls: vec![ggas(11_573), ggas(11_606), ggas(17_000), ggas(17_000)],
+                    calls: vec![ggas(11_910), ggas(11_606), ggas(17_000), ggas(17_000)],
                     fee_calls: vec![ggas(12_180)],
-                    estimated_burn: ggas(1_573 + 1_606 + 7_000 + 2_180),
+                    estimated_burn: ggas(1_910 + 1_606 + 7_000 + 2_180),
                 },
                 false
             )

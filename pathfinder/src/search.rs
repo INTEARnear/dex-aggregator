@@ -692,6 +692,29 @@ impl<'a, P: Pool> RouteSet<'a, P> {
     }
 }
 
+/// The `settings.top_routes` best routes of each kind from `token_in` to `token_out` (token
+/// indices) that [`route`] splits between, each hop through the best pool for the amount it gets
+pub fn best_routes<P: Pool>(
+    graph: &Graph<P>,
+    token_in: usize,
+    token_out: usize,
+    amount: QuoteAmount,
+    max_hops: MaxHops,
+    settings: Settings,
+    hop_cost: Balance,
+) -> Vec<Route> {
+    let mut search = Search {
+        graph,
+        settings,
+        best_routes: FxHashMap::default(),
+    };
+    let candidates = search.candidates_net_of_hops(amount, token_in, token_out, max_hops, hop_cost);
+    Search::<P>::best(&candidates, settings.top_routes, amount)
+        .into_iter()
+        .map(|candidate| candidate.route)
+        .collect()
+}
+
 /// Finds the best split route from `token_in` to `token_out` (token indices)
 pub fn route<P: Pool>(
     graph: &Graph<P>,
@@ -708,20 +731,7 @@ pub fn route<P: Pool>(
         settings,
         best_routes: FxHashMap::default(),
     };
-    let mut candidates = search.candidates(amount, token_in, token_out, max_hops);
-    for kind in [
-        &mut candidates.paired,
-        &mut candidates.shorter,
-        &mut candidates.unpaired,
-    ] {
-        kind.sort_by_key(|candidate| {
-            std::cmp::Reverse(amount.net_key(
-                candidate.metric,
-                candidate.route.hops.len(),
-                hop_cost,
-            ))
-        });
-    }
+    let candidates = search.candidates_net_of_hops(amount, token_in, token_out, max_hops, hop_cost);
     let mut set = RouteSet::new(graph, amount);
     let mut best_routes = |count| {
         Search::<P>::best(&candidates, count, amount)
@@ -1228,6 +1238,32 @@ impl<P: Pool> Search<'_, P> {
             best = Self::top(best, 1, amount);
         }
         best
+    }
+
+    /// Like `candidates`, each kind best first by what its routes swap net of their hops
+    fn candidates_net_of_hops(
+        &mut self,
+        amount: QuoteAmount,
+        from: usize,
+        to: usize,
+        max_hops: MaxHops,
+        hop_cost: Balance,
+    ) -> Candidates {
+        let mut candidates = self.candidates(amount, from, to, max_hops);
+        for kind in [
+            &mut candidates.paired,
+            &mut candidates.shorter,
+            &mut candidates.unpaired,
+        ] {
+            kind.sort_by_key(|candidate| {
+                std::cmp::Reverse(amount.net_key(
+                    candidate.metric,
+                    candidate.route.hops.len(),
+                    hop_cost,
+                ))
+            });
+        }
+        candidates
     }
 
     /// Routes through intermediate tokens, each hop through the best pool for the amount it gets,

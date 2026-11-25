@@ -31,7 +31,6 @@ use crate::{
         base_token, convert_to, is_near, BaseTokenId, Mainnet, NetworkView, REQWEST_CLIENT,
         RPC_CLIENT, RPC_URLS, WRAP_NEAR,
     },
-    simulated_gas,
     types::{
         Amount, BalanceChange, DexId, ExecutionInstruction, IntearAssetId, OutcomeRequest,
         OutcomeWaitUntil, Quote, Route, SwapOutcome, SwapRequest, TokenId,
@@ -636,7 +635,6 @@ async fn wait_for_execution(
         // The RPC itself waits for the execution, so it's cut off at the deadline too
         match tokio::time::timeout_at(deadline, chain.executed_transaction(tx_hash)).await {
             Ok(Ok(Some(view))) => {
-                simulated_gas::record_executed(&view);
                 return ExecutedTransaction::from_view(&view)
                     .map_err(|err| (StatusCode::BAD_GATEWAY, err));
             }

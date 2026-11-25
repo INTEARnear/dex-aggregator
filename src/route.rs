@@ -426,10 +426,9 @@ mod tests {
         // The fee calls' gas counts too
         assert_eq!(
             RouteGas::planned(&route).total(),
-            Gas::from_ggas(1_910, 11_910)
+            Gas::from_ggas(1_910, 11_910) * 2
                 + Gas::from_ggas(3_540, 4_000)
                 + Gas::from_ggas(1_606, 11_606)
-                + Gas::from_ggas(1_573, 11_573)
                 + Gas::from_ggas(2_180, 12_180) * 2
         );
     }
