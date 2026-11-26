@@ -8,11 +8,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use intear_dex_common::{AssetId, FeeDiscountFraction};
+use intear_dex_common::{AssetId, FeeDiscountFraction, FeeFraction, FULL_FEE_FRACTION};
 use near_min_api::types::{Balance, NearGas};
 use near_sdk::PublicKeyHandle;
 use pathfinder::search::{self, Graph, QuoteAmount};
-use swap_router_types::hook::{HookPools, HookSwap, HookSwapRequest, OracleFees, PoolState};
+use swap_router_types::{
+    hook::{HookPools, HookSwap, HookSwapRequest, OracleFees, PoolState},
+    types::PoolFee,
+};
 
 use super::{answer, loaded, Hook, HookPlugin, SwapFunction};
 use crate::types::IntearAssetId;
@@ -184,6 +187,24 @@ pub struct PoolOrigin {
     pub snapshot: usize,
     hop_gas: NearGas,
     pub oracle_key: Option<PublicKeyHandle>,
+    /// By receiver
+    fees: Vec<FeeFraction>,
+}
+
+impl PoolOrigin {
+    /// Of what a swap through the pool swaps, which the DEX discounts each fee of
+    pub fn pool_fee(&self, fee_discount: Option<FeeDiscountFraction>) -> PoolFee {
+        let total_fee: u32 = self
+            .fees
+            .iter()
+            .map(|&fee| {
+                fee_discount
+                    .map_or(fee, |fee_discount| fee_discount.apply(fee))
+                    .get()
+            })
+            .sum();
+        PoolFee::ratio(total_fee.into(), FULL_FEE_FRACTION.get().into())
+    }
 }
 
 /// Which pools a route can go through: of one hook, or all of them, and the ones that read the
@@ -309,6 +330,7 @@ impl RoutingPools {
                     snapshot: snapshot_index,
                     hop_gas: pool.hop_gas,
                     oracle_key: pool.oracle_key.clone(),
+                    fees: pool.fees.clone(),
                 });
             }
         }

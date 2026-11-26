@@ -338,6 +338,13 @@ impl Pools {
                     state: PoolState::of_balances(pool.reserves.0.map(TokenAmount::get)),
                     hop_gas: HOP_GAS.estimated_burn,
                     oracle_key: None,
+                    fees: pool
+                        .info
+                        .fees
+                        .receivers
+                        .iter()
+                        .map(|(_, fee_fraction)| *fee_fraction)
+                        .collect(),
                 })
                 .collect(),
             oracle_fees: Vec::new(),

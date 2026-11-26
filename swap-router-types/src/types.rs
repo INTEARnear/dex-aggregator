@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, fmt::Display, str::FromStr, sync::Arc};
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, RoundingMode};
 use near_min_api::{
     types::{near_crypto::PublicKey, AccountId, Action, Balance, CryptoHash, NearGas, NearToken},
     utils::dec_format,
 };
-use num_traits::{ToPrimitive, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use serde::de::Error;
 use serde::{Deserialize, Serialize};
 
@@ -430,6 +430,62 @@ pub struct Route {
     /// provided `Amount::AmountOut`. The estimated amounts already include it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discount: Option<Amount>,
+    /// What the pools of the route, and the oracle that its swap asks, take of its input as fees.
+    /// The referral fees aren't in it.
+    pub pool_fee: PoolFee,
+}
+
+/// The share of a swap's input that the pools it goes through take as fees, `"0.003"` is 0.3%
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PoolFee(#[serde(deserialize_with = "from_str")] BigDecimal);
+
+impl Serialize for PoolFee {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Without the exponent that small ones are displayed with
+        serializer.serialize_str(&self.0.to_plain_string())
+    }
+}
+
+/// Decimal places of a [`PoolFee`]
+const POOL_FEE_SCALE: i64 = 12;
+
+impl PoolFee {
+    pub fn none() -> Self {
+        Self(BigDecimal::zero())
+    }
+
+    pub fn ratio(numerator: u128, denominator: u128) -> Self {
+        Self::rounded(BigDecimal::from(numerator) / BigDecimal::from(denominator))
+    }
+
+    /// Of swaps one after another, each of what the one before it gave
+    pub fn chained(fees: impl IntoIterator<Item = Self>) -> Self {
+        let kept = fees.into_iter().fold(BigDecimal::one(), |kept, fee| {
+            kept * (BigDecimal::one() - fee.0)
+        });
+        Self::rounded(BigDecimal::one() - kept)
+    }
+
+    /// Of swaps of parts of the input, of each part's weight of it
+    pub fn split(parts: impl IntoIterator<Item = (u32, Self)>) -> Self {
+        let (total_weight, weighted_fees) = parts.into_iter().fold(
+            (BigDecimal::zero(), BigDecimal::zero()),
+            |(total_weight, weighted_fees), (weight, fee)| {
+                (
+                    total_weight + BigDecimal::from(weight),
+                    weighted_fees + fee.0 * BigDecimal::from(weight),
+                )
+            },
+        );
+        Self::rounded(weighted_fees / total_weight)
+    }
+
+    fn rounded(fee: BigDecimal) -> Self {
+        Self(
+            fee.with_scale_round(POOL_FEE_SCALE, RoundingMode::HalfEven)
+                .normalized(),
+        )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -707,5 +763,42 @@ impl FromStr for DexId {
             "" => return Err("Empty dex id".to_string()),
             name => DexId::Hook(name.into()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized(fee: &PoolFee) -> String {
+        serde_json::to_string(fee).unwrap()
+    }
+
+    #[test]
+    fn pool_fees_of_swaps_one_after_another_take_from_what_the_ones_before_gave() {
+        let fee = PoolFee::chained([PoolFee::ratio(3, 1_000), PoolFee::ratio(3, 1_000)]);
+        assert_eq!(serialized(&fee), r#""0.005991""#);
+    }
+
+    #[test]
+    fn pool_fees_of_parts_are_weighed_by_the_parts() {
+        let fee = PoolFee::split([(75, PoolFee::ratio(1, 100)), (25, PoolFee::ratio(3, 100))]);
+        assert_eq!(serialized(&fee), r#""0.015""#);
+        // Of what's swapped, when the weights don't add up to all of the input
+        let fee = PoolFee::split([(30, PoolFee::ratio(1, 100)), (10, PoolFee::ratio(3, 100))]);
+        assert_eq!(serialized(&fee), r#""0.015""#);
+    }
+
+    #[test]
+    fn pool_fees_are_plain_decimals_rounded_to_their_scale() {
+        assert_eq!(serialized(&PoolFee::none()), r#""0""#);
+        assert_eq!(serialized(&PoolFee::ratio(1, 1_000_000)), r#""0.000001""#);
+        assert_eq!(serialized(&PoolFee::ratio(1, 3)), r#""0.333333333333""#);
+        assert_eq!(
+            serialized(&PoolFee::ratio(1, 10u128.pow(12))),
+            r#""0.000000000001""#
+        );
+        let fee: PoolFee = serde_json::from_str(r#""0.000001""#).unwrap();
+        assert_eq!(fee, PoolFee::ratio(1, 1_000_000));
     }
 }

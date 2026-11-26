@@ -3,6 +3,7 @@ use ruint::aliases::U256;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use swap_router_types::types::PoolFee;
 
 use super::math::{
     CurrentState, LEFT_MOST_POINT, RIGHT_MOST_POINT, RangeRet, SwapError, SwapResult, as_u128,
@@ -169,6 +170,10 @@ impl Pool {
     /// Steps of the swaps simulated on this pool since it was built
     pub fn work(&self) -> DclWork {
         self.work
+    }
+
+    pub fn fee(&self) -> PoolFee {
+        PoolFee::ratio(self.data.fee.into(), FEE_DENOMINATOR)
     }
 
     pub fn set_protocol_fee_rate(&mut self, protocol_fee_rate: u32) {

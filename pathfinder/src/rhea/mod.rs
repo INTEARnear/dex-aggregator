@@ -20,7 +20,10 @@ use tokio::time::Instant;
 #[cfg(feature = "indexer")]
 use pool_indexer::PoolIndexer;
 use serde::Serialize;
-use swap_router_types::{indexed::AccountState, types::Gas};
+use swap_router_types::{
+    indexed::AccountState,
+    types::{Gas, PoolFee},
+};
 use tracing::{info, warn};
 
 use crate::search::{
@@ -42,6 +45,8 @@ pub struct SplitRouteApiResponse {
     pub amount_out: Balance,
     /// What the route's pools burn in Rhea's call that swaps
     pub swap_gas: Gas,
+    /// Of what the route swaps, without the input that Rhea refunds
+    pub pool_fee: PoolFee,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -179,6 +184,16 @@ impl search::Pool for Pool {
 }
 
 impl Pool {
+    fn fee(&self) -> PoolFee {
+        let total_fee = match &self.detail {
+            PoolDetailInfo::SimplePoolInfo(info) => info.total_fee,
+            PoolDetailInfo::StablePoolInfo(info) => info.total_fee,
+            PoolDetailInfo::RatedPoolInfo(info) => info.total_fee,
+            PoolDetailInfo::DegenPoolInfo(info) => info.total_fee,
+        };
+        PoolFee::ratio(total_fee.into(), FEE_DIVISOR.into())
+    }
+
     fn unless_panicked(
         &mut self,
         swap: impl FnOnce(&mut PoolDetailInfo) -> Option<Balance>,
@@ -625,6 +640,17 @@ fn exact_in_response(
         amount_in: total_amount_in,
         amount_out: total_estimated_out,
         swap_gas: swap_gas(split_route, graph),
+        pool_fee: PoolFee::split(split_route.parts.iter().map(|part| {
+            (
+                part.weight_percentage,
+                PoolFee::chained(
+                    part.route
+                        .hops
+                        .iter()
+                        .map(|hop| graph.pools()[hop.pool].fee()),
+                ),
+            )
+        })),
     })
 }
 
@@ -914,6 +940,8 @@ mod tests {
             [(1, 5_700 * 10u128.pow(24)), (5949, 4_300 * 10u128.pow(24))]
         );
         assert_eq!(response.amount_in, 1_000_000 * 10u128.pow(24));
+        // Both pools take 0.3% of the hundredth they swap, and nothing of the refunded rest
+        assert_eq!(response.pool_fee, PoolFee::ratio(3, 1_000));
     }
 
     #[test]

@@ -652,6 +652,7 @@ fn quote_with_gas(
             dex_id: route.dex_id.clone(),
             token_output: route.token_output.clone(),
             discount: route.discount,
+            pool_fee: route.pool_fee.clone(),
             deprecated_needs_unwrap_always_false: false,
             execution_instructions: route.into_execution_instructions(route_gas),
         },
@@ -826,6 +827,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PoolFee;
 
     fn quote(dex_id: DexId, amount_out: u128, gas_usage: u128) -> Quote {
         Quote {
@@ -837,6 +839,7 @@ mod tests {
                 deprecated_needs_unwrap_always_false: false,
                 token_output: TokenId::Near,
                 discount: None,
+                pool_fee: PoolFee::none(),
             },
             estimated_max_gas_cost: NearToken::from_yoctonear(gas_usage),
             estimated_gas_usage: NearToken::from_yoctonear(gas_usage),

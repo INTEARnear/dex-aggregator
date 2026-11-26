@@ -1,7 +1,8 @@
 use std::{future::Future, pin::Pin};
 
 use crate::{
-    route::RouteBlueprint, shared_utils::convert_to_nep141, Amount, DexId, Provider, SwapRequest,
+    route::RouteBlueprint, shared_utils::convert_to_nep141, types::PoolFee, Amount, DexId,
+    Provider, SwapRequest,
 };
 
 pub struct WrapProvider;
@@ -34,6 +35,7 @@ impl Provider for WrapProvider {
                     steps: vec![],
                     fee_steps: vec![],
                     discount: None,
+                    pool_fee: PoolFee::none(),
                     token_output: request.token_in,
                 });
             }

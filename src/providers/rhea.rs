@@ -174,6 +174,7 @@ async fn route(
             worst_case_amount: Amount::AmountOut(total_min_amount_out),
             token_output: request.token_out.clone(),
             discount: None,
+            pool_fee: response.pool_fee,
             steps: [
                 registration,
                 vec![swap],
@@ -232,6 +233,7 @@ async fn route(
         fee_steps,
         token_output,
         discount: None,
+        pool_fee: response.pool_fee,
     })
 }
 
@@ -242,7 +244,7 @@ mod tests {
     use super::*;
     use crate::route::resolve;
     use crate::shared_utils::{TestNetworkView, WRAP_NEAR};
-    use crate::types::{Gas, IntearAssetId, Slippage};
+    use crate::types::{Gas, IntearAssetId, PoolFee, Slippage};
     use swap_router_types::fees::AGGREGATOR_FEE_RECEIVER_ID;
 
     #[derive(Clone)]
@@ -305,11 +307,17 @@ mod tests {
                 amount_in: request.amount_in,
                 amount_out: 80,
                 swap_gas: SWAP_GAS,
+                pool_fee: pool_fee(),
             })
         }
     }
 
     const SWAP_GAS: Gas = Gas::from_ggas(5_500, 5_500);
+
+    /// Of the test route through pool 1
+    fn pool_fee() -> PoolFee {
+        PoolFee::ratio(3, 1_000)
+    }
 
     fn account(id: &str) -> AccountId {
         id.parse().unwrap()
@@ -427,6 +435,7 @@ mod tests {
             worst_case_amount: Amount::AmountOut(79),
             token_output,
             discount: None,
+            pool_fee: pool_fee(),
             steps,
             fee_steps,
         }

@@ -5,7 +5,7 @@ use near_sdk::json_types::{Base64VecU8, U128};
 use swap_router_types::{
     fees::{amount_in_after_referral_fees, amount_in_with_referral_fees},
     hook::{HookQuote, IntearDexTrade, OracleRequest, QuoteFeeDiscount},
-    types::Gas,
+    types::{Gas, PoolFee},
 };
 
 use crate::{
@@ -115,6 +115,8 @@ pub struct IntearDexSwap {
     oracle_request: Option<IntearDexOracleRequest>,
     /// On every swap of the steps, which the estimated amount is with
     fee_discount: Option<QuoteFeeDiscount>,
+    /// Of the first option, as in [`HookQuote`]
+    pool_fee: PoolFee,
 }
 
 impl IntearDexSwap {
@@ -125,6 +127,7 @@ impl IntearDexSwap {
             discount: quote.discount,
             oracle_request: oracle_request_of(&quote),
             fee_discount: quote.fee_discount,
+            pool_fee: quote.pool_fee.clone(),
             branches: vec![whole(
                 quote.estimated_amount.0,
                 vec![single_step(trade, vec![swap_option(quote)])],
@@ -141,6 +144,7 @@ impl IntearDexSwap {
         discount: Option<U128>,
         oracle_request: Option<IntearDexOracleRequest>,
         fee_discount: Option<QuoteFeeDiscount>,
+        pool_fee: PoolFee,
     ) -> Self {
         Self {
             branches: vec![whole(estimated_amount, chained_steps(steps))],
@@ -149,6 +153,7 @@ impl IntearDexSwap {
             discount,
             oracle_request,
             fee_discount,
+            pool_fee,
         }
     }
 
@@ -161,6 +166,7 @@ impl IntearDexSwap {
         discount: Option<U128>,
         oracle_request: Option<IntearDexOracleRequest>,
         fee_discount: Option<QuoteFeeDiscount>,
+        pool_fee: PoolFee,
     ) -> Self {
         Self {
             branches: branches
@@ -176,6 +182,7 @@ impl IntearDexSwap {
             discount,
             oracle_request,
             fee_discount,
+            pool_fee,
         }
     }
 
@@ -207,6 +214,7 @@ impl IntearDexSwap {
                     fee_swap: None,
                 }),
                 fee_discount: None,
+                pool_fee: PoolFee::none(),
             },
         )
     }
@@ -279,6 +287,7 @@ impl IntearDexSwap {
             discount: best.discount,
             oracle_request: best_oracle_request,
             fee_discount: best.fee_discount,
+            pool_fee: best.pool_fee.clone(),
             branches: vec![whole(
                 best.estimated_amount.0,
                 vec![single_step(
@@ -317,6 +326,10 @@ impl IntearDexSwap {
 
     pub fn fee_discount(&self) -> Option<QuoteFeeDiscount> {
         self.fee_discount
+    }
+
+    pub fn pool_fee(&self) -> &PoolFee {
+        &self.pool_fee
     }
 
     pub fn branches(&self) -> &[IntearDexSwapBranch] {
@@ -402,6 +415,17 @@ pub fn route(
         .oracle_request
         .as_ref()
         .map_or(0, |oracle_request| oracle_request.request.fee.0);
+    // Of the input without the referral fees, which is the oracle's fee and what the DEX swaps
+    let dex_amount_in = match request.amount {
+        Amount::AmountIn(amount_in) => {
+            amount_in_after_referral_fees(&request.fees, amount_in - oracle_fee)
+        }
+        Amount::AmountOut(_) => swap.estimated_amount,
+    };
+    let pool_fee = PoolFee::chained([
+        PoolFee::ratio(oracle_fee, oracle_fee + dex_amount_in),
+        swap.pool_fee.clone(),
+    ]);
     // It's the most that the swap that buys the fee takes, which leaves the rest in the input
     let oracle_fee_is_swapped = swap
         .oracle_request
@@ -629,6 +653,7 @@ pub fn route(
             TokenId::TokenOnIntearDex(token_out.clone())
         },
         discount,
+        pool_fee,
         steps: [registration, steps].concat(),
         fee_steps: vec![],
     })
@@ -665,6 +690,11 @@ mod tests {
         )
     }
 
+    /// Of the test quotes through Plach's pool 1
+    fn plach_pool_fee() -> PoolFee {
+        PoolFee::ratio(3, 1_000)
+    }
+
     /// The route of a Plach quote through pool 1 without a fee discount: 80 out of 100 in, or 100
     /// in for 80 out, with 1 of slippage
     fn test_route(request: SwapRequest) -> Option<RouteBlueprint> {
@@ -683,6 +713,7 @@ mod tests {
             discount: None,
             oracle_request: None,
             fee_discount: None,
+            pool_fee: plach_pool_fee(),
         };
         route(
             DexId::Hook("Plach".into()),
@@ -708,6 +739,7 @@ mod tests {
             discount: None,
             oracle_request: None,
             fee_discount: None,
+            pool_fee: PoolFee::none(),
         }
     }
 
@@ -866,6 +898,7 @@ mod tests {
             worst_case_amount,
             token_output,
             discount: None,
+            pool_fee: plach_pool_fee(),
             steps,
             fee_steps: vec![],
         }
@@ -1216,6 +1249,7 @@ mod tests {
             None,
             None,
             None,
+            PoolFee::none(),
         )
     }
 
@@ -1781,6 +1815,42 @@ mod tests {
                 .unwrap()
                 .amount,
             Amount::AmountOut(1_000_000)
+        );
+    }
+
+    #[test]
+    fn pool_fee_has_the_oracle_fee_of_the_input_without_the_referral_fees() {
+        let network = TestNetworkView::default().with_test_prices();
+        let with_pool_fee = |mut quote: HookQuote, oracle_fee| {
+            quote.pool_fee = plach_pool_fee();
+            quote.oracle_request.as_mut().unwrap().fee = U128(oracle_fee);
+            quote
+        };
+        let exact_in = SwapRequest {
+            fees: r#"{"app.near":0.005}"#.parse().unwrap(),
+            ..request(TokenId::Near, ft_output(), Amount::AmountIn(1_000_000))
+        };
+        let trade = trade_of_request(&network, &exact_in).unwrap();
+        let quote = oracle_quote("slimedragon.near/amp", 82, 82, 25, b"near,usdc");
+        let swap = IntearDexSwap::of_quote(&trade, with_pool_fee(quote, 200_000));
+        let exact_in_route = route(DexId::IntearDex, &exact_in, &trade, swap).unwrap();
+        // The DEX swaps 796,000 of the 800,000 that the oracle's fee leaves, after the app fees
+        assert_eq!(
+            exact_in_route.pool_fee,
+            PoolFee::chained([PoolFee::ratio(200_000, 996_000), plach_pool_fee()])
+        );
+
+        let exact_out = request(TokenId::Near, ft_output(), Amount::AmountOut(80));
+        let trade = trade_of_request(&network, &exact_out).unwrap();
+        let quote = oracle_quote("slimedragon.near/amp", 100, 101, 25, b"near,usdc");
+        let swap = IntearDexSwap::of_quote(&trade, with_pool_fee(quote, ORACLE_FEE));
+        let exact_out_route = route(DexId::IntearDex, &exact_out, &trade, swap).unwrap();
+        assert_eq!(
+            exact_out_route.pool_fee,
+            PoolFee::chained([
+                PoolFee::ratio(ORACLE_FEE, 100 + ORACLE_FEE),
+                plach_pool_fee()
+            ])
         );
     }
 

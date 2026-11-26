@@ -19,7 +19,10 @@ use tokio::time::Instant;
 #[cfg(feature = "indexer")]
 use pool_indexer::PoolIndexer;
 use serde::{Deserialize, Serialize};
-use swap_router_types::{indexed::AccountState, types::Gas};
+use swap_router_types::{
+    indexed::AccountState,
+    types::{Gas, PoolFee},
+};
 use tracing::{error, info, warn};
 
 use self::math::{SwapResult, as_u128, mul_div_floor};
@@ -58,6 +61,7 @@ pub struct ExactInRoute {
     pub swap_gas: Gas,
     /// The steps that the swap takes through the points of its pools, which its gas depends on
     pub work: DclWork,
+    pub pool_fee: PoolFee,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -71,6 +75,7 @@ pub struct ExactOutRoute {
     pub swap_gas: Gas,
     /// The steps that the swap takes through the points of its pools, which its gas depends on
     pub work: DclWork,
+    pub pool_fee: PoolFee,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -374,6 +379,7 @@ fn to_api_response(
     amount: QuoteAmount,
     slippage_bp: u128,
 ) -> Result<RouteApiResponse, anyhow::Error> {
+    let pool_fee = PoolFee::chained(route.hops.iter().map(|hop| graph.pools()[hop.pool].fee()));
     let pools = route
         .hops
         .iter()
@@ -401,6 +407,7 @@ fn to_api_response(
                     amount_out: U128(amount_out),
                     swap_gas: swap_gas(route, work),
                     work,
+                    pool_fee,
                 },
                 contract_in: graph.token(token_in).clone(),
                 contract_out: graph.token(token_out).clone(),
@@ -423,6 +430,7 @@ fn to_api_response(
                     amount_out: U128(amount_out),
                     swap_gas: swap_gas(route, work),
                     work,
+                    pool_fee,
                 },
                 contract_in: graph.token(token_in).clone(),
                 contract_out: graph.token(token_out).clone(),
@@ -610,9 +618,11 @@ mod tests {
                 quoted_token_price_raw: "3e-24".parse().unwrap(),
             };
             match find_path_in(&pools, &request).unwrap() {
-                RouteApiResponse::ExactIn { route, .. } => {
-                    (route.pools[0].pool_id.clone(), route.work.crossings)
-                }
+                RouteApiResponse::ExactIn { route, .. } => (
+                    route.pools[0].pool_id.clone(),
+                    route.work.crossings,
+                    route.pool_fee,
+                ),
                 RouteApiResponse::ExactOut { .. } => unreachable!(),
             }
         };
@@ -627,8 +637,22 @@ mod tests {
         // which burns 34 Tgas, 0.0034 y, less
         let five = 5 * 10u128.pow(24);
         assert_eq!(found_by_the_search(five), "x.near|y.near|100");
-        assert_eq!(chosen(five), ("x.near|y.near|400".to_string(), 0));
+        assert_eq!(
+            chosen(five),
+            (
+                "x.near|y.near|400".to_string(),
+                0,
+                PoolFee::ratio(400, 1_000_000)
+            )
+        );
         // 1 x crosses one point for 0.00027 y more, which is worth its 1.2 Tgas
-        assert_eq!(chosen(10u128.pow(24)), ("x.near|y.near|100".to_string(), 1));
+        assert_eq!(
+            chosen(10u128.pow(24)),
+            (
+                "x.near|y.near|100".to_string(),
+                1,
+                PoolFee::ratio(100, 1_000_000)
+            )
+        );
     }
 }

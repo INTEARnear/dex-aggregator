@@ -17,7 +17,7 @@ use swap_router_types::{
         OracleFees, OracleRequest, QuoteFeeDiscount, HOOK_ANSWER_TIMEOUT,
     },
     last_look::{with_tear_fee_discount, LastLook, SwapEstimate},
-    types::{CostPrices, Gas},
+    types::{CostPrices, Gas, PoolFee},
 };
 use tracing::warn;
 
@@ -133,6 +133,7 @@ pub fn find(
                         discount: route.discount.map(U128),
                         oracle_request: oracle_request.map(|oracle_request| oracle_request.request),
                         fee_discount: route.fee_discount,
+                        pool_fee: route.pool_fee,
                     }),
                     Err(swaps) => routes.chains.push(IntearDexSwap::chain(
                         swap_options(swaps),
@@ -141,6 +142,7 @@ pub fn find(
                         route.discount.map(U128),
                         oracle_request,
                         route.fee_discount,
+                        route.pool_fee,
                     )),
                 },
                 Err(branches) => routes.chains.push(IntearDexSwap::split(
@@ -159,6 +161,7 @@ pub fn find(
                     route.discount.map(U128),
                     oracle_request,
                     route.fee_discount,
+                    route.pool_fee,
                 )),
             }
         }
@@ -271,6 +274,8 @@ struct FoundRoute {
     oracle_request: Option<(OracleRequest, intear_dex_common::DexId)>,
     /// Of every swap of the route, which `estimated_amount` is with
     fee_discount: Option<QuoteFeeDiscount>,
+    /// With `fee_discount`
+    pool_fee: PoolFee,
 }
 
 /// Swaps of the share of the amount that the route splits to the branch
@@ -342,6 +347,22 @@ fn found_route(
     });
     let fee_discount = with_tear_fee_discount(last_look_fee_discount, request.tear_fee_discount);
     let emulated = route.emulate(graph, amount, fee_discount)?;
+    let hop_fee =
+        |hop: &Hop| pools.origins[graph.pools()[hop.pool].index as usize].pool_fee(fee_discount);
+    let step_fee = |step: &Step| {
+        PoolFee::split(step.routes.iter().map(|step_route| {
+            (
+                step_route.fraction,
+                PoolFee::chained(step_route.hops.iter().map(hop_fee)),
+            )
+        }))
+    };
+    let pool_fee = PoolFee::split(route.branches.iter().map(|branch| {
+        (
+            branch.fraction,
+            PoolFee::chained(branch.route.steps.iter().map(step_fee)),
+        )
+    }));
     let estimated_amount = total_of(&emulated)?;
     // Only what the TEAR staker's discount adds is shown as the discount
     let discount = match request.tear_fee_discount {
@@ -400,6 +421,7 @@ fn found_route(
             fee_discount,
             expiration_block_height: request.block_height + FEE_DISCOUNT_VALIDITY_BLOCKS,
         }),
+        pool_fee,
     })
 }
 
@@ -1135,6 +1157,7 @@ mod tests {
             state: PoolState::of_balances(reserves),
             hop_gas: near_min_api::types::NearGas::from_tgas(2),
             oracle_key: oracle_key.map(|key| key.parse().unwrap()),
+            fees: vec![intear_dex_common::FeeFraction::new(10_000)],
         }
     }
 
@@ -1403,6 +1426,8 @@ mod tests {
             (asset("near"), asset("tear"))
         );
         assert_eq!(chain.fee_discount(), None);
+        // 1% in each pool, the second of what the first gave
+        assert_eq!(chain.pool_fee(), &PoolFee::ratio(199, 10_000));
     }
 
     #[test]
@@ -1428,6 +1453,7 @@ mod tests {
         assert_eq!(quote.dex_id, "slimedragon.near/xyk".parse().unwrap());
         assert_eq!(quote.estimated_amount, U128(out(USDC_NEAR, 1_000_000, 0)));
         assert!(quote.oracle_request.is_none());
+        assert_eq!(quote.pool_fee, PoolFee::ratio(1, 100));
     }
 
     #[test]
@@ -1502,6 +1528,11 @@ mod tests {
         assert_eq!(chain.estimated_amount(), with(fee_discount));
         // Only a TEAR staker's discount is shown
         assert_eq!(chain.discount(), None);
+        let discounted_pool_fee = PoolFee::ratio(fee_millionths(fee_discount), 1_000_000);
+        assert_eq!(
+            chain.pool_fee(),
+            &PoolFee::chained([discounted_pool_fee.clone(), discounted_pool_fee])
+        );
     }
 
     #[test]
@@ -1767,6 +1798,20 @@ mod tests {
                 .map(|branch| branch.estimated_amount)
                 .sum::<u128>(),
             split.estimated_amount()
+        );
+        // Of 1% through the direct pool, and 1% of each of the two pools through NEAR
+        let branch_pool_fee = |steps| match steps {
+            1 => PoolFee::ratio(1, 100),
+            2 => PoolFee::ratio(199, 10_000),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            split.pool_fee(),
+            &PoolFee::split(
+                branches
+                    .iter()
+                    .map(|branch| (branch.fraction.get(), branch_pool_fee(branch.steps.len())))
+            )
         );
     }
 

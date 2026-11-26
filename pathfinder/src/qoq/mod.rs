@@ -253,6 +253,7 @@ impl RatedPools {
                     state: PoolState::of_balances(pool.balances.0.map(TokenAmount::get)),
                     hop_gas: pool.hop_gas().estimated_burn,
                     oracle_key: pool.oracle_key.clone(),
+                    fees: vec![pool.fees.pool, pool.fees.protocol],
                 })
                 .collect(),
             oracle_fees: self.oracle_fees.clone(),

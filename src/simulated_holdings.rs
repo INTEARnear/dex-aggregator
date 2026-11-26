@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use crate::{
         calls::{RheaOutput, RheaSwapAction},
-        types::{Amount, DexId, Gas},
+        types::{Amount, DexId, Gas, PoolFee},
     };
 
     fn account(id: &str) -> AccountId {
@@ -342,6 +342,7 @@ mod tests {
             worst_case_amount: Amount::AmountOut(6),
             token_output: TokenId::Nep141(account("usdc.near")),
             discount: None,
+            pool_fee: PoolFee::none(),
             calls: vec![
                 CallBlueprint::WrapNear {
                     amount: NearToken::from_yoctonear(5),

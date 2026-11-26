@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, net::IpAddr, time::Duration};
 
 use bigdecimal::BigDecimal;
-use intear_dex_common::{AssetId, DexId, FeeDiscountFraction};
+use intear_dex_common::{AssetId, DexId, FeeDiscountFraction, FeeFraction};
 use near_min_api::types::{AccountId, BlockHeight, NearGas, NearToken};
 use near_sdk::{
     json_types::{Base64VecU8, U128},
@@ -11,9 +11,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "hook")]
 use crate::indexed::{AccountState, Watch};
-use crate::types::{Amount, CostPrices, Gas, Quote, SwapRequest};
+use crate::types::{Amount, CostPrices, Gas, PoolFee, Quote, SwapRequest};
 
-pub const HOOK_ABI_VERSION: u32 = 10;
+pub const HOOK_ABI_VERSION: u32 = 11;
 pub const HOOK_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The HTTP request the swap request came in, the websocket upgrade for subscriptions
@@ -93,6 +93,9 @@ pub struct HookQuote {
     /// operations of the route
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_discount: Option<QuoteFeeDiscount>,
+    /// What the DEX's pools take of what it swaps, with `fee_discount`. The oracle's fee isn't in
+    /// it.
+    pub pool_fee: PoolFee,
 }
 
 /// A discount on the pool and protocol fees of every swap of a route's operations
@@ -193,6 +196,9 @@ pub struct HookPool {
     pub hop_gas: NearGas,
     /// The oracle whose prices swaps through the pool read, which the operations ask first
     pub oracle_key: Option<PublicKeyHandle>,
+    /// What a swap through the pool takes of what it swaps, by receiver, which a fee discount
+    /// discounts each of
+    pub fees: Vec<FeeFraction>,
 }
 
 /// What the oracle that has `oracle_key` takes for a request, in each asset it takes fees in
@@ -681,7 +687,7 @@ mod tests {
     use super::*;
 
     const SWAP_REQUEST: &str = r#"{"token_in":"near","token_out":"nep141:usdc.near","amount_in":"1000","slippage_type":"Fixed","slippage":"0.01","dexes":"Rhea,Plach","trader_account_id":"trader.near","referrer_id":"app.near","fees":"{\"app.near\":0.005}"}"#;
-    const QUOTE: &str = r#"{"estimated_amount":{"amount_out":"5"},"worst_case_amount":{"amount_out":"4"},"dex_id":"Rhea","execution_instructions":[],"needs_unwrap":false,"token_output":"nep141:usdc.near","estimated_max_gas_cost":"1","estimated_gas_usage":"1","storage_deposits":"0","fee_amount":"0"}"#;
+    const QUOTE: &str = r#"{"estimated_amount":{"amount_out":"5"},"worst_case_amount":{"amount_out":"4"},"dex_id":"Rhea","execution_instructions":[],"needs_unwrap":false,"token_output":"nep141:usdc.near","pool_fee":"0.003","estimated_max_gas_cost":"1","estimated_gas_usage":"1","storage_deposits":"0","fee_amount":"0"}"#;
 
     pub fn input_json() -> String {
         let request = RequestDetails {
@@ -786,6 +792,7 @@ mod export_tests {
                     state: PoolState::of_balances([1_000, 2_000]),
                     hop_gas: NearGas::from_tgas(2),
                     oracle_key: None,
+                    fees: vec![],
                 }],
                 oracle_fees: vec![],
             }
@@ -870,6 +877,7 @@ mod export_tests {
                 discount: None,
                 oracle_request: None,
                 fee_discount: None,
+                pool_fee: PoolFee::none(),
             }])
         }
 

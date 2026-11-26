@@ -11,7 +11,7 @@ use crate::{
         rhea_fee_receivers_registration, rhea_registration, token_storage_deposit_amount,
         NetworkView,
     },
-    types::{Amount, DexId, ExecutionInstruction, Gas, IntearAssetId, TokenId},
+    types::{Amount, DexId, ExecutionInstruction, Gas, IntearAssetId, PoolFee, TokenId},
 };
 
 /// What a provider found: the swap, and what has to happen around it. What the trader and the
@@ -23,6 +23,7 @@ pub struct RouteBlueprint {
     pub worst_case_amount: Amount,
     pub token_output: TokenId,
     pub discount: Option<Amount>,
+    pub pool_fee: PoolFee,
     /// Executed one after another
     pub steps: Vec<RouteStep>,
     /// Pay referral fees out of the wallet, after `steps` and the output conversion, so the swap
@@ -78,6 +79,7 @@ pub struct ResolvedRoute {
     pub worst_case_amount: Amount,
     pub token_output: TokenId,
     pub discount: Option<Amount>,
+    pub pool_fee: PoolFee,
     pub calls: Vec<CallBlueprint>,
     pub fee_calls: Vec<CallBlueprint>,
 }
@@ -171,6 +173,7 @@ pub async fn resolve(network: &impl NetworkView, route: RouteBlueprint) -> Optio
         worst_case_amount: route.worst_case_amount,
         token_output: route.token_output,
         discount: route.discount,
+        pool_fee: route.pool_fee,
         calls: calls?,
         fee_calls: fee_calls?,
     })
@@ -349,6 +352,7 @@ mod tests {
             worst_case_amount: Amount::AmountOut(1),
             token_output: TokenId::Near,
             discount: None,
+            pool_fee: PoolFee::none(),
             calls,
             fee_calls,
         }
